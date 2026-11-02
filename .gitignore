@@ -1,0 +1,39 @@
+# Окружение
+.venv/
+venv/
+env/
+
+# Сессионный токен демона — создаётся при каждом запуске, не является конфигурацией
+.autopilot_token
+
+# Артефакты сборки и упаковки
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Кэши интерпретатора и инструментов
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Логи и трейсы агента (появятся в Фазе 5)
+logs/
+*.log
+traces/
+*.jsonl
+
+# Редакторы и ОС
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store

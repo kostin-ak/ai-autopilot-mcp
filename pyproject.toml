@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-autopilot-mcp"
+version = "0.2.0"
+description = "Desktop autopilot MCP server: UIA-first semantic control with pixel fallback, HUD overlay, and human-override detection"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+keywords = ["mcp", "automation", "desktop", "ui-automation", "computer-use"]
+
+# Верхние границы заданы явно: проект использует нативные API Windows и
+# чувствителен к смене мажорных версий SDK.
+dependencies = [
+    "mcp>=2.0,<3",
+    "pydantic>=2.5,<3",
+    "websockets>=12,<16",
+    "PyQt6>=6.6,<7",
+    "qasync>=0.27,<1",
+    "mss>=9.0,<11",
+    "Pillow>=10.0",
+    "numpy>=1.26",
+    "pyperclip>=1.8,<2",
+]
+
+[project.optional-dependencies]
+# Всё, что работает только под Windows: UI Automation и COM.
+win32 = [
+    "pywinauto>=0.6.8",
+    "comtypes>=1.2",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+autopilot-daemon = "autopilot_daemon:main"
+autopilot-mcp = "mcp_server:main"
+
+[tool.setuptools]
+# Плоская раскладка сохраняется намеренно: переход на src-layout отложен до
+# Фазы 2, когда появится слой UI Automation и число модулей вырастет.
+py-modules = [
+    "autopilot_daemon",
+    "config",
+    "input_controller",
+    "mcp_server",
+    "overlay_ui",
+    "vision_engine",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+warn_redundant_casts = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

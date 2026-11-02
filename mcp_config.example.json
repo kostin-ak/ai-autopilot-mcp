@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "desktop-autopilot": {
+      "command": "C:\\path\\to\\ai-autopilot-mcp\\.venv\\Scripts\\autopilot-mcp.exe"
+    }
+  }
+}

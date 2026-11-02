@@ -1,0 +1,16 @@
+# Нормализация окончаний строк. Без этого git на Windows конвертирует LF в CRLF
+# при checkout и обратно, порождая предупреждения и расхождения в diff.
+* text=auto eol=lf
+
+# Пакетные файлы cmd.exe требуют CRLF: с LF возможны сбои на метках и
+# многострочных блоках if/for.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Двоичные данные — без преобразований
+*.png binary
+*.jpg binary
+*.webp binary
+*.ico binary
+*.pyc binary
