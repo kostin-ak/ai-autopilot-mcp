@@ -603,6 +603,70 @@ class TestWindowResolution:
 
 
 # --------------------------------------------------------------------------
+# Tool descriptions are English: they are model-facing instructions
+# --------------------------------------------------------------------------
+class TestToolDescriptions:
+    """Descriptions are consumed by the model, not shown to the user, and
+    instruction-following is more consistent in English. User-facing strings --
+    HUD, tray, returned messages, documentation -- stay Russian."""
+
+    TOOLS = {
+        "take_control", "release_control", "get_screen_state", "mouse_action",
+        "keyboard_action", "scroll_screen", "list_windows_and_monitors",
+        "get_ui_elements", "reset_user_override", "get_hud_state",
+    }
+
+    def test_every_tool_has_a_non_empty_english_description(self):
+        import asyncio
+
+        import mcp_server
+
+        tools = asyncio.run(mcp_server.mcp.list_tools())
+        assert {t.name for t in tools} == self.TOOLS
+        for t in tools:
+            desc = (t.description or "").strip()
+            assert desc, f"{t.name} has no description"
+            non_ascii = [c for c in desc if ord(c) > 127]
+            assert not non_ascii, (
+                f"{t.name} description is not English: {non_ascii[:5]}"
+            )
+
+    def test_descriptions_name_the_class_and_its_side_effects(self):
+        """The description is the only place the model learns whether an action
+        consumes the single cursor and keyboard."""
+        import asyncio
+
+        import mcp_server
+
+        tools = {t.name: (t.description or "") for t in asyncio.run(mcp_server.mcp.list_tools())}
+        for name in ("mouse_action", "keyboard_action", "scroll_screen"):
+            assert "Class A" in tools[name], f"{name} must state its action class"
+        assert "USER_OVERRIDE" in tools["mouse_action"]
+        assert "USER_OVERRIDE" in tools["keyboard_action"]
+
+    def test_keyboard_description_matches_the_real_input_path(self):
+        """It no longer types through the clipboard; a stale description here
+        would make the model expect clipboard side effects that do not happen."""
+        import asyncio
+
+        import mcp_server
+
+        tools = {t.name: (t.description or "") for t in asyncio.run(mcp_server.mcp.list_tools())}
+        desc = tools["keyboard_action"]
+        assert "KEYEVENTF_UNICODE" in desc
+        assert "clipboard" in desc.lower()
+
+    def test_get_ui_elements_documents_why_a_handle_is_needed(self):
+        import asyncio
+
+        import mcp_server
+
+        tools = {t.name: (t.description or "") for t in asyncio.run(mcp_server.mcp.list_tools())}
+        desc = tools["get_ui_elements"]
+        assert "hwnd" in desc
+        assert "largest-of-N" in desc
+        assert "win32-title" in desc
+# --------------------------------------------------------------------------
 # Session lock state must reach the agent
 # --------------------------------------------------------------------------
 class TestSessionState:

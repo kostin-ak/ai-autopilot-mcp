@@ -178,12 +178,20 @@ async def take_control(
     show_grid: bool = False,
 ) -> list[ContentBlock]:
     """
-    Захватывает управление сессией для ИИ: зажигает постоянную неоновую рамку вокруг выбранного экрана.
-    Вызывайте этот инструмент первым шагом перед началом выполнения интерактивных действий.
+    Takes control of the desktop session for the agent: lights a persistent neon frame
+    around the chosen monitor. Call this first, before any interactive action.
 
-    Параметры:
-        monitor_index: Номер экрана (1 = основной монитор, 0 = все мониторы, None = автовыбор).
-        show_grid: Накладывать ли координатную сетку с шагом 100px и шкалами (по умолчанию False).
+    The frame is drawn on the agent's own overlay window, which carries
+    WDA_EXCLUDEFROMCAPTURE, so it never appears in captured frames. Use get_hud_state
+    to verify where it actually landed.
+
+    Args:
+        monitor_index: 1 = primary monitor, 0 = every display as one virtual desktop,
+            None = automatic. An out-of-range index is an error, not a silent fallback,
+            because falling back to 0 changes the frame scale and invalidates every
+            coordinate accumulated so far.
+        show_grid: Overlay a 100px coordinate grid. Off by default; the grid draws over
+            the title-bar area where window controls live.
     """
     params = {"monitor_index": monitor_index, "show_grid": show_grid}
     resp = await _send_daemon_request("take_control", params)
@@ -193,8 +201,13 @@ async def take_control(
 @mcp.tool()
 async def release_control() -> str:
     """
-    Освобождает управление рабочим столом и выключает постоянную рамку HUD.
-    Вызывайте этот инструмент строго в конце выполнения всей составной задачи.
+    Releases desktop control and turns the persistent HUD frame off.
+
+    Always available, including while USER_OVERRIDE is active. Before that was made
+    explicit, a human interruption blocked this call too, so a pause left the neon
+    frame lit with no way out short of reset_user_override or killing the daemon.
+
+    Call it at the end of the whole composite task, not between steps.
     """
     resp = await _send_daemon_request("release_control", {})
     if resp.get("status") == "ok":
@@ -208,12 +221,17 @@ async def get_screen_state(
     show_grid: bool = False,
 ) -> list[ContentBlock]:
     """
-    Запрашивает свежий снимок экрана, статус системы (IDLE, AI_ACTIVE, USER_OVERRIDE),
-    разрешение кадра и текущие координаты мыши.
+    Requests a fresh screen capture plus system state (IDLE, AI_ACTIVE, USER_OVERRIDE),
+    frame resolution, and the cursor position.
 
-    Параметры:
-        monitor_index: Индекс монитора (1 = основной монитор, 0 = все экраны вместе, None = автовыбор).
-        show_grid: Накладывать ли координатную сетку с шагом 100px (по умолчанию False).
+    The response may carry a session warning. When the workstation is locked, capture
+    still succeeds and returns the lock screen; the warning is the only thing that
+    distinguishes that from a frame of the target application.
+
+    Args:
+        monitor_index: 1 = primary, 0 = every display as one virtual desktop,
+            None = automatic.
+        show_grid: Overlay a 100px coordinate grid. Off by default.
     """
     resp = await _send_daemon_request(
         "get_screen_state", {"monitor_index": monitor_index, "show_grid": show_grid}
@@ -232,16 +250,25 @@ async def mouse_action(
     show_grid: bool = False,
 ) -> list[ContentBlock]:
     """
-    Выполняет действие мышью с предиктивным визуальным маркером и проверкой перехвата человеком.
+    Performs a mouse action with a predictive visual marker and human-interruption check.
 
-    Параметры:
-        action: Тип действия ('click', 'double_click', 'right_click', 'move', 'drag')
-        x: Координата X на сжатом скриншоте (от 0 до 1280)
-        y: Координата Y на сжатом скриншоте
-        end_x: Конечная координата X для перетаскивания (drag)
-        end_y: Конечная координата Y для перетаскивания (drag)
-        monitor_index: Индекс монитора
-        show_grid: Накладывать ли координатную сетку на итоговый снимок (по умолчанию False)
+    This is a Class A action: it consumes the session's single cursor, so it cannot run
+    concurrently with the human using the machine. A physical mouse movement or keypress
+    switches the daemon to USER_OVERRIDE and aborts the action mid-flight. Prefer
+    element-based actions when the target exposes them.
+
+    Coordinates are in the downscaled frame, not physical pixels. The response reports
+    where the cursor actually ended up, which differs from the requested point whenever
+    a move was clipped or interrupted -- that difference is the signal a click failed.
+
+    Args:
+        action: 'click', 'double_click', 'right_click', 'move' or 'drag'.
+        x: X in the downscaled frame (0..scaled_width).
+        y: Y in the downscaled frame (0..scaled_height).
+        end_x: Destination X for 'drag'.
+        end_y: Destination Y for 'drag'.
+        monitor_index: Which monitor the frame coordinates refer to.
+        show_grid: Overlay a grid on the resulting frame. Off by default.
     """
     params = {
         "action": action,
@@ -264,13 +291,22 @@ async def keyboard_action(
     show_grid: bool = False,
 ) -> list[ContentBlock]:
     """
-    Выполняет ввод текста через буфер обмена или нажимает системную комбинацию клавиш.
+    Types text or presses a key combination.
 
-    Параметры:
-        text: Текст для безопасного ввода через буфер обмена (не зависит от текущей раскладки RU/EN)
-        hotkey: Сочетание клавиш (например: 'ctrl+c', 'ctrl+v', 'alt+tab', 'enter', 'esc')
-        monitor_index: Индекс монитора для возврата итогового снимка
-        show_grid: Накладывать ли координатную сетку на итоговый снимок (по умолчанию False)
+    Text is injected per character via KEYEVENTF_UNICODE, not pasted from the clipboard.
+    That means it is independent of the RU/EN keyboard layout, it does not touch the
+    user's clipboard, and it works where Ctrl+V is not paste (vim, ssh sessions, some
+    terminals). The clipboard is used only above CLIPBOARD_TYPING_THRESHOLD characters
+    and only as a fallback; it destroys non-text clipboard formats.
+
+    This is a Class A action: it consumes the session keyboard, so a physical keypress
+    switches the daemon to USER_OVERRIDE and aborts typing mid-flight.
+
+    Args:
+        text: Literal text to type. Newline and tab are sent as their virtual keys.
+        hotkey: Key combination such as 'ctrl+c', 'alt+tab', 'enter', 'esc', 'f5'.
+        monitor_index: Which monitor the returned frame should show.
+        show_grid: Overlay a grid on the resulting frame. Off by default.
     """
     params = {
         "text": text,
@@ -292,15 +328,18 @@ async def scroll_screen(
     show_grid: bool = False,
 ) -> list[ContentBlock]:
     """
-    Прокручивает экран вверх или вниз колесом мыши с ожиданием стабилизации изображения.
+    Scrolls the screen with the mouse wheel and waits for the image to settle.
 
-    Параметры:
-        direction: Направление прокрутки ('up' или 'down')
-        amount: Количество шагов прокрутки (по умолчанию 3)
-        x: Опциональная координата X, куда предварительно переместить курсор
-        y: Опциональная координата Y, куда предварительно переместить курсор
-        monitor_index: Индекс монитора
-        show_grid: Накладывать ли координатную сетку на итоговый снимок (по умолчанию False)
+    Class A action: consumes the session cursor. Only vertical direction is supported;
+    horizontal scrolling is not implemented.
+
+    Args:
+        direction: 'up' or 'down'.
+        amount: Number of wheel steps.
+        x: Optional X in the downscaled frame to move the cursor to first.
+        y: Optional Y in the downscaled frame to move the cursor to first.
+        monitor_index: Which monitor the frame coordinates refer to.
+        show_grid: Overlay a grid on the resulting frame. Off by default.
     """
     params = {
         "direction": direction,
@@ -317,8 +356,16 @@ async def scroll_screen(
 @mcp.tool()
 async def list_windows_and_monitors() -> str:
     """
-    Возвращает список всех подключенных мониторов и открытых окон приложений с их координатами.
-    Позволяет агенту сориентироваться, какие программы запущены и на каких экранах они находятся.
+    Lists connected monitors and open application windows with their bounds.
+
+    Use this to decide what to target, then pass a window's exact handle to
+    get_ui_elements. Handles are listed because titles are ambiguous: one application
+    can own several top-level windows with the same title.
+
+    Each window reports its Win32 class and pid, which disambiguate when titles collide,
+    and an on_monitor flag. on_monitor=False means the window's centre fell in a gap
+    between displays -- monitors do not necessarily tile the virtual desktop -- so its
+    monitor_index is the nearest screen rather than the containing one.
     """
     resp = await _send_daemon_request("list_windows_and_monitors", {})
     if resp.get("status") != "ok":
@@ -368,22 +415,28 @@ async def get_ui_elements(
     class_name: str | None = None,
 ) -> str:
     """
-    Выполняет инспекцию интерактивных элементов UI (кнопки, поля ввода, чекбоксы) через Windows Accessibility.
-    Возвращает список элементов с уже готовыми координатами клика, масштабированными под скриншот.
+    Inspects a window's interactive UI elements (buttons, edits, checkboxes) through
+    Windows UI Automation and returns them with click coordinates pre-scaled to the frame.
 
-    Параметры:
-        window_title: Фильтр по заголовку окна (подстрока). Если не указан, берется активное окно.
-        monitor_index: Индекс монитора, к кадру которого приводятся координаты.
-        hwnd: Точный дескриптор окна из list_windows_and_monitors. Имеет приоритет над заголовком.
-        class_name: Класс окна Win32, сужает поиск по заголовку.
+    A title alone does not identify a window. One application can own several top-level
+    windows with the same title -- a main window plus notification popups -- and picking
+    the wrong one yields an empty element list that looks exactly like an application
+    exposing no accessibility tree at all. Pass hwnd to remove all doubt.
 
-    Заголовок сам по себе окно не определяет. У приложения может быть несколько окон
-    верхнего уровня с одинаковым заголовком — например, основное окно и окна уведомлений.
-    При неоднозначности выбирается наибольшее по площади, а в ответе сообщается число
-    кандидатов. Чтобы исключить угадывание, передавайте hwnd.
+    The response always states which window was chosen and how, so an empty result is
+    distinguishable from a mis-resolved target. Resolution is one of: 'hwnd',
+    'unique', 'largest-of-N' (the title matched several windows and the largest by area
+    won), 'win32-title' (matched by the Win32 title rather than the UIA name -- these are
+    different strings for the same window), or 'foreground'.
 
-    Ответ всегда сообщает, какое именно окно было выбрано и каким способом. Пустой
-    список элементов при этом отличим от неверно выбранного окна.
+    Elements whose centre lies outside the given monitor are counted in
+    skipped_off_monitor rather than returned with a negative click_target.
+
+    Args:
+        window_title: Substring of the window title.
+        monitor_index: Which monitor's frame the coordinates are scaled to.
+        hwnd: Exact handle from list_windows_and_monitors. Takes priority over the title.
+        class_name: Win32 window class, narrows a title search.
     """
     params = {
         "window_title": window_title,
@@ -445,8 +498,17 @@ async def get_ui_elements(
 @mcp.tool()
 async def reset_user_override() -> str:
     """
-    Сбрасывает режим паузы (USER_OVERRIDE) в исходное состояние (IDLE).
-    Используйте этот инструмент только после того, как пользователь в чате разрешил продолжить работу.
+    Resets USER_OVERRIDE back to IDLE.
+
+    Call this only after the user has explicitly agreed in chat to continue. A physical
+    mouse movement or keypress puts the daemon into USER_OVERRIDE and aborts the running
+    action; that is the human reclaiming the machine, and it is not a condition to clear
+    automatically.
+
+    The human can also clear it themselves with Ctrl+Alt+Space.
+
+    Note that release_control already works during USER_OVERRIDE, so this tool is not the
+    only way out of a pause.
     """
     resp = await _send_daemon_request("reset_override", {})
     if resp.get("status") == "ok":
@@ -462,14 +524,15 @@ def main() -> None:
 @mcp.tool()
 async def get_hud_state() -> str:
     """
-    Возвращает живую геометрию HUD-оверлея: границы окна, обрамляемую область в
-    глобальных и локальных координатах окна, точку, где рамка фактически рисуется,
-    и признак корректности размещения.
+    Returns live HUD overlay geometry: window bounds, the framed region in both global
+    desktop and widget-local coordinates, the point where the frame is actually painted,
+    and a placement_correct flag.
 
-    Используйте для проверки того, что неоновая рамка окружает именно нужный монитор.
-    Оверлей аппаратно исключён из скриншотов (WDA_EXCLUDEFROMCAPTURE), поэтому
-    неверно расположенную рамку на снимке не увидеть — эти числа являются единственно
-    проверяемым свидетельством её положения.
+    Use this to confirm the neon frame surrounds the intended monitor. The overlay carries
+    WDA_EXCLUDEFROMCAPTURE, so a mis-placed frame never appears in any screenshot -- these
+    numbers are the only machine-checkable evidence of where it landed. That matters on
+    multi-monitor setups: the overlay window spans the whole virtual desktop, whose origin
+    is not (0, 0) when a secondary display sits to the left of or above the primary.
     """
     resp = await _send_daemon_request("hud_state", {})
     if resp.get("status") != "ok":
