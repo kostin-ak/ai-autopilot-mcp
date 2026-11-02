@@ -31,6 +31,18 @@ win32 = [
     "pywinauto>=0.6.8",
     "comtypes>=1.2",
 ]
+# Windows.Media.Ocr. Проверено спайком S5: кириллица распознаётся корректно,
+# область 400x200 обрабатывается за ~3 мс. Отдельная группа, потому что OCR нужен
+# только как запасной путь для целей без дерева доступности (содержимое
+# Проводника, Java AWT, canvas).
+ocr = [
+    "winrt-runtime",
+    "winrt-Windows.Media.Ocr",
+    "winrt-Windows.Graphics.Imaging",
+    "winrt-Windows.Storage.Streams",
+    "winrt-Windows.Foundation",
+    "winrt-Windows.Globalization",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.4",
