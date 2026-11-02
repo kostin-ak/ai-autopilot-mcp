@@ -600,3 +600,95 @@ class TestWindowResolution:
 
         assert _find_hwnd_by_win32_title("") is None
         assert _find_hwnd_by_win32_title("   ") is None
+
+
+# --------------------------------------------------------------------------
+# Session lock state must reach the agent
+# --------------------------------------------------------------------------
+class TestSessionState:
+    """With the workstation locked, capture still succeeds and returns the lock
+    screen. Measured live: get_screen_state came back looking perfectly normal.
+    Without an explicit signal the agent cannot tell a locked machine from a
+    closed application or a broken capture."""
+
+    def test_returns_documented_keys_and_never_raises(self):
+        import session_state as ss
+
+        s = ss.session_state()
+        assert set(s) == {"locked", "state", "session_id", "reason"}
+        assert s["locked"] in (True, False, None)
+
+    def test_structure_alignment_places_data_at_offset_8(self):
+        """The union's 64-bit level-2 members force Data to offset 8.
+
+        With Data at 4 every field reads four bytes early, SessionFlags picks up
+        a padding zero, and "locked" comes out True for the wrong reason. That
+        is exactly what happened before the hexdump was checked.
+        """
+        import ctypes
+
+        import session_state as ss
+
+        assert ss._WTSINFOEXW.Data.offset == 8
+        assert ctypes.sizeof(ss._WTSINFOEXW) >= (
+            8 + ctypes.sizeof(ss._WTSINFOEX_LEVEL1_W)
+        )
+
+    def test_describe_state(self, monkeypatch):
+        import session_state as ss
+
+        cases = [
+            (True, "active", "ЗАБЛОКИРОВАНА"),
+            (False, "disconnected", "ОТКЛЮЧЕНА"),
+            (False, "active", ""),
+            (None, "unknown", ""),
+        ]
+        for locked, state, expected in cases:
+            monkeypatch.setattr(
+                ss, "session_state",
+                lambda lock=locked, st=state: {
+                    "locked": lock, "state": st, "session_id": 1, "reason": "",
+                },
+            )
+            text = ss.describe_state()
+            if expected:
+                assert expected in text, f"{locked}/{state} -> {text!r}"
+            else:
+                assert text == "", f"{locked}/{state} -> {text!r}"
+
+    def test_annotation_reaches_ok_responses(self, monkeypatch):
+        import session_state as ss
+        from autopilot_daemon import AutopilotDaemon
+
+        monkeypatch.setattr(
+            ss, "session_state",
+            lambda: {"locked": True, "state": "active", "session_id": 1, "reason": ""},
+        )
+        resp = AutopilotDaemon._annotate_session({"status": "ok", "data": {"x": 1}})
+        assert resp["data"]["session"] == {"locked": True, "state": "active"}
+        assert "session_warning" in resp["data"]
+        assert resp["data"]["x"] == 1, "annotation must not disturb existing data"
+
+    def test_annotation_creates_data_for_flat_responses(self, monkeypatch):
+        import session_state as ss
+        from autopilot_daemon import AutopilotDaemon
+
+        monkeypatch.setattr(
+            ss, "session_state",
+            lambda: {"locked": False, "state": "active", "session_id": 1, "reason": ""},
+        )
+        resp = AutopilotDaemon._annotate_session({"status": "ok", "state": "IDLE"})
+        assert resp["data"]["session"]["locked"] is False
+        assert "session_warning" not in resp["data"]
+
+    def test_annotation_leaves_errors_alone(self, monkeypatch):
+        import session_state as ss
+        from autopilot_daemon import AutopilotDaemon
+
+        monkeypatch.setattr(
+            ss, "session_state",
+            lambda: {"locked": True, "state": "active", "session_id": 1, "reason": ""},
+        )
+        resp = AutopilotDaemon._annotate_session({"status": "error", "message": "boom"})
+        assert "data" not in resp
+        assert resp["message"] == "boom"

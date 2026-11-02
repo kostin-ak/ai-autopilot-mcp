@@ -148,7 +148,12 @@ def _format_image_and_text(resp: dict[str, Any], default_text: str = "") -> list
     cursor_desktop = data.get("cursor_desktop")
     msg = data.get("message", default_text)
 
-    summary_lines = [f"Статус демона: {state}"]
+    summary_lines: list[str] = []
+    if data.get("session_warning"):
+        # First, before anything else. A frame of the lock screen must not be
+        # mistaken for a frame of the target application.
+        summary_lines.append(f"ВНИМАНИЕ: {data['session_warning']}")
+    summary_lines.append(f"Статус демона: {state}")
     if msg:
         summary_lines.append(f"Результат: {msg}")
     if w and h:
@@ -323,7 +328,11 @@ async def list_windows_and_monitors() -> str:
     monitors = data.get("monitors", [])
     windows = data.get("windows", [])
 
-    output = ["=== ПОДКЛЮЧЕННЫЕ МОНИТОРЫ ==="]
+    output = []
+    if data.get("session_warning"):
+        output.append(f"ВНИМАНИЕ: {data['session_warning']}")
+        output.append("")
+    output.append("=== ПОДКЛЮЧЕННЫЕ МОНИТОРЫ ===")
     for m in monitors:
         primary_mark = " [PRIMARY]" if m.get("is_primary") else ""
         if m["index"] == 0:
@@ -393,9 +402,10 @@ async def get_ui_elements(
     frame = data.get("frame", [])
     tgt = data.get("target") or {}
 
-    header = [
-        f"Найдено интерактивных элементов: {len(elements)}",
-    ]
+    header: list[str] = []
+    if data.get("session_warning"):
+        header.append(f"ВНИМАНИЕ: {data['session_warning']}")
+    header.append(f"Найдено интерактивных элементов: {len(elements)}")
     if tgt:
         header.append(
             f"Целевое окно: handle={tgt.get('handle')} '{tgt.get('title')}' "

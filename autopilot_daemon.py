@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 from websockets.asyncio.server import ServerConnection
 
 import config
+import session_state
 from config import AutopilotState
 from input_controller import InputController, InterruptedByUserError
 from overlay_ui import HUDOverlayWindow
@@ -224,9 +225,35 @@ class AutopilotDaemon:
         blocking that would make the observer blind exactly when it matters.
         """
         if action in NON_INPUT_ACTIONS:
-            return await self._dispatch(action, params)
-        async with self._input_lock:
-            return await self._dispatch(action, params)
+            resp = await self._dispatch(action, params)
+        else:
+            async with self._input_lock:
+                resp = await self._dispatch(action, params)
+        return self._annotate_session(resp)
+
+    @staticmethod
+    def _annotate_session(resp: dict[str, Any]) -> dict[str, Any]:
+        """Attaches workstation lock state to every successful response.
+
+        A locked workstation is the single most misleading state to hide: screen
+        capture still succeeds and returns the lock screen, so the agent sees a
+        PIN prompt with no indication that it is not looking at the target
+        application at all. It then either reports the app closed or tries to
+        interact with a session that is not accepting input.
+
+        Measured live: with the session locked, get_screen_state returned a
+        normal-looking frame of the lock screen and nothing else was different.
+        """
+        if not isinstance(resp, dict) or resp.get("status") != "ok":
+            return resp
+
+        info = session_state.session_state()
+        data = resp.setdefault("data", {})
+        data["session"] = {"locked": info["locked"], "state": info["state"]}
+        note = session_state.describe_state()
+        if note:
+            data["session_warning"] = note
+        return resp
 
     async def _dispatch(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         """Dispatches and executes requested tool action."""
