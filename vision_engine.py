@@ -4,6 +4,7 @@ import base64
 import ctypes
 import io
 import logging
+import math
 import re
 import sys
 import time
@@ -39,8 +40,13 @@ class WindowInfo:
     handle: int
     title: str
     rect: tuple[int, int, int, int]
-    monitor_index: int
+    # Nearest monitor by center point. None only when no physical monitor is
+    # enumerated at all.
+    monitor_index: int | None
     is_active: bool
+    # False when the center point fell in a gap between monitors and
+    # monitor_index is therefore an approximation, not a containment.
+    on_monitor: bool = True
 
 
 @dataclass
@@ -55,6 +61,18 @@ class UIElementInfo:
     rect: tuple[int, int, int, int]
 
 
+def _distance_to_rect(x: int, y: int, mon: MonitorInfo) -> float:
+    """Distance from a point to a monitor rectangle; 0.0 when inside.
+
+    Used to attribute a window to the nearest monitor when its center falls in a
+    gap between monitors, which happens whenever the displays do not tile the
+    virtual desktop.
+    """
+    dx = max(mon.left - x, 0, x - (mon.left + mon.width - 1))
+    dy = max(mon.top - y, 0, y - (mon.top + mon.height - 1))
+    return math.hypot(dx, dy)
+
+
 class VisionEngine:
     """Handles multi-monitor frame acquisition, stabilization, and accessibility inspection."""
 
@@ -67,7 +85,7 @@ class VisionEngine:
         monitors: list[MonitorInfo] = []
         import mss
 
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             for idx, m in enumerate(sct.monitors):
                 name = "All Displays (Virtual Desktop)" if idx == 0 else f"Display {idx}"
                 is_primary = idx == 1
@@ -120,7 +138,7 @@ class VisionEngine:
         monitor_index: int | None = None,
         cursor_pos: tuple[int, int] | None = None,
         wait_stabilization: bool = False,
-        show_grid: bool = True,
+        show_grid: bool = False,
     ) -> tuple[str, int, int, float, float, MonitorInfo]:
         """
         Captures target display, waits for animations to finish, overlays cursor, and compresses to WebP.
@@ -138,7 +156,7 @@ class VisionEngine:
         import mss
 
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 if wait_stabilization:
                     pil_image = self._capture_stabilized_frame(sct, bbox)
                 else:
@@ -182,33 +200,60 @@ class VisionEngine:
         return encoded_webp, scaled_w, scaled_h, scale_x, scale_y, target_monitor
 
     def _draw_coordinate_grid(self, image: Image.Image) -> Image.Image:
-        """Overlays semi-transparent grid lines and coordinate markers to assist model localization."""
+        """Overlays grid lines and coordinate markers without occluding the frame.
+
+        The previous version painted two semi-opaque black bars -- the full width
+        of the top 14px and the full height of the left 28px -- to give the
+        labels contrast. That band is exactly where a window's title-bar controls
+        live. A live inspection of the active window returned its only four
+        elements at y=6: "Система" at [6, 6], and "Свернуть" / "Восстановить" /
+        "Закрыть" at [1221, 6] / [1244, 6] / [1268, 6]. With the grid on, the
+        agent could not see the close button of the window it was inspecting.
+
+        Labels now carry a dark stroke instead of a backing bar, so they stay
+        legible over any background while occluding only the glyph pixels.
+        """
         w, h = image.size
         overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
 
-        # Top and left ruler background bars for high contrast
-        draw.rectangle([(0, 0), (w, 14)], fill=(0, 0, 0, 150))
-        draw.rectangle([(0, 0), (28, h)], fill=(0, 0, 0, 150))
+        label_fill = (0, 255, 255, 235)
+        label_stroke = (0, 0, 0, 230)
+        line_fill = (255, 255, 255, 40)
+        tick_fill = (255, 255, 255, 170)
 
-        # Vertical grid lines & labels every 100px
+        # Vertical grid lines & labels every 100px, spanning the full height.
+        # Labels are centered on their line rather than starting at line+2: a
+        # left-aligned "1200" reaches x=1226 and lands squarely on the window
+        # buttons that a real title bar puts at x=1221/1244/1268 on a 1280-wide
+        # frame. Centering leaves the inter-line space, where controls live, clear.
         for x in range(100, w, 100):
-            draw.line([(x, 14), (x, h)], fill=(255, 255, 255, 40), width=1)
-            draw.text((x - 10, 1), str(x), fill=(0, 255, 255, 230))
+            draw.line([(x, 0), (x, h)], fill=line_fill, width=1)
+            label = str(x)
+            draw.text(
+                (x - draw.textlength(label) / 2, 1),
+                label,
+                fill=label_fill,
+                stroke_width=2,
+                stroke_fill=label_stroke,
+            )
 
-        # Horizontal grid lines & labels every 100px
+        # Horizontal grid lines & labels every 100px, spanning the full width
         for y in range(100, h, 100):
-            draw.line([(28, y), (w, y)], fill=(255, 255, 255, 40), width=1)
-            draw.text((2, y - 5), str(y), fill=(0, 255, 255, 230))
+            draw.line([(0, y), (w, y)], fill=line_fill, width=1)
+            draw.text(
+                (2, y + 2), str(y), fill=label_fill,
+                stroke_width=2, stroke_fill=label_stroke,
+            )
 
-        # 50px tick marks along rulers
+        # 50px ticks kept to a 4px edge so they never reach real content
         for x in range(50, w, 50):
             if x % 100 != 0:
-                draw.line([(x, 0), (x, 7)], fill=(255, 255, 255, 180), width=1)
+                draw.line([(x, 0), (x, 4)], fill=tick_fill, width=1)
 
         for y in range(50, h, 50):
             if y % 100 != 0:
-                draw.line([(0, y), (7, y)], fill=(255, 255, 255, 180), width=1)
+                draw.line([(0, y), (4, y)], fill=tick_fill, width=1)
 
         return Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
 
@@ -280,8 +325,10 @@ class VisionEngine:
         user32 = ctypes.windll.user32
         active_hwnd = user32.GetForegroundWindow()
 
-        # Cache monitors for hit testing
+        # Cache monitors for hit testing. Index 0 is the mss pseudo-entry spanning
+        # every display and is not a real monitor, so it is excluded from matching.
         monitors = self.list_monitors()
+        physical = monitors[1:]
 
         def _enum_proc(hwnd: int, lparam: int) -> int:
             if not user32.IsWindowVisible(hwnd):
@@ -310,11 +357,24 @@ class VisionEngine:
             # Match monitor
             mid_x = (rect.left + rect.right) // 2
             mid_y = (rect.top + rect.bottom) // 2
-            matched_monitor = 0
-            for m in monitors[1:]:
+            matched_monitor: int | None = None
+            for m in physical:
                 if m.left <= mid_x < m.left + m.width and m.top <= mid_y < m.top + m.height:
                     matched_monitor = m.index
                     break
+
+            # Monitors need not tile the virtual desktop. On this machine the
+            # secondary occupies y in [351, 1431] at x < 0, so strips above and
+            # below it belong to no monitor, and a window centered there matched
+            # nothing. The old default of 0 was actively misleading: 0 is also
+            # the legitimate index for "all displays", so the agent read an
+            # unmatched window as one spanning every screen. Nearest monitor plus
+            # an explicit flag is the honest answer.
+            on_monitor = matched_monitor is not None
+            if matched_monitor is None and physical:
+                matched_monitor = min(
+                    physical, key=lambda m: _distance_to_rect(mid_x, mid_y, m)
+                ).index
 
             windows.append(
                 WindowInfo(
@@ -322,6 +382,7 @@ class VisionEngine:
                     title=title,
                     rect=(rect.left, rect.top, rect.right, rect.bottom),
                     monitor_index=matched_monitor,
+                    on_monitor=on_monitor,
                     is_active=(hwnd == active_hwnd),
                 )
             )

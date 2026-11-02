@@ -170,7 +170,7 @@ def _format_image_and_text(resp: dict[str, Any], default_text: str = "") -> list
 @mcp.tool()
 async def take_control(
     monitor_index: int | None = None,
-    show_grid: bool = True,
+    show_grid: bool = False,
 ) -> list[ContentBlock]:
     """
     Захватывает управление сессией для ИИ: зажигает постоянную неоновую рамку вокруг выбранного экрана.
@@ -178,7 +178,7 @@ async def take_control(
 
     Параметры:
         monitor_index: Номер экрана (1 = основной монитор, 0 = все мониторы, None = автовыбор).
-        show_grid: Накладывать ли координатную сетку с шагом 100px и шкалами (по умолчанию True).
+        show_grid: Накладывать ли координатную сетку с шагом 100px и шкалами (по умолчанию False).
     """
     params = {"monitor_index": monitor_index, "show_grid": show_grid}
     resp = await _send_daemon_request("take_control", params)
@@ -200,7 +200,7 @@ async def release_control() -> str:
 @mcp.tool()
 async def get_screen_state(
     monitor_index: int | None = None,
-    show_grid: bool = True,
+    show_grid: bool = False,
 ) -> list[ContentBlock]:
     """
     Запрашивает свежий снимок экрана, статус системы (IDLE, AI_ACTIVE, USER_OVERRIDE),
@@ -208,7 +208,7 @@ async def get_screen_state(
 
     Параметры:
         monitor_index: Индекс монитора (1 = основной монитор, 0 = все экраны вместе, None = автовыбор).
-        show_grid: Накладывать ли координатную сетку с шагом 100px (по умолчанию True).
+        show_grid: Накладывать ли координатную сетку с шагом 100px (по умолчанию False).
     """
     resp = await _send_daemon_request(
         "get_screen_state", {"monitor_index": monitor_index, "show_grid": show_grid}
@@ -224,7 +224,7 @@ async def mouse_action(
     end_x: int | None = None,
     end_y: int | None = None,
     monitor_index: int | None = None,
-    show_grid: bool = True,
+    show_grid: bool = False,
 ) -> list[ContentBlock]:
     """
     Выполняет действие мышью с предиктивным визуальным маркером и проверкой перехвата человеком.
@@ -236,7 +236,7 @@ async def mouse_action(
         end_x: Конечная координата X для перетаскивания (drag)
         end_y: Конечная координата Y для перетаскивания (drag)
         monitor_index: Индекс монитора
-        show_grid: Накладывать ли координатную сетку на итоговый снимок (по умолчанию True)
+        show_grid: Накладывать ли координатную сетку на итоговый снимок (по умолчанию False)
     """
     params = {
         "action": action,
@@ -256,7 +256,7 @@ async def keyboard_action(
     text: str | None = None,
     hotkey: str | None = None,
     monitor_index: int | None = None,
-    show_grid: bool = True,
+    show_grid: bool = False,
 ) -> list[ContentBlock]:
     """
     Выполняет ввод текста через буфер обмена или нажимает системную комбинацию клавиш.
@@ -265,7 +265,7 @@ async def keyboard_action(
         text: Текст для безопасного ввода через буфер обмена (не зависит от текущей раскладки RU/EN)
         hotkey: Сочетание клавиш (например: 'ctrl+c', 'ctrl+v', 'alt+tab', 'enter', 'esc')
         monitor_index: Индекс монитора для возврата итогового снимка
-        show_grid: Накладывать ли координатную сетку на итоговый снимок (по умолчанию True)
+        show_grid: Накладывать ли координатную сетку на итоговый снимок (по умолчанию False)
     """
     params = {
         "text": text,
@@ -284,7 +284,7 @@ async def scroll_screen(
     x: int | None = None,
     y: int | None = None,
     monitor_index: int | None = None,
-    show_grid: bool = True,
+    show_grid: bool = False,
 ) -> list[ContentBlock]:
     """
     Прокручивает экран вверх или вниз колесом мыши с ожиданием стабилизации изображения.
@@ -295,7 +295,7 @@ async def scroll_screen(
         x: Опциональная координата X, куда предварительно переместить курсор
         y: Опциональная координата Y, куда предварительно переместить курсор
         monitor_index: Индекс монитора
-        show_grid: Накладывать ли координатную сетку на итоговый снимок (по умолчанию True)
+        show_grid: Накладывать ли координатную сетку на итоговый снимок (по умолчанию False)
     """
     params = {
         "direction": direction,
@@ -326,13 +326,21 @@ async def list_windows_and_monitors() -> str:
     output = ["=== ПОДКЛЮЧЕННЫЕ МОНИТОРЫ ==="]
     for m in monitors:
         primary_mark = " [PRIMARY]" if m.get("is_primary") else ""
+        if m["index"] == 0:
+            primary_mark += " [весь виртуальный стол, не отдельный экран]"
         output.append(f"Монитор {m['index']}: '{m['name']}' границы={m['bounds']}{primary_mark}")
 
     output.append("\n=== ОТКРЫТЫЕ ОКНА ПРОГРАММ ===")
     for w in windows:
-        active_mark = " [ACTIVE]" if w.get("is_active") else ""
+        marks = ""
+        if w.get("is_active"):
+            marks += " [ACTIVE]"
+        if w.get("on_monitor") is False:
+            # Center point landed in a gap between monitors, so the index is the
+            # nearest screen rather than the containing one.
+            marks += " [вне мониторов: индекс приблизительный]"
         output.append(
-            f"- '{w['title']}' (Монитор {w['monitor_index']}, границы={w['bounds']}){active_mark}"
+            f"- '{w['title']}' (Монитор {w['monitor_index']}, границы={w['bounds']}){marks}"
         )
 
     return "\n".join(output)

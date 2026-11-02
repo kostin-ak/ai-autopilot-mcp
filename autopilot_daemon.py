@@ -288,7 +288,7 @@ class AutopilotDaemon:
     async def _action_take_control(self, params: dict[str, Any]) -> dict[str, Any]:
         """Locks session control to AI, activates persistent HUD neon frame, and returns initial screenshot."""
         mon_idx = params.get("monitor_index")
-        show_grid = params.get("show_grid", True)
+        show_grid = params.get("show_grid", False)
         self._update_overlay_target(mon_idx)
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
 
@@ -333,7 +333,7 @@ class AutopilotDaemon:
     async def _action_get_screen_state(self, params: dict[str, Any]) -> dict[str, Any]:
         """Captures screen and reports cursor coordinates."""
         mon_idx = params.get("monitor_index")
-        show_grid = params.get("show_grid", True)
+        show_grid = params.get("show_grid", False)
         self._update_overlay_target(mon_idx)
 
         cursor_abs = self.input_ctrl.get_cursor_pos()
@@ -372,7 +372,7 @@ class AutopilotDaemon:
         x = int(params.get("x", 0))
         y = int(params.get("y", 0))
         mon_idx = params.get("monitor_index")
-        show_grid = params.get("show_grid", True)
+        show_grid = params.get("show_grid", False)
 
         left, top, sx, sy = self._update_overlay_target(mon_idx)
         abs_x = left + int(round(x * sx))
@@ -454,7 +454,7 @@ class AutopilotDaemon:
         text = params.get("text")
         hotkey = params.get("hotkey")
         mon_idx = params.get("monitor_index")
-        show_grid = params.get("show_grid", True)
+        show_grid = params.get("show_grid", False)
 
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
 
@@ -491,7 +491,7 @@ class AutopilotDaemon:
         x = params.get("x")
         y = params.get("y")
         mon_idx = params.get("monitor_index")
-        show_grid = params.get("show_grid", True)
+        show_grid = params.get("show_grid", False)
 
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
 
@@ -546,6 +546,7 @@ class AutopilotDaemon:
                         "title": w.title,
                         "bounds": list(w.rect),
                         "monitor_index": w.monitor_index,
+                        "on_monitor": w.on_monitor,
                         "is_active": w.is_active,
                     }
                     for w in windows[:25]

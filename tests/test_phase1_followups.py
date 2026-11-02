@@ -168,6 +168,111 @@ class TestEscapeHatch:
 
 
 # --------------------------------------------------------------------------
+# Coordinate grid must not occlude the frame it annotates
+# --------------------------------------------------------------------------
+class TestGridOcclusion:
+    """The grid used to paint two semi-opaque black bars: the full width of the
+    top 14px and the full height of the left 28px.
+
+    A live inspection of the active window returned its only four elements at
+    y=6 -- "Система" at [6, 6] and the minimize/restore/close buttons at
+    [1221, 6] / [1244, 6] / [1268, 6]. With the grid on, those were painted over,
+    so the agent could not see the close button of the window it was inspecting.
+    """
+
+    WIDTH, HEIGHT = 1280, 720
+
+    def _gridded(self, base):
+        from PIL import Image
+
+        from vision_engine import VisionEngine
+
+        img = Image.new("RGB", (self.WIDTH, self.HEIGHT), base)
+        return VisionEngine()._draw_coordinate_grid(img)
+
+    def test_title_bar_band_is_not_painted_over(self):
+        """(6, 6) is where the system menu button sits on a scaled frame."""
+        out = self._gridded((255, 255, 255))
+        r, g, b = out.getpixel((6, 6))
+        # The old bar was fill=(0,0,0,150) over white, which lands near 105.
+        assert min(r, g, b) > 200, f"title-bar pixel darkened to {(r, g, b)}"
+
+    def test_window_button_positions_are_not_painted_over(self):
+        out = self._gridded((240, 240, 240))
+        for x in (1221, 1244, 1268):
+            r, g, b = out.getpixel((x, 6))
+            assert min(r, g, b) > 190, f"button column x={x} darkened to {(r, g, b)}"
+
+    def test_left_ruler_band_is_not_painted_over(self):
+        """x in [0, 28] used to be a continuous bar. Sampled at x=10, clear of
+        the 4px ticks and of the labels drawn at x=2."""
+        out = self._gridded((255, 255, 255))
+        for y in (250, 350, 550):
+            r, g, b = out.getpixel((10, y))
+            assert min(r, g, b) > 200, f"left band darkened at y={y}: {(r, g, b)}"
+
+    def test_grid_is_still_drawn(self):
+        """Guard against the fix degenerating into a no-op.
+
+        Uses a dark base: the grid lines are white at alpha 40, so over a white
+        background they are invisible and the assertion would be meaningless.
+        """
+        out = self._gridded((60, 60, 90))
+        on_line = out.getpixel((200, 300))
+        off_line = out.getpixel((203, 303))
+        assert on_line != off_line, "grid lines no longer visible"
+        assert sum(on_line) > sum(off_line), "grid line is not lighter than its background"
+
+    def test_labels_are_still_present(self):
+        """Labels moved from a backing bar to a stroke; they must still render."""
+        out = self._gridded((255, 255, 255))
+        region = out.crop((100, 0, 140, 14))
+        colors = region.getcolors(maxcolors=100000)
+        assert colors is not None
+        assert len(colors) > 1, "no label pixels rendered near x=100"
+        cyan = any(
+            b > 150 and r < 130 and g > 150 for _count, (r, g, b) in colors
+        )
+        assert cyan, "cyan label text not found on the top edge"
+
+
+# --------------------------------------------------------------------------
+# Monitor attribution when displays do not tile the virtual desktop
+# --------------------------------------------------------------------------
+class TestMonitorAttribution:
+    def test_distance_is_zero_inside(self):
+        from vision_engine import _distance_to_rect
+
+        assert _distance_to_rect(100, 100, PRIMARY) == 0.0
+
+    def test_distance_in_the_gap_below_secondary(self):
+        """Secondary covers y in [351, 1431] at x < 0; y=100 there is a gap."""
+        from vision_engine import _distance_to_rect
+
+        d_secondary = _distance_to_rect(-1000, 100, SECONDARY)
+        d_primary = _distance_to_rect(-1000, 100, PRIMARY)
+        assert d_secondary > 0, "point is inside the gap, not on the secondary"
+        assert d_secondary == pytest.approx(251.0)
+        assert d_secondary < d_primary, "secondary is nearer than the primary here"
+
+    def test_nearest_monitor_is_chosen_for_a_gap_point(self):
+        from vision_engine import _distance_to_rect
+
+        candidates = [PRIMARY, SECONDARY]
+        nearest = min(candidates, key=lambda m: _distance_to_rect(-1000, 100, m))
+        assert nearest is SECONDARY
+
+    def test_window_info_can_express_approximate_attribution(self):
+        from vision_engine import WindowInfo
+
+        w = WindowInfo(
+            handle=1, title="t", rect=(0, 0, 10, 10),
+            monitor_index=2, is_active=False, on_monitor=False,
+        )
+        assert w.on_monitor is False
+        assert w.monitor_index == 2
+
+# --------------------------------------------------------------------------
 # Off-monitor UI elements must not carry a bogus click_target
 # --------------------------------------------------------------------------
 class TestUiElementFiltering:
