@@ -302,6 +302,64 @@ class TestUiElementFiltering:
 
         return _Ctrl()
 
+    def _patch_desktop(self, monkeypatch, controls, windows=None):
+        """Replaces pywinauto.Desktop with a double exposing the given controls."""
+
+        class _Win:
+            """Faithful double: inspect_ui_elements reads target metadata off it."""
+
+            handle = 555
+
+            def descendants(self_inner):
+                return controls
+
+            def window_text(self):
+                return "double window"
+
+            def class_name(self):
+                return "DoubleClass"
+
+            def process_id(self):
+                return 4242
+
+            def rectangle(self):
+                from PyQt6.QtCore import QRect
+
+                return QRect(0, 0, 800, 600)
+
+        class _Wrapper:
+            def __init__(self, handle, title, cls, rect):
+                self.handle = handle
+                self._title, self._cls, self._rect = title, cls, rect
+
+            def window_text(self):
+                return self._title
+
+            def class_name(self):
+                return self._cls
+
+            def process_id(self):
+                return 4242
+
+            def rectangle(self):
+                from PyQt6.QtCore import QRect
+
+                x0, y0, x1, y1 = self._rect
+                return QRect(x0, y0, x1 - x0, y1 - y0)
+
+        class _Desktop:
+            def __init__(self_inner, backend=None):
+                pass
+
+            def window(self_inner, **kw):
+                return _Win()
+
+            def windows(self_inner, **kw):
+                return windows if windows is not None else [_Wrapper(1, "t", "c", (0, 0, 100, 100))]
+
+        monkeypatch.setattr("pywinauto.Desktop", _Desktop)
+        return _Wrapper
+
     def test_element_outside_monitor_is_skipped(self, monkeypatch):
         from vision_engine import VisionEngine
 
@@ -313,19 +371,232 @@ class TestUiElementFiltering:
         )
         inside = self._fake_ctrl(100, 100, 200, 140)
         outside = self._fake_ctrl(-900, 300, -800, 340)
+        self._patch_desktop(monkeypatch, [inside, outside])
 
-        class _Win:
-            def descendants(self_inner):
-                return [inside, outside]
+        result = eng.inspect_ui_elements(None, 1)
+        assert len(result.elements) == 1
+        assert result.skipped_off_monitor == 1
+        assert result.error is None
+        assert result.elements[0].scaled_center_x >= 0
+        assert result.elements[0].scaled_center_y >= 0
 
+    def test_result_reports_which_window_was_inspected(self, monkeypatch):
+        """An empty element list and a mis-resolved window look identical without this."""
+        from vision_engine import VisionEngine
+
+        eng = VisionEngine()
         monkeypatch.setattr(
-            "pywinauto.Desktop", lambda backend=None: type(
-                "D", (), {"window": lambda s, **kw: _Win()}
-            )()
+            eng, "get_monitor_bounds", lambda idx=None: (
+                {"left": 0, "top": 0, "width": 2560, "height": 1440}, PRIMARY
+            )
         )
+        self._patch_desktop(monkeypatch, [])
 
-        elements, skipped = eng.inspect_ui_elements(None, 1)
-        assert len(elements) == 1
-        assert skipped == 1
-        assert elements[0].scaled_center_x >= 0
-        assert elements[0].scaled_center_y >= 0
+        result = eng.inspect_ui_elements(None, 1)
+        assert result.elements == []
+        assert result.target is not None
+        assert result.target.handle == 555
+        assert result.target.class_name == "DoubleClass"
+        assert result.target.pid == 4242
+        assert result.target.resolution == "foreground"
+
+    def test_unresolvable_target_is_an_error_not_an_empty_list(self, monkeypatch):
+        """The old code returned ([], 0) here, indistinguishable from a real
+        window that simply exposes no controls."""
+        from vision_engine import VisionEngine
+
+        eng = VisionEngine()
+        monkeypatch.setattr(
+            eng, "get_monitor_bounds", lambda idx=None: (
+                {"left": 0, "top": 0, "width": 2560, "height": 1440}, PRIMARY
+            )
+        )
+        self._patch_desktop(monkeypatch, [], windows=[])
+
+        result = eng.inspect_ui_elements("NoSuchWindowTitle", 1)
+        assert result.target is None
+        assert result.error is not None
+        # Wording is Russian; assert on the stable parts that make the message
+        # actionable rather than on the sentence itself.
+        assert "list_windows_and_monitors" in result.error
+        assert "handle" in result.error
+
+    def test_invalid_handle_is_distinguished_from_no_match(self, monkeypatch):
+        """Dead handle and nothing-matched need different follow-up actions."""
+        import ctypes
+
+        from vision_engine import VisionEngine
+
+        eng = VisionEngine()
+        monkeypatch.setattr(ctypes.windll.user32, "IsWindow", lambda h: 0)
+        monkeypatch.setattr(
+            eng, "get_monitor_bounds", lambda idx=None: (
+                {"left": 0, "top": 0, "width": 2560, "height": 1440}, PRIMARY
+            )
+        )
+        self._patch_desktop(monkeypatch, [], windows=[])
+
+        result = eng.inspect_ui_elements(None, 1, hwnd=999999)
+        assert result.target is None
+        assert result.error is not None
+        # Names the handle and the Win32 check that rejected it, which the
+        # "nothing matched" message does not.
+        assert "999999" in result.error
+        assert "IsWindow" in result.error
+
+
+# --------------------------------------------------------------------------
+# Window target resolution: a title alone does not identify a window
+# --------------------------------------------------------------------------
+class TestWindowResolution:
+    """AyuGram has four top-level windows titled "AyuGramDesktop": the real one
+    with ~1400 descendants and three notification popups with 0-1. Taking the
+    first title match lands on a popup and the agent concludes the application
+    exposes nothing at all."""
+
+    def _wrappers(self):
+        from PyQt6.QtCore import QRect
+
+        class _W:
+            def __init__(self, handle, title, cls, w, h):
+                self.handle = handle
+                self._t, self._c = title, cls
+                self._rect = QRect(0, 0, w, h)
+
+            def window_text(self):
+                return self._t
+
+            def class_name(self):
+                return self._c
+
+            def process_id(self):
+                return 7
+
+            def rectangle(self):
+                return self._rect
+
+        return [
+            _W(101, "AyuGramDesktop", "Window::Notification", 240, 90),
+            _W(102, "AyuGramDesktop", "MainWindow", 1280, 800),
+            _W(103, "AyuGramDesktop", "Window::Notification", 240, 90),
+        ]
+
+    def _resolve(self, monkeypatch, wrappers, **kw):
+        from vision_engine import VisionEngine
+
+        class _Desktop:
+            def __init__(self, backend=None):
+                pass
+
+            def windows(self, **criteria):
+                return wrappers
+
+            def window(self, **criteria):
+                return wrappers[0]
+
+        monkeypatch.setattr("pywinauto.Desktop", _Desktop)
+        return VisionEngine._resolve_window(_Desktop(), **kw)
+
+    def test_ambiguous_title_picks_the_largest(self, monkeypatch):
+        target, n, how = self._resolve(
+            monkeypatch, self._wrappers(),
+            hwnd=None, window_title="AyuGram", class_name=None,
+        )
+        assert n == 3
+        assert how == "largest-of-3"
+        assert target.handle == 102, "must pick the main window, not a popup"
+        assert target.class_name == "MainWindow"
+
+    def test_resolution_is_recorded_on_the_target(self, monkeypatch):
+        target, n, how = self._resolve(
+            monkeypatch, self._wrappers(),
+            hwnd=None, window_title="AyuGram", class_name=None,
+        )
+        assert target.resolution == how == "largest-of-3"
+
+    def test_unique_match_is_labelled_unique(self, monkeypatch):
+        wrappers = self._wrappers()[:1]
+        target, n, how = self._resolve(
+            monkeypatch, wrappers,
+            hwnd=None, window_title="AyuGram", class_name=None,
+        )
+        assert n == 1 and how == "unique"
+        assert target.handle == 101
+
+    def test_no_match_returns_none_with_a_reason(self, monkeypatch):
+        target, n, how = self._resolve(
+            monkeypatch, [],
+            hwnd=None, window_title="NoSuchWindow", class_name=None,
+        )
+        assert target is None
+        assert n == 0
+        assert how == "none"
+
+    def test_explicit_hwnd_bypasses_title_matching(self, monkeypatch):
+        import ctypes
+
+        monkeypatch.setattr(ctypes.windll.user32, "IsWindow", lambda h: 1)
+        target, n, how = self._resolve(
+            monkeypatch, self._wrappers(),
+            hwnd=999, window_title=None, class_name=None,
+        )
+        assert how == "hwnd"
+        assert n == 1
+
+    def test_target_carries_pid_and_class_for_disambiguation(self, monkeypatch):
+        target, _n, _how = self._resolve(
+            monkeypatch, self._wrappers(),
+            hwnd=None, window_title="AyuGram", class_name=None,
+        )
+        assert target.pid == 7
+        assert target.class_name == "MainWindow"
+
+    def test_falls_back_to_win32_title_when_the_uia_name_differs(self, monkeypatch):
+        """The Win32 title and the UIA Name are different strings for one window.
+
+        Qt derives the UIA Name from the application name while GetWindowText
+        returns the document title, so AyuGram's main window is "AyuGramDesktop"
+        to UIA and "Избранное @ Alex Kostin" to Win32. Since
+        list_windows_and_monitors reports Win32 titles, matching only by UIA Name
+        means a title copied out of that list finds nothing.
+        """
+        import vision_engine as ve
+
+        wrappers = self._wrappers()
+
+        class _Desktop:
+            def __init__(self, backend=None):
+                pass
+
+            def windows(self, **criteria):
+                return []  # UIA Name does not match the Win32 title
+
+            def window(self, **criteria):
+                return wrappers[1]
+
+        seen = {}
+
+        def fake_lookup(title, cls=None):
+            seen["title"] = title
+            return 132212
+
+        monkeypatch.setattr(ve, "_find_hwnd_by_win32_title", fake_lookup)
+        target, n, how = ve.VisionEngine._resolve_window(
+            _Desktop(), hwnd=None, window_title="Избранное", class_name=None
+        )
+        assert how == "win32-title"
+        assert n == 1
+        assert target.handle == 102
+        assert seen["title"] == "Избранное"
+
+    def test_win32_lookup_of_a_nonexistent_title_returns_none(self):
+        """Real EnumWindows call; read-only."""
+        from vision_engine import _find_hwnd_by_win32_title
+
+        assert _find_hwnd_by_win32_title("zzz_definitely_no_such_window_zzz") is None
+
+    def test_win32_lookup_rejects_empty_input(self):
+        from vision_engine import _find_hwnd_by_win32_title
+
+        assert _find_hwnd_by_win32_title("") is None
+        assert _find_hwnd_by_win32_title("   ") is None

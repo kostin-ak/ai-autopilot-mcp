@@ -547,6 +547,8 @@ class AutopilotDaemon:
                         "bounds": list(w.rect),
                         "monitor_index": w.monitor_index,
                         "on_monitor": w.on_monitor,
+                        "class_name": w.class_name,
+                        "pid": w.pid,
                         "is_active": w.is_active,
                     }
                     for w in windows[:25]
@@ -558,20 +560,48 @@ class AutopilotDaemon:
         """Returns interactive UI control elements with pre-computed scaled click targets."""
         win_title = params.get("window_title")
         mon_idx = params.get("monitor_index")
+        hwnd = params.get("hwnd")
+        cls = params.get("class_name")
 
-        elements, skipped = await asyncio.to_thread(
-            self.vision.inspect_ui_elements, win_title, mon_idx
+        result = await asyncio.to_thread(
+            self.vision.inspect_ui_elements,
+            window_title=win_title,
+            monitor_index=mon_idx,
+            hwnd=hwnd,
+            class_name=cls,
         )
         bbox, mon = await asyncio.to_thread(self.vision.get_monitor_bounds, mon_idx)
+        monitor_info = {
+            "index": mon.index,
+            "name": mon.name,
+            "bounds": [bbox["left"], bbox["top"], bbox["width"], bbox["height"]],
+        }
+
+        tgt = result.target
+        if tgt is None:
+            # No window resolved at all. Returning an empty element list here
+            # would be indistinguishable from a window that exposes nothing.
+            return {
+                "status": "error",
+                "message": result.error or "No window matched the given criteria.",
+                "data": {"monitor": monitor_info},
+            }
 
         data: dict[str, Any] = {
-            "count": len(elements),
-            "monitor": {
-                "index": mon.index,
-                "name": mon.name,
-                "bounds": [bbox["left"], bbox["top"], bbox["width"], bbox["height"]],
+            "count": len(result.elements),
+            "monitor": monitor_info,
+            "frame": [
+                config.TARGET_IMAGE_WIDTH,
+                round(bbox["height"] / (bbox["width"] / config.TARGET_IMAGE_WIDTH)),
+            ],
+            "target": {
+                "handle": tgt.handle,
+                "title": tgt.title,
+                "class_name": tgt.class_name,
+                "pid": tgt.pid,
+                "bounds": list(tgt.rect),
+                "resolution": tgt.resolution,
             },
-            "frame": [config.TARGET_IMAGE_WIDTH, round(bbox["height"] / (bbox["width"] / config.TARGET_IMAGE_WIDTH))],
             "elements": [
                 {
                     "control_type": e.control_type,
@@ -580,19 +610,32 @@ class AutopilotDaemon:
                     "click_target": [e.scaled_center_x, e.scaled_center_y],
                     "bounds": list(e.rect),
                 }
-                for e in elements[:60]
+                for e in result.elements[:60]
             ],
         }
-        if skipped:
+
+        if tgt.resolution.startswith("largest-of-"):
+            # Several top-level windows share this title. The largest was chosen,
+            # but the caller should not have to guess: an exact handle removes the
+            # doubt entirely.
+            data["ambiguous_title"] = True
+            data["hint_ambiguous"] = (
+                "Несколько окон имеют одинаковый заголовок; выбрано наибольшее по "
+                "площади. Передайте точный handle из list_windows_and_monitors, "
+                "чтобы исключить неоднозначность."
+            )
+        if result.skipped_off_monitor:
             # Tells the agent that the window straddles or sits outside the
             # captured monitor, so it can re-target with a different monitor_index
             # instead of concluding the window has no controls.
-            data["skipped_off_monitor"] = skipped
+            data["skipped_off_monitor"] = result.skipped_off_monitor
             data["hint"] = (
-                f"{skipped} element(s) lie outside monitor {mon.index} and have no "
-                "valid click_target. Re-run with the monitor_index that contains "
-                "the window, using the bounds below."
+                f"{result.skipped_off_monitor} element(s) lie outside monitor "
+                f"{mon.index} and have no valid click_target. Re-run with the "
+                "monitor_index that contains the window, using the bounds below."
             )
+        if result.error:
+            data["warning"] = result.error
 
         return {"status": "ok", "data": data}
 

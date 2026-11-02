@@ -340,8 +340,13 @@ async def list_windows_and_monitors() -> str:
             # nearest screen rather than the containing one.
             marks += " [вне мониторов: индекс приблизительный]"
         output.append(
-            f"- '{w['title']}' (Монитор {w['monitor_index']}, границы={w['bounds']}){marks}"
+            f"- handle={w.get('handle')} '{w['title']}'"
+            f" (Монитор {w['monitor_index']}, границы={w['bounds']}){marks}"
         )
+        if w.get("class_name") or w.get("pid"):
+            output.append(
+                f"    class='{w.get('class_name', '')}' pid={w.get('pid')}"
+            )
 
     return "\n".join(output)
 
@@ -350,18 +355,32 @@ async def list_windows_and_monitors() -> str:
 async def get_ui_elements(
     window_title: str | None = None,
     monitor_index: int | None = None,
+    hwnd: int | None = None,
+    class_name: str | None = None,
 ) -> str:
     """
     Выполняет инспекцию интерактивных элементов UI (кнопки, поля ввода, чекбоксы) через Windows Accessibility.
     Возвращает список элементов с уже готовыми координатами клика, масштабированными под скриншот.
 
     Параметры:
-        window_title: Опциональный фильтр по заголовку окна (если не указан, берется активное окно)
-        monitor_index: Индекс монитора
+        window_title: Фильтр по заголовку окна (подстрока). Если не указан, берется активное окно.
+        monitor_index: Индекс монитора, к кадру которого приводятся координаты.
+        hwnd: Точный дескриптор окна из list_windows_and_monitors. Имеет приоритет над заголовком.
+        class_name: Класс окна Win32, сужает поиск по заголовку.
+
+    Заголовок сам по себе окно не определяет. У приложения может быть несколько окон
+    верхнего уровня с одинаковым заголовком — например, основное окно и окна уведомлений.
+    При неоднозначности выбирается наибольшее по площади, а в ответе сообщается число
+    кандидатов. Чтобы исключить угадывание, передавайте hwnd.
+
+    Ответ всегда сообщает, какое именно окно было выбрано и каким способом. Пустой
+    список элементов при этом отличим от неверно выбранного окна.
     """
     params = {
         "window_title": window_title,
         "monitor_index": monitor_index,
+        "hwnd": hwnd,
+        "class_name": class_name,
     }
     resp = await _send_daemon_request("get_ui_elements", params)
     if resp.get("status") != "ok":
@@ -372,19 +391,30 @@ async def get_ui_elements(
     skipped = data.get("skipped_off_monitor", 0)
     mon = data.get("monitor", {})
     frame = data.get("frame", [])
+    tgt = data.get("target") or {}
 
     header = [
         f"Найдено интерактивных элементов: {len(elements)}",
     ]
+    if tgt:
+        header.append(
+            f"Целевое окно: handle={tgt.get('handle')} '{tgt.get('title')}' "
+            f"class='{tgt.get('class_name')}' pid={tgt.get('pid')} "
+            f"границы={tgt.get('bounds')} выбрано={tgt.get('resolution')}"
+        )
     if mon:
         header.append(
             f"Монитор {mon.get('index')} '{mon.get('name')}' "
             f"границы={mon.get('bounds')} кадр={frame}"
         )
+    if data.get("ambiguous_title") and data.get("hint_ambiguous"):
+        header.append(data["hint_ambiguous"])
     if skipped:
         header.append(f"Пропущено вне этого монитора: {skipped}")
         if data.get("hint"):
             header.append(data["hint"])
+    if data.get("warning"):
+        header.append(f"Предупреждение: {data['warning']}")
 
     if not elements:
         detail = "\n".join(header)

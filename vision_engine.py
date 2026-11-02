@@ -47,6 +47,8 @@ class WindowInfo:
     # False when the center point fell in a gap between monitors and
     # monitor_index is therefore an approximation, not a containment.
     on_monitor: bool = True
+    class_name: str = ""
+    pid: int = 0
 
 
 @dataclass
@@ -59,6 +61,116 @@ class UIElementInfo:
     abs_center_x: int
     abs_center_y: int
     rect: tuple[int, int, int, int]
+
+
+@dataclass
+class WindowTarget:
+    """The window an inspection actually resolved to."""
+
+    handle: int
+    title: str
+    class_name: str
+    pid: int
+    rect: tuple[int, int, int, int]
+    resolution: str = ""
+
+
+@dataclass
+class InspectionResult:
+    """Elements found, plus how the target window was chosen.
+
+    The caller needs the target back because an empty element list and a
+    mis-resolved window look identical from the outside.
+    """
+
+    elements: list[UIElementInfo]
+    skipped_off_monitor: int
+    target: WindowTarget | None
+    error: str | None = None
+
+
+def _target_from(wrapper: Any, resolution: str = "") -> WindowTarget:
+    """Builds a WindowTarget from a pywinauto window wrapper, tolerating failures.
+
+    Every accessor is wrapped in a lambda so that the attribute lookup itself
+    happens inside the guard. Passing the bound method directly would evaluate
+    ``wrapper.window_text`` before ``safe`` is entered and let an AttributeError
+    escape for any wrapper that lacks the attribute.
+    """
+
+    def safe(fn, default):
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    rect = safe(wrapper.rectangle, None)
+    return WindowTarget(
+        handle=safe(lambda: int(wrapper.handle), 0),
+        title=safe(lambda: str(wrapper.window_text() or ""), ""),
+        class_name=safe(lambda: str(wrapper.class_name() or ""), ""),
+        pid=safe(lambda: int(wrapper.process_id()), 0),
+        rect=(
+            (rect.left, rect.top, rect.right, rect.bottom) if rect else (0, 0, 0, 0)
+        ),
+        resolution=resolution,
+    )
+
+
+def _find_hwnd_by_win32_title(
+    title_fragment: str, class_name: str | None = None
+) -> int | None:
+    """Finds a top-level window by its Win32 title, ignoring case.
+
+    Needed because the Win32 title and the UIA Name are different strings for the
+    same window. Qt derives the UIA Name from the application name while
+    GetWindowText returns the document title: AyuGram's main window is
+    "AyuGramDesktop" to UIA and "Избранное @ Alex Kostin" to Win32. Since
+    list_windows_and_monitors reports Win32 titles, an agent that copies a title
+    from there would otherwise match nothing.
+
+    Returns the largest visible match, for the same reason the UIA path does:
+    applications keep several same-titled top-level windows, and the notification
+    popups are the small ones.
+    """
+    user32 = ctypes.windll.user32
+    needle = title_fragment.strip().lower()
+    if not needle:
+        return None
+
+    best: tuple[int, int] | None = None  # (area, hwnd)
+    proto = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd: int, _lparam: int) -> int:
+        nonlocal best
+        if not user32.IsWindowVisible(hwnd):
+            return 1
+
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return 1
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        if needle not in buf.value.strip().lower():
+            return 1
+
+        if class_name:
+            cbuf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, cbuf, 256)
+            if cbuf.value.lower() != class_name.lower():
+                return 1
+
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        area = max(rect.right - rect.left, 0) * max(rect.bottom - rect.top, 0)
+        if area <= 100:
+            return 1
+        if best is None or area > best[0]:
+            best = (area, hwnd)
+        return 1
+
+    user32.EnumWindows(proto(cb), 0)
+    return best[1] if best else None
 
 
 def _distance_to_rect(x: int, y: int, mon: MonitorInfo) -> float:
@@ -376,6 +488,14 @@ class VisionEngine:
                     physical, key=lambda m: _distance_to_rect(mid_x, mid_y, m)
                 ).index
 
+            # Class and process identify a window unambiguously; a bare title
+            # does not. AyuGram, for instance, has four top-level windows called
+            # "AyuGramDesktop": the real one and three notification popups.
+            cls_buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, cls_buf, 256)
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
             windows.append(
                 WindowInfo(
                     handle=hwnd,
@@ -384,6 +504,8 @@ class VisionEngine:
                     monitor_index=matched_monitor,
                     on_monitor=on_monitor,
                     is_active=(hwnd == active_hwnd),
+                    class_name=cls_buf.value,
+                    pid=int(pid.value),
                 )
             )
             return 1
@@ -396,18 +518,31 @@ class VisionEngine:
         return windows
 
     def inspect_ui_elements(
-        self, window_title: str | None = None, monitor_index: int | None = None
-    ) -> tuple[list[UIElementInfo], int]:
-        """Inspects accessible controls (buttons, edits) with coordinates pre-scaled for LLM clicks.
+        self,
+        window_title: str | None = None,
+        monitor_index: int | None = None,
+        hwnd: int | None = None,
+        class_name: str | None = None,
+    ) -> InspectionResult:
+        """Inspects accessible controls with coordinates pre-scaled for the frame.
 
-        Returns the elements whose center lies on the target monitor, plus the
-        number skipped for being off it. Off-monitor elements have no valid frame
-        coordinate; publishing a negative one is worse than omitting the element,
-        because the agent then aims at a point that does not exist in the image it
-        is looking at.
+        Target resolution is explicit because a title alone does not identify a
+        window. AyuGram has four top-level windows titled "AyuGramDesktop": the
+        real one with ~1400 descendants and three notification popups with 0-1.
+        Matching by title regex and taking the first hit lands on a popup, and
+        the agent then reports that the application exposes nothing.
+
+        Preference order: explicit ``hwnd``, then (title, class_name), then the
+        foreground window. When a title matches several windows the largest by
+        area wins -- popups are small -- and the ambiguity is reported so the
+        caller can re-target by handle.
+
+        Off-monitor elements are skipped and counted rather than published with
+        a negative click_target: an element outside the captured frame has no
+        valid coordinate in the image the agent is looking at.
         """
         if sys.platform != "win32":
-            return [], 0
+            return InspectionResult([], 0, None, "UI automation requires Windows")
 
         # Pool thread; DPI awareness is per-thread. See list_windows.
         config.ensure_interactive_desktop()
@@ -419,23 +554,36 @@ class VisionEngine:
 
         elements: list[UIElementInfo] = []
         skipped_off_monitor = 0
+        target: WindowTarget | None = None
+        error: str | None = None
 
         try:
             from pywinauto import Desktop
 
             desktop = Desktop(backend="uia")
-            if window_title:
-                # Escape the caller's text. A title containing regex
-                # metacharacters -- "[admin]" brackets, parentheses, a trailing
-                # backslash -- previously produced re.error or silently matched
-                # the wrong window.
-                win = desktop.window(
-                    title_re=f".*{re.escape(window_title)}.*", visible_only=True
-                )
-            else:
-                user32 = ctypes.windll.user32
-                active_hwnd = user32.GetForegroundWindow()
-                win = desktop.window(handle=active_hwnd)
+            target, _candidates, how = self._resolve_window(
+                desktop, hwnd, window_title, class_name
+            )
+            if target is None:
+                # Distinguish the causes. "The handle you gave me is dead" and
+                # "nothing matched that title" need different follow-up actions,
+                # and a single generic message sends the agent down both.
+                if how == "hwnd-invalid":
+                    message = (
+                        f"Дескриптор окна {hwnd} недействителен (IsWindow вернул false) — "
+                        "окно могло быть закрыто. Запросите list_windows_and_monitors "
+                        "для получения актуальных дескрипторов."
+                    )
+                elif how == "none":
+                    message = (
+                        "Ни одно видимое окно не подошло под заданные критерии. "
+                        "Запросите list_windows_and_monitors и передайте точный handle."
+                    )
+                else:
+                    message = f"Не удалось определить целевое окно (причина: {how})."
+                return InspectionResult([], 0, None, message)
+
+            win = desktop.window(handle=target.handle)
 
             for ctrl in win.descendants():
                 try:
@@ -473,14 +621,11 @@ class VisionEngine:
                     sc_x = int(round((abs_cx - bbox["left"]) / scale_x))
                     sc_y = int(round((abs_cy - bbox["top"]) / scale_y))
 
-                    text = ctrl.window_text().strip()
-                    auto_id = ctrl.automation_id()
-
                     elements.append(
                         UIElementInfo(
                             control_type=c_type,
-                            title=text,
-                            automation_id=auto_id,
+                            title=ctrl.window_text().strip(),
+                            automation_id=ctrl.automation_id(),
                             scaled_center_x=sc_x,
                             scaled_center_y=sc_y,
                             abs_center_x=abs_cx,
@@ -492,8 +637,73 @@ class VisionEngine:
                     continue
 
         except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
             logger.warning(f"UI automation inspection encountered an issue: {exc}")
 
-        return elements, skipped_off_monitor
+        return InspectionResult(elements, skipped_off_monitor, target, error)
+
+    @staticmethod
+    def _resolve_window(
+        desktop: Any,
+        hwnd: int | None,
+        window_title: str | None,
+        class_name: str | None,
+    ) -> tuple[WindowTarget | None, int, str]:
+        """Picks the window to inspect and says how it was picked.
+
+        Returns the target, the number of candidates that matched, and a
+        resolution label. Ambiguity is surfaced rather than silently resolved,
+        because guessing wrong here produces an empty element list that looks
+        identical to an application that exposes no accessibility tree.
+        """
+        user32 = ctypes.windll.user32
+
+        if hwnd:
+            if not user32.IsWindow(hwnd):
+                return None, 0, "hwnd-invalid"
+            return _target_from(desktop.window(handle=hwnd), "hwnd"), 1, "hwnd"
+
+        if not window_title and not class_name:
+            active = user32.GetForegroundWindow()
+            if not active:
+                return None, 0, "none"
+            return _target_from(desktop.window(handle=active), "foreground"), 1, "foreground"
+
+        criteria: dict[str, Any] = {"visible_only": True}
+        if window_title:
+            # Escape the caller's text: brackets, parentheses and trailing
+            # backslashes in a title otherwise produce re.error or a wrong match.
+            criteria["title_re"] = f".*{re.escape(window_title)}.*"
+        if class_name:
+            criteria["class_name"] = class_name
+
+        matches = desktop.windows(**criteria)
+        if not matches:
+            # The Win32 title and the UIA Name are different strings for the same
+            # window. list_windows_and_monitors reports Win32 titles while this
+            # match is against UIA Name, so a title copied out of the window list
+            # can legitimately match nothing here. Fall back to Win32 matching
+            # before giving up.
+            if window_title:
+                handle = _find_hwnd_by_win32_title(window_title, class_name)
+                if handle:
+                    return (
+                        _target_from(desktop.window(handle=handle), "win32-title"),
+                        1,
+                        "win32-title",
+                    )
+            return None, 0, "none"
+        if len(matches) == 1:
+            return _target_from(matches[0], "unique"), 1, "unique"
+
+        def area(w) -> int:
+            try:
+                r = w.rectangle()
+                return max(r.width(), 0) * max(r.height(), 0)
+            except Exception:
+                return 0
+
+        best = max(matches, key=area)
+        return _target_from(best, f"largest-of-{len(matches)}"), len(matches), f"largest-of-{len(matches)}"
 
 
