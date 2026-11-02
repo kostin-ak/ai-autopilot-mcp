@@ -657,9 +657,10 @@ class AutopilotDaemon:
             # instead of concluding the window has no controls.
             data["skipped_off_monitor"] = result.skipped_off_monitor
             data["hint"] = (
-                f"{result.skipped_off_monitor} element(s) lie outside monitor "
-                f"{mon.index} and have no valid click_target. Re-run with the "
-                "monitor_index that contains the window, using the bounds below."
+                f"{result.skipped_off_monitor} элемент(ов) лежат вне монитора "
+                f"{mon.index} и не имеют корректного click_target. Повторите "
+                "запрос с monitor_index того монитора, на котором находится "
+                "окно, используя указанные границы."
             )
         if result.error:
             data["warning"] = result.error
