@@ -38,13 +38,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AutopilotDaemon")
 
-# Actions that never touch the session input queue and may therefore run
-# concurrently with an in-flight input action.
-READ_ONLY_ACTIONS: frozenset[str] = frozenset({
+# Actions that never touch the session input queue. They bypass the input lock
+# and they also stay available while USER_OVERRIDE is active, so the agent can
+# keep observing and -- critically -- can always give control back.
+#
+# release_control belongs here even though it mutates state. Blocking it during
+# USER_OVERRIDE was a dead end: the override gate stopped the only action that
+# clears the HUD frame, so a pause left the neon border lit with no way out
+# except reset_override or killing the daemon.
+NON_INPUT_ACTIONS: frozenset[str] = frozenset({
     "get_screen_state",
     "list_windows_and_monitors",
     "get_ui_elements",
     "reset_override",
+    "release_control",
+    "hud_state",
 })
 
 
@@ -150,6 +158,25 @@ class AutopilotDaemon:
 
         return bbox["left"], bbox["top"], scale_x, scale_y
 
+    @staticmethod
+    def _cursor_in_frame(
+        cursor_abs: tuple[int, int], mon: Any, sx: float, sy: float
+    ) -> list[int] | None:
+        """Maps the desktop cursor into frame coordinates, or None if off-frame.
+
+        Returning an out-of-frame position as though it were valid is worse than
+        returning nothing. With a secondary monitor to the left of the primary,
+        a cursor sitting on the secondary maps to a negative x on the primary's
+        frame, and the agent then aims at coordinates that do not exist in the
+        image it is looking at.
+        """
+        cx, cy = cursor_abs
+        if not (mon.left <= cx < mon.left + mon.width):
+            return None
+        if not (mon.top <= cy < mon.top + mon.height):
+            return None
+        return [int(round((cx - mon.left) / sx)), int(round((cy - mon.top) / sy))]
+
     async def handle_client(self, websocket: ServerConnection) -> None:
         """Handles incoming commands from the MCP gateway over WebSocket."""
         logger.info(f"Client connected from {websocket.remote_address}")
@@ -196,7 +223,7 @@ class AutopilotDaemon:
         screenshot or a tree inspection while a click is still in flight, and
         blocking that would make the observer blind exactly when it matters.
         """
-        if action in READ_ONLY_ACTIONS:
+        if action in NON_INPUT_ACTIONS:
             return await self._dispatch(action, params)
         async with self._input_lock:
             return await self._dispatch(action, params)
@@ -207,7 +234,7 @@ class AutopilotDaemon:
 
         # Immediate return if user override is active. Read-only actions stay
         # available so the agent can still observe and re-plan while paused.
-        if current_state == AutopilotState.USER_OVERRIDE and action not in READ_ONLY_ACTIONS:
+        if current_state == AutopilotState.USER_OVERRIDE and action not in NON_INPUT_ACTIONS:
             return {
                 "status": "interrupted",
                 "state": current_state.value,
@@ -234,6 +261,8 @@ class AutopilotDaemon:
                 return await self._action_list_windows_and_monitors()
             elif action == "get_ui_elements":
                 return await self._action_get_ui_elements(params)
+            elif action == "hud_state":
+                return await self._action_hud_state()
             elif action == "reset_override":
                 self.input_ctrl.reset_override()
                 return {"status": "ok", "state": self.input_ctrl.state.value}
@@ -272,8 +301,7 @@ class AutopilotDaemon:
             show_grid=show_grid,
         )
 
-        img_cur_x = int(round((cursor_abs[0] - mon.left) / sx))
-        img_cur_y = int(round((cursor_abs[1] - mon.top) / sy))
+        cursor_frame = self._cursor_in_frame(cursor_abs, mon, sx, sy)
 
         return {
             "status": "ok",
@@ -284,7 +312,8 @@ class AutopilotDaemon:
                 "scaled_height": h,
                 "scale_x": sx,
                 "scale_y": sy,
-                "cursor": [img_cur_x, img_cur_y],
+                "cursor": cursor_frame,
+                "cursor_desktop": list(cursor_abs),
                 "message": f"Управление захвачено. Рамка HUD активна на мониторе {mon.index} ('{mon.name}').",
             },
         }
@@ -316,8 +345,7 @@ class AutopilotDaemon:
             show_grid=show_grid,
         )
 
-        img_cur_x = int(round((cursor_abs[0] - mon.left) / sx))
-        img_cur_y = int(round((cursor_abs[1] - mon.top) / sy))
+        cursor_frame = self._cursor_in_frame(cursor_abs, mon, sx, sy)
 
         return {
             "status": "ok",
@@ -328,7 +356,8 @@ class AutopilotDaemon:
                 "scaled_height": h,
                 "scale_x": sx,
                 "scale_y": sy,
-                "cursor": [img_cur_x, img_cur_y],
+                "cursor": cursor_frame,
+                "cursor_desktop": list(cursor_abs),
                 "monitor": {
                     "index": mon.index,
                     "name": mon.name,
@@ -388,8 +417,14 @@ class AutopilotDaemon:
         # go. The two differ whenever a move was clipped, interrupted, or the
         # application moved the pointer itself -- and the difference is exactly
         # the signal the agent needs in order to notice a failed click.
-        actual_x = int(round((cursor_abs[0] - mon.left) / sx))
-        actual_y = int(round((cursor_abs[1] - mon.top) / sy))
+        # None means the cursor is not on this monitor at all, which is reported
+        # as such rather than as a bogus negative coordinate.
+        actual = self._cursor_in_frame(cursor_abs, mon, sx, sy)
+        actual_desc = (
+            f"({actual[0]}, {actual[1]})"
+            if actual
+            else f"off-frame (desktop {cursor_abs[0]}, {cursor_abs[1]})"
+        )
 
         return {
             "status": "ok",
@@ -401,15 +436,15 @@ class AutopilotDaemon:
                 "scale_x": sx,
                 "scale_y": sy,
                 "requested": [x, y],
-                "cursor": [actual_x, actual_y],
+                "cursor": actual,
+                "cursor_desktop": list(cursor_abs),
                 "monitor": {
                     "index": mon.index,
                     "name": mon.name,
                     "bounds": [mon.left, mon.top, mon.width, mon.height],
                 },
                 "message": (
-                    f"Mouse {sub_action} at ({x}, {y}); cursor now at "
-                    f"({actual_x}, {actual_y})."
+                    f"Mouse {sub_action} at ({x}, {y}); cursor now at {actual_desc}."
                 ),
             },
         }
@@ -523,22 +558,74 @@ class AutopilotDaemon:
         win_title = params.get("window_title")
         mon_idx = params.get("monitor_index")
 
-        elements = await asyncio.to_thread(self.vision.inspect_ui_elements, win_title, mon_idx)
+        elements, skipped = await asyncio.to_thread(
+            self.vision.inspect_ui_elements, win_title, mon_idx
+        )
+        bbox, mon = await asyncio.to_thread(self.vision.get_monitor_bounds, mon_idx)
+
+        data: dict[str, Any] = {
+            "count": len(elements),
+            "monitor": {
+                "index": mon.index,
+                "name": mon.name,
+                "bounds": [bbox["left"], bbox["top"], bbox["width"], bbox["height"]],
+            },
+            "frame": [config.TARGET_IMAGE_WIDTH, round(bbox["height"] / (bbox["width"] / config.TARGET_IMAGE_WIDTH))],
+            "elements": [
+                {
+                    "control_type": e.control_type,
+                    "title": e.title,
+                    "automation_id": e.automation_id,
+                    "click_target": [e.scaled_center_x, e.scaled_center_y],
+                    "bounds": list(e.rect),
+                }
+                for e in elements[:60]
+            ],
+        }
+        if skipped:
+            # Tells the agent that the window straddles or sits outside the
+            # captured monitor, so it can re-target with a different monitor_index
+            # instead of concluding the window has no controls.
+            data["skipped_off_monitor"] = skipped
+            data["hint"] = (
+                f"{skipped} element(s) lie outside monitor {mon.index} and have no "
+                "valid click_target. Re-run with the monitor_index that contains "
+                "the window, using the bounds below."
+            )
+
+        return {"status": "ok", "data": data}
+
+    async def _action_hud_state(self) -> dict[str, Any]:
+        """Reports live overlay geometry so frame placement is checkable, not assumed.
+
+        The overlay carries WDA_EXCLUDEFROMCAPTURE, so a mis-placed frame never
+        appears in any captured screenshot. These numbers are the only
+        machine-checkable evidence that the border is where it should be:
+        window origin plus target_local must equal target_global.
+        """
+        diag = self.overlay.diagnostics()
+        window = diag["window"]
+        local = diag["target_local"]
+        target_global = diag["target_global"]
+
+        painted_at = None
+        if local is not None:
+            painted_at = [window[0] + local[0], window[1] + local[1]]
+
+        placement_correct = (
+            painted_at is not None
+            and target_global is not None
+            and painted_at[0] == target_global[0]
+            and painted_at[1] == target_global[1]
+        )
 
         return {
             "status": "ok",
+            "state": self.input_ctrl.state.value,
             "data": {
-                "count": len(elements),
-                "elements": [
-                    {
-                        "control_type": e.control_type,
-                        "title": e.title,
-                        "automation_id": e.automation_id,
-                        "click_target": [e.scaled_center_x, e.scaled_center_y],
-                        "bounds": list(e.rect),
-                    }
-                    for e in elements[:60]
-                ],
+                **diag,
+                "painted_at_global": painted_at,
+                "placement_correct": placement_correct,
             },
         }
 

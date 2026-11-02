@@ -145,6 +145,7 @@ def _format_image_and_text(resp: dict[str, Any], default_text: str = "") -> list
     w = data.get("scaled_width")
     h = data.get("scaled_height")
     cursor = data.get("cursor")
+    cursor_desktop = data.get("cursor_desktop")
     msg = data.get("message", default_text)
 
     summary_lines = [f"Статус демона: {state}"]
@@ -154,6 +155,13 @@ def _format_image_and_text(resp: dict[str, Any], default_text: str = "") -> list
         summary_lines.append(f"Разрешение кадра: {w}x{h} px")
     if cursor:
         summary_lines.append(f"Позиция курсора на кадре: ({cursor[0]}, {cursor[1]})")
+    elif cursor_desktop:
+        # A null cursor means the pointer is on a different monitor. Saying so
+        # beats omitting it: the agent otherwise assumes the click landed.
+        summary_lines.append(
+            f"Курсор вне этого кадра: desktop ({cursor_desktop[0]}, {cursor_desktop[1]}). "
+            "Передайте monitor_index того монитора, на котором он находится."
+        )
 
     results.append(_text("\n".join(summary_lines)))
     return results
@@ -353,10 +361,30 @@ async def get_ui_elements(
 
     data = resp.get("data", {})
     elements = data.get("elements", [])
-    if not elements:
-        return "Интерактивные элементы UI не найдены или окно не поддерживает интерфейс Accessibility."
+    skipped = data.get("skipped_off_monitor", 0)
+    mon = data.get("monitor", {})
+    frame = data.get("frame", [])
 
-    output = [f"Найдено интерактивных элементов: {len(elements)}"]
+    header = [
+        f"Найдено интерактивных элементов: {len(elements)}",
+    ]
+    if mon:
+        header.append(
+            f"Монитор {mon.get('index')} '{mon.get('name')}' "
+            f"границы={mon.get('bounds')} кадр={frame}"
+        )
+    if skipped:
+        header.append(f"Пропущено вне этого монитора: {skipped}")
+        if data.get("hint"):
+            header.append(data["hint"])
+
+    if not elements:
+        detail = "\n".join(header)
+        return (
+            f"Интерактивные элементы UI не найдены или окно не поддерживает Accessibility.\n{detail}"
+        )
+
+    output = list(header)
     for el in elements:
         title = el.get("title") or el.get("automation_id") or "Без названия"
         c_type = el.get("control_type", "Control")
@@ -381,6 +409,33 @@ async def reset_user_override() -> str:
 def main() -> None:
     """Entry point for the ``autopilot-mcp`` console script."""
     mcp.run()
+
+
+@mcp.tool()
+async def get_hud_state() -> str:
+    """
+    Возвращает живую геометрию HUD-оверлея: границы окна, обрамляемую область в
+    глобальных и локальных координатах окна, точку, где рамка фактически рисуется,
+    и признак корректности размещения.
+
+    Используйте для проверки того, что неоновая рамка окружает именно нужный монитор.
+    Оверлей аппаратно исключён из скриншотов (WDA_EXCLUDEFROMCAPTURE), поэтому
+    неверно расположенную рамку на снимке не увидеть — эти числа являются единственно
+    проверяемым свидетельством её положения.
+    """
+    resp = await _send_daemon_request("hud_state", {})
+    if resp.get("status") != "ok":
+        return f"Ошибка получения состояния HUD: {resp.get('message', 'Неизвестная ошибка')}"
+
+    d = resp.get("data", {})
+    return "\n".join([
+        f"Состояние: {resp.get('state')}   оверлей видим: {d.get('visible')}",
+        f"Окно оверлея:              {d.get('window')}",
+        f"Цель (глобальные коорд.):  {d.get('target_global')}",
+        f"Цель (локальные коорд.):   {d.get('target_local')}",
+        f"Рамка рисуется в точке:    {d.get('painted_at_global')}",
+        f"Размещение корректно:      {d.get('placement_correct')}",
+    ])
 
 
 if __name__ == "__main__":

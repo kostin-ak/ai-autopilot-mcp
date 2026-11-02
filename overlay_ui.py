@@ -46,6 +46,10 @@ class HUDOverlayWindow(QMainWindow):
         self._state: config.AutopilotState = config.AutopilotState.IDLE
         self._target_rect: QRect | None = None
 
+        # Display-topology tracking; see _connect_screen_signals
+        self._app_signals_connected: bool = False
+        self._tracked_screens: list = []
+
         # Predictive ripple animation state
         self._ripple_pos: QPoint | None = None
         self._ripple_start_time: float = 0.0
@@ -61,6 +65,38 @@ class HUDOverlayWindow(QMainWindow):
 
         self._init_window_flags()
         self._update_geometry()
+        self._connect_screen_signals()
+
+    def _connect_screen_signals(self) -> None:
+        """Re-spans the window whenever display topology or geometry changes.
+
+        Without this the overlay keeps the geometry it had at startup, so
+        plugging in a monitor or changing a resolution leaves the HUD covering
+        the wrong part of the desktop.
+
+        Idempotent: safe to call again when a screen is added, so the new
+        screen's own geometryChanged signal gets tracked too.
+        """
+        # screenAdded / screenRemoved are static signals: in PyQt6 they are
+        # connectable only through the application instance, not the class.
+        app = QGuiApplication.instance()
+        if app is not None and not self._app_signals_connected:
+            app.screenAdded.connect(self._on_screen_topology_changed)
+            app.screenRemoved.connect(self._on_screen_topology_changed)
+            self._app_signals_connected = True
+
+        for screen in QGuiApplication.screens():
+            if screen in self._tracked_screens:
+                continue
+            screen.geometryChanged.connect(self._on_screen_topology_changed)
+            self._tracked_screens.append(screen)
+
+    @pyqtSlot()
+    def _on_screen_topology_changed(self, *_args) -> None:
+        """Handles screenAdded / screenRemoved (QScreen arg) and geometryChanged (no arg)."""
+        self._connect_screen_signals()
+        self._update_geometry()
+        self.update()
 
     def _init_window_flags(self) -> None:
         """Set Qt window flags and attributes for a click-through, always-on-top window."""
@@ -75,15 +111,76 @@ class HUDOverlayWindow(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
 
     def _update_geometry(self) -> None:
-        """Spans the entire virtual desktop covering all connected monitors."""
+        """Spans the entire virtual desktop covering all connected monitors.
+
+        The active target rect is deliberately preserved: it is stored in global
+        desktop coordinates, so it survives a topology change, and resetting it
+        would silently drop the agent's chosen monitor back to "everything".
+        """
         primary_screen = QGuiApplication.primaryScreen()
-        if primary_screen:
-            virtual_geo = primary_screen.virtualGeometry()
-            self.setGeometry(virtual_geo)
+        fallback = QRect(0, 0, 1920, 1080)
+        virtual_geo = primary_screen.virtualGeometry() if primary_screen else fallback
+
+        self.setGeometry(virtual_geo)
+        if self._target_rect is None:
             self._target_rect = QRect(virtual_geo)
-        else:
-            self.setGeometry(0, 0, 1920, 1080)
-            self._target_rect = QRect(0, 0, 1920, 1080)
+
+    def _global_to_local_rect(self, rect: QRect) -> QRect:
+        """Converts a desktop-coordinate rect into this window's paint space.
+
+        The window sits at ``primaryScreen().virtualGeometry()``, whose top-left
+        is not ``(0, 0)`` whenever a secondary monitor is arranged to the left of
+        or above the primary. ``paintEvent`` draws in widget-local coordinates,
+        so painting a desktop-coordinate rect directly offsets it by exactly that
+        origin. On a two-monitor setup with the secondary on the left at
+        ``x = -1920``, the frame for the primary landed 1920px too far left: it
+        covered the whole secondary plus only the left 640px of the primary, which
+        reads on screen as a frame of the wrong size with no right edge.
+        """
+        origin = self.geometry().topLeft()
+        return QRect(
+            rect.x() - origin.x(),
+            rect.y() - origin.y(),
+            rect.width(),
+            rect.height(),
+        )
+
+    def _global_to_local_point(self, point: QPoint) -> QPoint:
+        """Converts a desktop-coordinate point into this window's paint space."""
+        origin = self.geometry().topLeft()
+        return QPoint(point.x() - origin.x(), point.y() - origin.y())
+
+    @property
+    def target_rect_global(self) -> QRect | None:
+        """The framed region, in global desktop coordinates."""
+        return self._target_rect
+
+    def diagnostics(self) -> dict:
+        """Live geometry, so frame placement can be verified rather than assumed.
+
+        WDA_EXCLUDEFROMCAPTURE keeps this window out of every screenshot, which
+        is correct for capture but means a mis-placed frame cannot be seen in a
+        captured frame. These numbers are the only machine-checkable evidence
+        that the border is where it should be.
+        """
+        geom = self.geometry()
+        target = self._target_rect
+        local = self._global_to_local_rect(target) if target is not None else None
+        return {
+            "visible": self.isVisible(),
+            "window": [geom.x(), geom.y(), geom.width(), geom.height()],
+            "target_global": (
+                [target.x(), target.y(), target.width(), target.height()]
+                if target is not None
+                else None
+            ),
+            "target_local": (
+                [local.x(), local.y(), local.width(), local.height()]
+                if local is not None
+                else None
+            ),
+            "state": self._state.value,
+        }
 
     def showEvent(self, event) -> None:
         """Apply OS-native capture exclusion and window styles upon showing."""
@@ -206,17 +303,26 @@ class HUDOverlayWindow(QMainWindow):
         self.update()
 
     def paintEvent(self, event: QPaintEvent) -> None:
-        """Renders glowing HUD border and active target ripple."""
+        """Renders glowing HUD border and active target ripple.
+
+        Both inputs are stored in global desktop coordinates and converted here.
+        Converting at paint time rather than at store time means a display
+        topology change cannot leave stale widget-local values behind.
+        """
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         # 1. Draw glowing perimeter border based on state
         if self._state != config.AutopilotState.IDLE and self._target_rect:
-            self._draw_neon_border(painter, self._target_rect, self._state)
+            self._draw_neon_border(
+                painter, self._global_to_local_rect(self._target_rect), self._state
+            )
 
         # 2. Draw predictive ripple target if active
         if self._ripple_active and self._ripple_pos:
-            self._draw_ripple_marker(painter, self._ripple_pos)
+            self._draw_ripple_marker(
+                painter, self._global_to_local_point(self._ripple_pos)
+            )
 
         painter.end()
 

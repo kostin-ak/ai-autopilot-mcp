@@ -336,10 +336,17 @@ class VisionEngine:
 
     def inspect_ui_elements(
         self, window_title: str | None = None, monitor_index: int | None = None
-    ) -> list[UIElementInfo]:
-        """Inspects accessible controls (buttons, edits) with coordinates pre-scaled for LLM clicks."""
+    ) -> tuple[list[UIElementInfo], int]:
+        """Inspects accessible controls (buttons, edits) with coordinates pre-scaled for LLM clicks.
+
+        Returns the elements whose center lies on the target monitor, plus the
+        number skipped for being off it. Off-monitor elements have no valid frame
+        coordinate; publishing a negative one is worse than omitting the element,
+        because the agent then aims at a point that does not exist in the image it
+        is looking at.
+        """
         if sys.platform != "win32":
-            return []
+            return [], 0
 
         # Pool thread; DPI awareness is per-thread. See list_windows.
         config.ensure_interactive_desktop()
@@ -350,6 +357,7 @@ class VisionEngine:
         scale_y = bbox["height"] / float(scaled_h)
 
         elements: list[UIElementInfo] = []
+        skipped_off_monitor = 0
 
         try:
             from pywinauto import Desktop
@@ -393,6 +401,13 @@ class VisionEngine:
                     abs_cx = (rect.left + rect.right) // 2
                     abs_cy = (rect.top + rect.bottom) // 2
 
+                    if not (
+                        bbox["left"] <= abs_cx < bbox["left"] + bbox["width"]
+                        and bbox["top"] <= abs_cy < bbox["top"] + bbox["height"]
+                    ):
+                        skipped_off_monitor += 1
+                        continue
+
                     # Convert to scaled screenshot coordinate
                     sc_x = int(round((abs_cx - bbox["left"]) / scale_x))
                     sc_y = int(round((abs_cy - bbox["top"]) / scale_y))
@@ -418,5 +433,6 @@ class VisionEngine:
         except Exception as exc:
             logger.warning(f"UI automation inspection encountered an issue: {exc}")
 
-        return elements
+        return elements, skipped_off_monitor
+
 
