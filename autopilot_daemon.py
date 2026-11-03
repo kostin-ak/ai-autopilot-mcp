@@ -31,6 +31,7 @@ from uia_client import (
     DEFAULT_MAX_DEPTH,
     DEFAULT_MAX_NODES,
     DEFAULT_TIME_BUDGET_S,
+    TERMINAL_BUFFER_ROWS,
     UIAClient,
 )
 from vision_engine import ScreenCaptureError, VisionEngine
@@ -60,6 +61,11 @@ NON_INPUT_ACTIONS: frozenset[str] = frozenset({
     "probe_target",
     "get_snapshot",
     "resolve_clickable",
+    # Reading a console buffer touches nothing. Writing to one does mutate the
+    # target, so write_terminal is deliberately absent: it takes the input lock and
+    # stays blocked while a human has taken over.
+    "read_terminal",
+    "wait_terminal",
     "reset_override",
     "release_control",
     "hud_state",
@@ -309,6 +315,12 @@ class AutopilotDaemon:
                 return await self._action_resolve_clickable(params)
             elif action == "element_action":
                 return await self._action_element_action(params)
+            elif action == "read_terminal":
+                return await self._action_read_terminal(params)
+            elif action == "write_terminal":
+                return await self._action_write_terminal(params)
+            elif action == "wait_terminal":
+                return await self._action_wait_terminal(params)
             elif action == "hud_state":
                 return await self._action_hud_state()
             elif action == "reset_override":
@@ -1003,6 +1015,134 @@ class AutopilotDaemon:
                 "before": res.before,
                 "after": res.after,
                 "message": res.message,
+            },
+        }
+
+    async def _action_read_terminal(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Reads a console buffer through TextPattern and returns a slice of it.
+
+        The whole buffer is reachable in one read -- measured at 9000 rows, about
+        1.1 MB, in 30 ms -- which is far too much to hand back, so a slice is
+        selected here. The default is the tail, because that is where the result of
+        the last command is.
+        """
+        handle, how = await self._resolve_target(params)
+        if handle is None:
+            return {"status": "error", "message": how}
+
+        buf = await asyncio.to_thread(self.uia.read_terminal, handle)
+        if buf.error:
+            return {"status": "error", "message": buf.error}
+
+        lines = buf.lines
+        contains = params.get("contains")
+        matched = None
+        if contains:
+            matched = sum(1 for ln in lines if str(contains) in ln)
+            lines = [ln for ln in lines if str(contains) in ln]
+
+        head = params.get("head")
+        start = params.get("start")
+        count = params.get("count")
+        tail = params.get("tail")
+        if head:
+            selected, mode = lines[: int(head)], "head"
+        elif start is not None or count:
+            s = int(start or 0)
+            n = int(count or 200)
+            selected, mode = lines[s:s + n], "range"
+        else:
+            n = int(tail or 200)
+            selected, mode = lines[-n:] if n else [], "tail"
+
+        warnings: list[str] = []
+        if buf.buffer_full:
+            warnings.append(
+                f"Буфер консоли полон ({TERMINAL_BUFFER_ROWS} строк): самый старый "
+                "вывод уже потерян безвозвратно. Для длинных команд читайте буфер "
+                "по мере поступления, а не один раз в конце."
+            )
+        if matched == 0:
+            warnings.append(
+                f"Строка {contains!r} в буфере не найдена. Это не то же самое, что "
+                "пустой буфер: прочитано строк — "
+                f"{buf.row_count}."
+            )
+
+        return {
+            "status": "ok",
+            "data": {
+                "handle": handle,
+                "resolution": how,
+                "host": buf.host,
+                "row_count": buf.row_count,
+                "char_count": buf.char_count,
+                "buffer_full": buf.buffer_full,
+                "read_ms": round(buf.read_ms, 1),
+                "mode": mode,
+                "selected_count": len(selected),
+                "matched_count": matched,
+                "lines": selected,
+                "warnings": warnings,
+            },
+        }
+
+    async def _action_write_terminal(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Types into a console through posted WM_CHAR. Class B: no cursor.
+
+        Mutating, so it takes the input lock and stays blocked during USER_OVERRIDE.
+        """
+        handle, how = await self._resolve_target(params)
+        if handle is None:
+            return {"status": "error", "message": how}
+        text = params.get("text")
+        if text is None:
+            return {"status": "error", "message": "Не указан text для записи."}
+
+        expect = params.get("expect")
+        res = await asyncio.to_thread(
+            lambda: self.uia.write_terminal(
+                handle, str(text),
+                enter=bool(params.get("enter", True)),
+                expect=None if expect is None else str(expect),
+                timeout_s=float(params.get("timeout_s") or 3.0),
+            )
+        )
+        return {
+            "status": "ok",
+            "data": {
+                "handle": handle, "resolution": how, "ok": res.ok,
+                "verified": res.verified, "weak_verification": res.weak_verification,
+                "input_hwnd": res.input_hwnd, "posted": res.posted,
+                "chars": res.chars, "host": res.host, "message": res.message,
+                "tail": res.tail,
+            },
+        }
+
+    async def _action_wait_terminal(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Waits for text in a console buffer instead of sleeping a fixed time."""
+        handle, how = await self._resolve_target(params)
+        if handle is None:
+            return {"status": "error", "message": how}
+        expect = params.get("expect")
+        if not expect:
+            return {"status": "error",
+                    "message": "Не указан expect — строка, которую нужно дождаться."}
+
+        res = await asyncio.to_thread(
+            lambda: self.uia.wait_terminal(
+                handle, str(expect),
+                timeout_s=float(params.get("timeout_s") or 30.0),
+                interval_s=float(params.get("interval_s") or 0.25),
+                after_text=params.get("after_text"),
+            )
+        )
+        return {
+            "status": "ok",
+            "data": {
+                "handle": handle, "resolution": how, "found": res.found,
+                "elapsed_s": round(res.elapsed_s, 2), "polls": res.polls,
+                "tail": res.tail, "message": res.message,
             },
         }
 

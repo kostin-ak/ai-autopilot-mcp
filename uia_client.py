@@ -115,6 +115,108 @@ OPAQUE_USEFUL_THRESHOLD = 5
 OPAQUE_SAMPLE_FLOOR = 2
 
 
+# Terminal support, per ADR-0009.
+#
+# 9000 rows was measured, not assumed: printing 12000 lines returned the newest
+# 9000 contiguously with the oldest 3002 gone, and printing 9000 lost only the two
+# rows the shell itself consumed. It is the cmd default buffer height on this
+# machine and is configurable, so it is used as a signal to warn rather than as a
+# hard law.
+TERMINAL_BUFFER_ROWS = 9000
+
+# The XAML island child that Windows Terminal actually routes keyboard input
+# through. Posting WM_CHAR to the top-level window, to the drag bar or to the
+# Composition bridge is accepted by PostMessage and then ignored.
+_INPUT_SITE_CLASS = "Windows.UI.Input.InputSite.WindowClass"
+_WM_CHAR = 0x0102
+_VK_RETURN = 0x0D
+
+
+@dataclass
+class TerminalBuffer:
+    """Console screen buffer as read through TextPattern."""
+
+    text: str
+    lines: list[str]
+    row_count: int
+    char_count: int
+    buffer_full: bool
+    host: str
+    read_ms: float
+    error: str | None = None
+
+
+@dataclass
+class TerminalWriteResult:
+    """Outcome of typing into a console, and whether it was read back."""
+
+    ok: bool
+    verified: bool
+    input_hwnd: int | None
+    posted: int
+    message: str
+    chars: int = 0
+    host: str = ""
+    weak_verification: bool = False
+    tail: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TerminalWaitResult:
+    """Outcome of waiting for text in a console buffer."""
+
+    found: bool
+    elapsed_s: float
+    polls: int
+    tail: list[str] = field(default_factory=list)
+    message: str = ""
+
+
+def _find_child_by_class(hwnd: int, class_name: str) -> int | None:
+    """First child window with an exact class name, or None."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    found: list[int] = []
+    proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(child, _lparam):
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(child, buf, 256)
+        if buf.value == class_name:
+            found.append(int(child))
+        return True
+
+    user32.EnumChildWindows(hwnd, proto(cb), 0)
+    return found[0] if found else None
+
+
+def _post_chars(hwnd: int, text: str, enter: bool) -> int:
+    """Posts WM_CHAR per character, then a carriage return if asked.
+
+    Posted rather than sent through the session input queue, which is what keeps
+    this a Class B action: the cursor and keyboard stay with the human. Text goes
+    character by character so the console's own input handling applies.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.PostMessageW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostMessageW.restype = wintypes.BOOL
+
+    posted = 0
+    for ch in text:
+        if user32.PostMessageW(hwnd, _WM_CHAR, ord(ch), 0):
+            posted += 1
+    if enter and user32.PostMessageW(hwnd, _WM_CHAR, _VK_RETURN, 0):
+        posted += 1
+    return posted
+
+
 @dataclass(frozen=True)
 class NodeSnapshot:
     """One element in a bounded snapshot."""
@@ -1283,6 +1385,229 @@ class UIAClient:
             verified, "expand_collapse", path, verified, before=before, after=after,
             message=(f"Состояние: {before} -> {after}." if verified else
                      f"Ожидалось {want}, получено {after!r}."))
+
+    # ------------------------------------------------------------- terminals
+    def terminal_host(self, hwnd: int) -> str:
+        """Identifies the console host, which decides where WM_CHAR must go.
+
+        Detected by window class, which is stable, rather than by tree shape.
+        """
+        try:
+            cls = (self._retry(
+                lambda: self.element_from_handle(hwnd).CurrentClassName
+            ) or "").lower()
+        except COMError:
+            cls = ""
+        if "cascadia_hosting" in cls:
+            return "windows-terminal"
+        if "consolewindowclass" in cls:
+            return "conhost"
+        return "unknown"
+
+    def find_terminal_input(self, hwnd: int) -> int | None:
+        """The window that accepts posted WM_CHAR for this console.
+
+        ADR-0009 measured every route on Windows Terminal: the top-level window,
+        SendMessage as well as PostMessage, KEYDOWN/CHAR/KEYUP triples, the drag bar
+        and the Composition bridge all failed. The one that works is the XAML
+        island's input site child. Legacy conhost accepts WM_CHAR on the top-level
+        window itself.
+        """
+        if self.terminal_host(hwnd) == "conhost":
+            return hwnd
+        return _find_child_by_class(hwnd, _INPUT_SITE_CLASS) or hwnd
+
+    def terminal_buffer_element(self, hwnd: int):
+        """The element holding the console screen buffer, plus its TextPattern.
+
+        The buffer element's control type differs between hosts -- Document on
+        conhost, Text on Windows Terminal -- so it is selected by having the most
+        TextPattern content, not by type. The short ones are the tab title and
+        status text.
+        """
+        el = self.element_from_handle(hwnd)
+        auto = self._automation()
+        mod = self._typelib()
+        try:
+            arr = self._retry(
+                lambda: el.FindAll(mod.TreeScope_Descendants,
+                                   auto.CreateTrueCondition())
+            )
+        except COMError:
+            return None, None
+        best_len, best_el, best_tp = 0, None, None
+        pid = self.patterns().get("Text")
+        for i in range(arr.Length):
+            e = arr.GetElement(i)
+            try:
+                unk = e.GetCurrentPattern(pid)
+                if not unk:
+                    continue
+                tp = unk.QueryInterface(mod.IUIAutomationTextPattern)
+                t = tp.DocumentRange.GetText(-1) or ""
+            except (COMError, AttributeError, TypeError):
+                continue
+            if len(t) > best_len:
+                best_len, best_el, best_tp = len(t), e, tp
+        return best_el, best_tp
+
+    def read_terminal(self, hwnd: int) -> TerminalBuffer:
+        """Reads the console screen buffer through TextPattern.
+
+        Returns the whole buffer, not the viewport: measured on both hosts, 2000
+        printed lines came back complete and contiguous, and 12000 came back as the
+        newest 9000. One read of a full 9000-row buffer is about 1.1 MB in 30 ms.
+
+        Rows are right-stripped because the console pads every row to its width, but
+        leading whitespace is kept: indentation is meaningful in code and in command
+        output. Trailing blank rows are dropped, which also drops a genuinely blank
+        final line -- an acceptable loss next to returning hundreds of padding rows.
+        """
+        t0 = time.monotonic()
+        _el, tp = self.terminal_buffer_element(hwnd)
+        if tp is None:
+            return TerminalBuffer(
+                text="", lines=[], row_count=0, char_count=0,
+                buffer_full=False, host=self.terminal_host(hwnd),
+                read_ms=(time.monotonic() - t0) * 1000,
+                error="TextPattern не найден: консольный буфер недоступен.",
+            )
+        try:
+            raw = tp.DocumentRange.GetText(-1) or ""
+        except COMError as exc:
+            return TerminalBuffer(
+                text="", lines=[], row_count=0, char_count=0,
+                buffer_full=False, host=self.terminal_host(hwnd),
+                read_ms=(time.monotonic() - t0) * 1000,
+                error=f"GetText отказал: {self._hresult(exc)}",
+            )
+
+        raw = raw.replace("\r", "")
+        lines = [ln.rstrip() for ln in raw.split("\n")]
+        while lines and not lines[-1]:
+            lines.pop()
+        text = "\n".join(lines)
+        return TerminalBuffer(
+            text=text,
+            lines=lines,
+            row_count=len(lines),
+            char_count=len(text),
+            buffer_full=len(lines) >= TERMINAL_BUFFER_ROWS,
+            host=self.terminal_host(hwnd),
+            read_ms=(time.monotonic() - t0) * 1000,
+        )
+
+    def write_terminal(
+        self, hwnd: int, text: str, *, enter: bool = True,
+        expect: str | None = None, timeout_s: float = 3.0,
+    ) -> TerminalWriteResult:
+        """Types into a console through posted WM_CHAR, without using the cursor.
+
+        Verification is by re-reading the buffer, which ADR-0009 makes mandatory:
+        ValuePattern on a terminal reports IsReadOnly=0, accepts SetValue and
+        changes nothing. A write that is not read back is not known to have
+        happened.
+
+        ``expect`` is what must appear in the buffer afterwards. It defaults to the
+        text itself, which is right for a shell that echoes its input. Pass an empty
+        string when echo is suppressed, as at a password prompt, and verification
+        falls back to "the buffer changed", which is weaker and is reported as such.
+        """
+        target = self.find_terminal_input(hwnd)
+        if target is None:
+            return TerminalWriteResult(
+                ok=False, verified=False, input_hwnd=None, posted=0,
+                message="Не найдено окно ввода консоли.",
+            )
+
+        before = self.read_terminal(hwnd)
+        if before.error:
+            return TerminalWriteResult(
+                ok=False, verified=False, input_hwnd=target, posted=0,
+                message=f"Буфер не читается до записи: {before.error}",
+            )
+
+        posted = _post_chars(target, text, enter)
+        needle = text.strip() if expect is None else expect
+        weak = not needle
+
+        deadline = time.monotonic() + timeout_s
+        after = before
+        verified = False
+        while time.monotonic() < deadline:
+            after = self.read_terminal(hwnd)
+            if weak:
+                if after.text != before.text:
+                    verified = True
+                    break
+            elif needle in after.text:
+                verified = True
+                break
+            time.sleep(0.05)
+
+        tail = after.lines[-12:] if after.lines else []
+        if verified:
+            msg = ("Запись подтверждена перечитыванием буфера."
+                   if not weak else
+                   "Буфер изменился. Подтверждение слабое: ожидаемая строка не "
+                   "задавалась, эхо подавлено.")
+        else:
+            msg = (
+                "Запись НЕ подтверждена: ожидаемая строка не появилась в буфере. "
+                "Повторять вслепую нельзя — команда могла исполниться, а вывод ещё "
+                "не дошёл, либо окно ввода определено неверно."
+            )
+        return TerminalWriteResult(
+            ok=verified, verified=verified, input_hwnd=target, posted=posted,
+            chars=len(text), message=msg, tail=tail,
+            host=after.host, weak_verification=weak,
+        )
+
+    def wait_terminal(
+        self, hwnd: int, expect: str, *, timeout_s: float = 30.0,
+        interval_s: float = 0.25, after_text: str | None = None,
+    ) -> TerminalWaitResult:
+        """Waits for text to appear in the console buffer.
+
+        This replaces a fixed sleep. A terminal can be read directly, so "wait until
+        the output contains X" is both faster and more reliable than waiting a
+        guessed duration: it returns as soon as the text lands and says plainly when
+        it never did.
+
+        ``after_text`` matters more than it looks. A shell echoes the command line
+        before running it, so waiting for a string that also appears in the command
+        returns immediately on the echo and proves nothing. Measured: waiting for a
+        marker produced by ``ping -n 3 ... & echo MARKER`` reported success in 0.0 s
+        on the first poll, because MARKER was already on screen as part of the echoed
+        command. Pass the command that was typed and the search starts after it, or
+        wait for text the command does not literally contain.
+        """
+        started = time.monotonic()
+        deadline = started + timeout_s
+        polls = 0
+        last = None
+        while time.monotonic() < deadline:
+            polls += 1
+            last = self.read_terminal(hwnd)
+            if last.error is None:
+                haystack = last.text
+                if after_text:
+                    cut = haystack.rfind(after_text)
+                    if cut >= 0:
+                        haystack = haystack[cut + len(after_text):]
+                if expect in haystack:
+                    return TerminalWaitResult(
+                        found=True, elapsed_s=time.monotonic() - started,
+                        polls=polls, tail=last.lines[-12:],
+                    )
+            time.sleep(interval_s)
+        tail = last.lines[-12:] if last and last.lines else []
+        return TerminalWaitResult(
+            found=False, elapsed_s=time.monotonic() - started, polls=polls,
+            tail=tail,
+            message=(f"За {timeout_s:.0f} с строка {expect!r} в буфере не появилась "
+                     f"({polls} опросов)."),
+        )
 
     # ------------------------------------------------------- continuation
     @staticmethod

@@ -615,6 +615,7 @@ class TestToolDescriptions:
         "keyboard_action", "scroll_screen", "list_windows_and_monitors",
         "get_ui_elements", "reset_user_override", "get_hud_state",
         "probe_target", "get_snapshot", "resolve_clickable", "act_on_element",
+        "read_terminal", "write_terminal", "wait_terminal",
     }
 
     def test_every_tool_has_a_non_empty_english_description(self):
@@ -716,6 +717,29 @@ class TestToolDescriptions:
         desc = self._desc("act_on_element")
         assert "cursor" in desc.lower()
         assert "Class B" in desc
+
+    def test_read_terminal_documents_the_ring_buffer_limit(self):
+        """Past ~9000 rows the oldest output is gone for good. An agent that does
+        not know this reads once at the end and silently loses the beginning."""
+        desc = self._desc("read_terminal")
+        assert "9000" in desc
+        assert "ring" in desc.lower()
+        assert "viewport" in desc.lower(), "must say it is not just the viewport"
+
+    def test_write_terminal_documents_why_readback_is_mandatory(self):
+        """ValuePattern on a terminal accepts SetValue and changes nothing."""
+        desc = self._desc("write_terminal")
+        assert "IsReadOnly" in desc
+        assert "read back" in desc.lower() or "re-reading" in desc.lower()
+        assert "input site" in desc.lower(), "the WT child window is the point"
+
+    def test_wait_terminal_documents_the_echo_trap(self):
+        """A shell echoes the command before running it, so waiting on a string that
+        appears in the command proves nothing. Measured at 0.00 s versus 6.16 s."""
+        desc = self._desc("wait_terminal")
+        assert "after_text" in desc
+        assert "echo" in desc.lower()
+        assert "0.00" in desc and "6.16" in desc
 # --------------------------------------------------------------------------
 # Session lock state must reach the agent
 # --------------------------------------------------------------------------

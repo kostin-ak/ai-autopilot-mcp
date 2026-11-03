@@ -905,6 +905,9 @@ class TestReadBack:
     reported Collapsed; the read a few hundred milliseconds later reported
     Expanded. A single read turns that into a false negative, and an agent that
     retries a toggle or an expand undoes the action it just performed.
+
+    On a live Firefox address bar the gap was about 1000 ms, which is why the
+    default timeout is 1.5 s rather than 0.5 s.
     """
 
     def test_polls_until_the_state_arrives(self):
@@ -955,3 +958,160 @@ class TestReadBack:
         )
         assert ok is True
         assert calls["n"] == 1, "no reason to sleep when the first read matches"
+
+
+# ---------------------------------------------------------------- terminals
+class _FakeTextRange:
+    def __init__(self, text):
+        self._text = text
+
+    def GetText(self, _max):
+        return self._text
+
+
+class _FakeTextPattern:
+    def __init__(self, text):
+        self.DocumentRange = _FakeTextRange(text)
+
+
+HOSTS = {
+    "ConsoleWindowClass": "conhost",
+    "CASCADIA_HOSTING_WINDOW_CLASS": "windows-terminal",
+}
+
+
+class TermClient(FakeClient):
+    """FakeClient with a canned console buffer behind TextPattern."""
+
+    def __init__(self, root, buffer_text="", host_class="ConsoleWindowClass"):
+        super().__init__(root)
+        self.buffer_text = buffer_text
+        self.host_class = host_class
+        self.reads = 0
+
+    def terminal_buffer_element(self, hwnd):
+        self.reads += 1
+        return object(), _FakeTextPattern(self.buffer_text)
+
+    def terminal_host(self, hwnd):
+        return HOSTS.get(self.host_class, "unknown")
+
+    def find_terminal_input(self, hwnd):
+        return hwnd
+
+
+PAD = " " * 40
+
+
+class TestReadTerminal:
+    def test_rows_are_right_stripped_but_indentation_kept(self):
+        """The console pads every row to its width; indentation is meaningful."""
+        text = f"$ cmd{PAD}\r\n    indented output{PAD}\r\n"
+        buf = TermClient(FakeElement("root"), buffer_text=text).read_terminal(1)
+        assert buf.error is None
+        assert buf.lines == ["$ cmd", "    indented output"]
+        assert buf.row_count == 2
+
+    def test_trailing_blank_rows_are_dropped(self):
+        text = f"real line{PAD}\r\n{PAD}\r\n{PAD}\r\n"
+        buf = TermClient(FakeElement("root"), buffer_text=text).read_terminal(1)
+        assert buf.lines == ["real line"]
+
+    def test_carriage_returns_are_removed(self):
+        buf = TermClient(FakeElement("root"),
+                         buffer_text="a\r\nb\r\n").read_terminal(1)
+        assert "\r" not in buf.text
+        assert buf.lines == ["a", "b"]
+
+    def test_buffer_full_is_signalled_at_the_ring_limit(self):
+        """Past 9000 rows the oldest output is gone for good, and the reader has
+        to say so rather than return a plausible-looking truncated result."""
+        rows = "\r\n".join(f"line{i}" for i in range(uc.TERMINAL_BUFFER_ROWS))
+        buf = TermClient(FakeElement("root"), buffer_text=rows).read_terminal(1)
+        assert buf.row_count == uc.TERMINAL_BUFFER_ROWS
+        assert buf.buffer_full is True
+
+    def test_small_buffer_is_not_reported_full(self):
+        buf = TermClient(FakeElement("root"),
+                         buffer_text="a\r\nb\r\n").read_terminal(1)
+        assert buf.buffer_full is False
+
+    def test_host_is_reported(self):
+        for host_class, expected in HOSTS.items():
+            buf = TermClient(FakeElement("root"), buffer_text="x",
+                             host_class=host_class).read_terminal(1)
+            assert buf.host == expected
+
+    def test_missing_text_pattern_is_an_error_not_empty_text(self):
+        """An empty string would look like a terminal with no output."""
+        client = FakeClient(FakeElement("root"))
+        client.terminal_buffer_element = lambda hwnd: (None, None)
+        buf = client.read_terminal(1)
+        assert buf.error
+        assert buf.lines == []
+
+
+class TestWaitTerminal:
+    def test_echo_trap_returns_immediately_without_an_anchor(self):
+        """A shell echoes the command before running it, so a marker that appears in
+        the command line satisfies the wait without the command having finished.
+
+        Measured live: found in 0.00 s for a command containing a 6-second delay.
+        """
+        echoed = "C:\\Users>x>ping -n 7 127.0.0.1 >nul & echo TRAP\r\n"
+        client = TermClient(FakeElement("root"), buffer_text=echoed)
+        r = client.wait_terminal(1, "TRAP", timeout_s=1.0, interval_s=0.01)
+        assert r.found is True
+        assert r.polls == 1, "matched the echo on the first poll"
+
+    def test_anchor_past_the_echo_makes_the_wait_real(self):
+        echoed = "C:\\Users>x>ping -n 7 127.0.0.1 >nul & echo TRAP\r\n"
+        client = TermClient(FakeElement("root"), buffer_text=echoed)
+        r = client.wait_terminal(
+            1, "TRAP", timeout_s=0.2, interval_s=0.01,
+            after_text="ping -n 7 127.0.0.1 >nul & echo TRAP")
+        assert r.found is False, "the real output has not arrived yet"
+        assert r.message and r.polls > 1
+
+    def test_anchor_still_finds_real_output(self):
+        text = ("C:\\x>echo TRAP\r\nTRAP\r\nC:\\x>")
+        client = TermClient(FakeElement("root"), buffer_text=text)
+        r = client.wait_terminal(1, "TRAP", timeout_s=1.0, interval_s=0.01,
+                                 after_text="echo TRAP")
+        assert r.found is True
+
+    def test_absence_is_reported_with_a_message(self):
+        client = TermClient(FakeElement("root"), buffer_text="some output\r\n")
+        r = client.wait_terminal(1, "NEVER", timeout_s=0.2, interval_s=0.01)
+        assert r.found is False
+        assert "NEVER" in r.message
+        assert r.elapsed_s >= 0.2
+
+    def test_last_echo_wins_when_the_command_ran_twice(self):
+        """rfind, not find: a repeated command leaves earlier echoes in the buffer,
+        and anchoring on the first one would search stale output."""
+        text = ("C:\\x>echo TRAP\r\nold\r\nC:\\x>echo TRAP\r\n")
+        client = TermClient(FakeElement("root"), buffer_text=text)
+        r = client.wait_terminal(1, "old", timeout_s=0.2, interval_s=0.01,
+                                 after_text="echo TRAP")
+        assert r.found is False, "anchored past the last echo, 'old' is behind it"
+
+
+class TestTerminalHostClassification:
+    def test_conhost_and_terminal_are_distinguished(self):
+        for host_class, expected in HOSTS.items():
+            root = FakeElement("root", class_name=host_class)
+            assert FakeClient(root).terminal_host(1) == expected
+
+    def test_unknown_class_is_not_guessed(self):
+        root = FakeElement("root", class_name="SomeOtherClass")
+        assert FakeClient(root).terminal_host(1) == "unknown"
+
+
+def test_post_chars_to_a_dead_window_reports_zero():
+    """An invalid handle must not raise into the caller."""
+    assert uc._post_chars(0xDEADBEEF, "text", True) == 0
+
+
+def test_find_child_by_class_returns_none_when_absent():
+    assert uc._find_child_by_class(0xDEADBEEF, uc._INPUT_SITE_CLASS) is None

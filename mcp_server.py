@@ -784,6 +784,216 @@ async def act_on_element(
 
 
 @mcp.tool()
+async def read_terminal(
+    hwnd: int | None = None,
+    window_title: str | None = None,
+    class_name: str | None = None,
+    tail: int = 200,
+    head: int | None = None,
+    start: int | None = None,
+    count: int | None = None,
+    contains: str | None = None,
+) -> str:
+    """
+    Reads a console buffer directly through UI Automation. No cursor, no screenshot, no OCR.
+
+    Works on Windows Terminal and legacy conhost. The buffer is read through
+    TextPattern, so text comes back exactly -- including Cyrillic -- rather than as
+    recognised glyphs. Reading is Class B: it works on a minimized or occluded
+    terminal and does not disturb the human.
+
+    The whole screen buffer is reachable in one read, not just the visible viewport:
+    measured at 9000 rows, about 1.1 MB, in 30 ms. That is far too much to return, so
+    a slice is selected. The default is the last 200 rows, which is where the result
+    of the last command lives.
+
+    The buffer is a ring of about 9000 rows. Past that the oldest output is gone for
+    good, and the response says so. For a long-running command, read while it runs
+    rather than once at the end.
+
+    Args:
+        hwnd: Exact handle from list_windows_and_monitors. Takes priority.
+        window_title: Substring of the window title.
+        class_name: Win32 window class, narrows a title search.
+        tail: Number of trailing rows to return (default 200). Ignored if head,
+            start or count is given.
+        head: Number of leading rows to return instead.
+        start: Zero-based first row of a range.
+        count: Number of rows in a range starting at `start`.
+        contains: Return only rows containing this substring. A zero match count is
+            reported explicitly, because it is not the same as an empty buffer.
+    """
+    resp = await _send_daemon_request("read_terminal", {
+        "hwnd": hwnd, "window_title": window_title, "class_name": class_name,
+        "tail": tail, "head": head, "start": start, "count": count,
+        "contains": contains,
+    })
+    if resp.get("status") != "ok":
+        return f"Буфер консоли не прочитан: {resp.get('message', 'Неизвестная ошибка')}"
+
+    d = resp.get("data", {})
+    session_note = (
+        f"ВНИМАНИЕ: {d['session_warning']}" if d.get("session_warning") else None
+    )
+    header = [session_note] if session_note else []
+    header.append(
+        f"Консоль: handle={d.get('handle')} host={d.get('host')} "
+        f"выбрано={d.get('resolution')}"
+    )
+    header.append(
+        f"Буфер: {d.get('row_count')} строк, {d.get('char_count')} символов, "
+        f"чтение {d.get('read_ms')} мс. Отдано {d.get('selected_count')} строк "
+        f"({d.get('mode')})."
+    )
+    if d.get("matched_count") is not None:
+        header.append(f"Совпадений с фильтром: {d.get('matched_count')}.")
+    for w in d.get("warnings") or []:
+        header.append(f"Внимание: {w}")
+
+    lines = d.get("lines") or []
+    body = "\n".join(lines) if lines else "(выбранный диапазон пуст)"
+    return "\n".join([*header, "", body])
+
+
+@mcp.tool()
+async def write_terminal(
+    text: str,
+    hwnd: int | None = None,
+    window_title: str | None = None,
+    class_name: str | None = None,
+    enter: bool = True,
+    expect: str | None = None,
+    timeout_s: float = 3.0,
+) -> str:
+    """
+    Types into a console without using the keyboard or the cursor. Class B.
+
+    Characters are posted as WM_CHAR to the window the console actually takes input
+    from, so the human keeps the keyboard and this runs in parallel with their work.
+    On Windows Terminal that window is a child -- the XAML island's input site -- and
+    not the top-level window; posting to the top level is accepted and then ignored.
+    Legacy conhost accepts it on the top-level window itself.
+
+    Every write is confirmed by re-reading the buffer. This is mandatory, not a
+    nicety: ValuePattern on a terminal reports IsReadOnly=0, accepts SetValue, and
+    changes nothing at all. A write that is not read back is not known to have
+    happened.
+
+    `expect` defaults to the text itself, which is right for a shell that echoes its
+    input. Pass an empty string when echo is suppressed, as at a password prompt;
+    verification then falls back to "the buffer changed", which is weaker and is
+    reported as weaker.
+
+    Args:
+        text: The characters to type.
+        hwnd: Exact handle from list_windows_and_monitors. Takes priority.
+        window_title: Substring of the window title.
+        class_name: Win32 window class, narrows a title search.
+        enter: Send a carriage return afterwards (default True).
+        expect: Text that must appear in the buffer to confirm the write.
+        timeout_s: How long to poll the buffer for confirmation (default 3).
+    """
+    resp = await _send_daemon_request("write_terminal", {
+        "text": text, "hwnd": hwnd, "window_title": window_title,
+        "class_name": class_name, "enter": enter, "expect": expect,
+        "timeout_s": timeout_s,
+    })
+    if resp.get("status") != "ok":
+        return f"Запись в консоль не выполнена: {resp.get('message', 'Неизвестная ошибка')}"
+
+    d = resp.get("data", {})
+    if d.get("verified") and not d.get("weak_verification"):
+        status = "ЗАПИСАНО И ПОДТВЕРЖДЕНО"
+    elif d.get("verified"):
+        status = "ЗАПИСАНО, ПОДТВЕРЖДЕНИЕ СЛАБОЕ"
+    else:
+        status = "НЕ ПОДТВЕРЖДЕНО"
+
+    lines = [
+        f"{status}: {d.get('chars')} символов в handle={d.get('handle')} "
+        f"(host={d.get('host')}, окно ввода={d.get('input_hwnd')}, "
+        f"доставлено WM_CHAR={d.get('posted')})",
+        f"  {d.get('message')}",
+    ]
+    tail = d.get("tail") or []
+    if tail:
+        lines.append("  хвост буфера:")
+        for ln in tail[-8:]:
+            lines.append(f"    | {ln[:110]}")
+    if not d.get("verified"):
+        lines.append(
+            "  Повторять вслепую нельзя: команда могла исполниться, а вывод ещё не "
+            "дошёл. Прочитайте буфер или дождитесь строки через wait_terminal."
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def wait_terminal(
+    expect: str,
+    hwnd: int | None = None,
+    window_title: str | None = None,
+    class_name: str | None = None,
+    timeout_s: float = 30.0,
+    interval_s: float = 0.25,
+    after_text: str | None = None,
+) -> str:
+    """
+    Waits for text to appear in a console buffer, instead of sleeping a fixed time.
+
+    A terminal can be read directly, so waiting on a condition is both faster and
+    more reliable than a guessed delay: it returns as soon as the text lands and says
+    plainly when it never did. Use this after starting a build, a test run or an
+    install, rather than sleeping and then reading.
+
+    `after_text` matters more than it looks. A shell echoes the command line before
+    running it, so waiting for a string that also appears in the command returns
+    instantly on the echo and proves nothing. Measured: waiting for a marker from
+    `ping -n 7 ... & echo MARKER` succeeded in 0.00 s, while the same wait anchored
+    with after_text took 6.16 s and matched the real output. Pass the command that was
+    typed, or wait for text the command does not literally contain.
+
+    Args:
+        expect: The text to wait for.
+        hwnd: Exact handle from list_windows_and_monitors. Takes priority.
+        window_title: Substring of the window title.
+        class_name: Win32 window class, narrows a title search.
+        timeout_s: How long to wait before reporting absence (default 30).
+        interval_s: Poll interval (default 0.25).
+        after_text: Only search buffer text occurring after the last occurrence of
+            this string. Use it to skip past the echoed command line.
+    """
+    resp = await _send_daemon_request("wait_terminal", {
+        "expect": expect, "hwnd": hwnd, "window_title": window_title,
+        "class_name": class_name, "timeout_s": timeout_s,
+        "interval_s": interval_s, "after_text": after_text,
+    })
+    if resp.get("status") != "ok":
+        return f"Ожидание не выполнено: {resp.get('message', 'Неизвестная ошибка')}"
+
+    d = resp.get("data", {})
+    head = (
+        f"ДОЖДАЛИСЬ: {expect!r} появилась через {d.get('elapsed_s')} с "
+        f"({d.get('polls')} опросов)"
+        if d.get("found") else
+        f"НЕ ДОЖДАЛИСЬ: {d.get('message')}"
+    )
+    lines = [head]
+    tail = d.get("tail") or []
+    if tail:
+        lines.append("  хвост буфера:")
+        for ln in tail[-8:]:
+            lines.append(f"    | {ln[:110]}")
+    if d.get("found") and (d.get("elapsed_s") or 0) < 0.05:
+        lines.append(
+            "  Подозрительно быстро: строка могла совпасть с эхом набранной команды, "
+            "а не с выводом. Повторите с after_text или ждите текст, которого нет в "
+            "командной строке."
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def reset_user_override() -> str:
     """
     Resets USER_OVERRIDE back to IDLE.
