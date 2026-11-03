@@ -63,6 +63,7 @@ py-modules = [
     "mcp_server",
     "overlay_ui",
     "session_state",
+    "uia_client",
     "vision_engine",
 ]
 
