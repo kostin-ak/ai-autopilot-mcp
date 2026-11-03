@@ -441,6 +441,51 @@ class AutopilotDaemon:
             },
         }
 
+    def _frame_size(self, monitor_index: int | None) -> tuple[int, int]:
+        """Frame dimensions in the coordinate space callers must use.
+
+        Callers give coordinates relative to the scaled frame, not to the desktop.
+        Without knowing the frame size the daemon cannot tell a coordinate that
+        belongs to another monitor from one that is simply wrong.
+        """
+        bbox, _mon = self.vision.get_monitor_bounds(monitor_index)
+        width = config.TARGET_IMAGE_WIDTH
+        height = int(round(bbox["height"] * (width / float(bbox["width"]))))
+        return width, height
+
+    def _reject_out_of_frame(
+        self, mon_idx: int | None, points: list[tuple[str, int | None, int | None]]
+    ) -> dict[str, Any] | None:
+        """Returns an error response if any point falls outside the frame.
+
+        Coordinates outside the frame used to be scaled, then clamped by the move
+        itself, and the click landed anyway. A live check with (-99999, -99999)
+        reported "cursor now at (0, 0)" -- the corner of the monitor was clicked.
+        Silent clamping is the worst outcome available here: the action succeeds, the
+        cursor ends up somewhere predictable but unrelated to the request, and nothing
+        tells the caller that its coordinates were wrong. Stale or miscomputed
+        coordinates are exactly what a bounds check should stop.
+        """
+        frame_w, frame_h = self._frame_size(mon_idx)
+        for label, px, py in points:
+            if px is None or py is None:
+                continue
+            if not (0 <= px <= frame_w and 0 <= py <= frame_h):
+                return {
+                    "status": "error",
+                    "message": (
+                        f"{label} ({px}, {py}) вне кадра {frame_w}x{frame_h} этого "
+                        f"монитора. Действие не выполнено. Обрезание координат "
+                        f"привело бы к клику в непредсказуемой точке: в замере "
+                        f"(-99999, -99999) завершилось кликом в углу монитора. "
+                        f"Проверьте monitor_index и координаты; если окно на другом "
+                        f"мониторе, укажите его индекс."
+                    ),
+                    "frame": [frame_w, frame_h],
+                    "point": [px, py],
+                }
+        return None
+
     async def _action_mouse_action(self, params: dict[str, Any]) -> dict[str, Any]:
         """Executes mouse move, click, or drag with HUD ripple notification."""
         sub_action = params.get("action", "click")
@@ -448,6 +493,14 @@ class AutopilotDaemon:
         y = int(params.get("y", 0))
         mon_idx = params.get("monitor_index")
         show_grid = params.get("show_grid", False)
+
+        points = [("Координаты", x, y)]
+        if sub_action == "drag":
+            points.append(("Конечные координаты", params.get("end_x"),
+                           params.get("end_y")))
+        rejected = self._reject_out_of_frame(mon_idx, points)
+        if rejected is not None:
+            return rejected
 
         left, top, sx, sy = self._update_overlay_target(mon_idx)
         abs_x = left + int(round(x * sx))

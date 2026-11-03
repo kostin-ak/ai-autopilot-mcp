@@ -584,25 +584,48 @@ class InputController:
             time.sleep(config.UNICODE_CHAR_DELAY_SEC)
 
     def press_hotkey(self, hotkey_str: str) -> None:
-        """Parses and executes key combinations like 'ctrl+c', 'alt+tab', 'enter'."""
+        """Parses and executes key combinations like 'ctrl+c', 'alt+tab', 'enter'.
+
+        An unrecognized token aborts the whole combination rather than being skipped.
+        Skipping sent real keystrokes for partial garbage: a live check with
+        "not+a+key+combo" pressed the letter A, because "a" is a single-character
+        token and was sent while the other three were silently dropped. Nothing is
+        sent unless every token is understood, and the message names the ones that
+        were not, so a caller can tell a typo from a missing mapping.
+        """
         if self.state == AutopilotState.USER_OVERRIDE:
             raise InterruptedByUserError("Hotkey aborted: System is in USER_OVERRIDE mode.")
 
         parts = [p.strip().lower() for p in hotkey_str.split("+")]
         vks = []
+        unknown = []
         for part in parts:
-            if part in VK_MAP:
+            if not part:
+                unknown.append("<пусто>")
+            elif part in VK_MAP:
                 vks.append(VK_MAP[part])
             elif len(part) == 1:
                 # Character key (A-Z, 0-9)
                 vks.append(ord(part.upper()))
-            elif part.startswith("f") and part[1:].isdigit():
-                # F1 - F12
-                f_num = int(part[1:])
-                vks.append(0x6F + f_num)
+            elif (part.startswith("f") and part[1:].isdigit()
+                    and 1 <= int(part[1:]) <= 24):
+                # F1 - F24. Bounded because an out-of-range number yields a virtual
+                # key code that does not exist, which would send a meaningless event.
+                vks.append(0x6F + int(part[1:]))
+            else:
+                unknown.append(part)
 
+        if unknown:
+            raise ValueError(
+                f"Неизвестные токены в hotkey {hotkey_str!r}: "
+                f"{', '.join(unknown)}. Клавиши НЕ отправлены. "
+                f"Распознано {len(vks)} из {len(parts)}."
+            )
         if not vks:
-            return
+            raise ValueError(
+                f"hotkey {hotkey_str!r} не содержит ни одной клавиши; "
+                "ничего не отправлено."
+            )
 
         # Press all keys in order
         for vk in vks:

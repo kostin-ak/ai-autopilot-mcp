@@ -275,6 +275,66 @@ class TestMonitorAttribution:
 # --------------------------------------------------------------------------
 # Off-monitor UI elements must not carry a bogus click_target
 # --------------------------------------------------------------------------
+class TestFrameBoundsRejection:
+    """Out-of-frame coordinates used to be scaled, clamped, and clicked anyway.
+
+    A live check with (-99999, -99999) reported "cursor now at (0, 0)": the corner of
+    the monitor was clicked. Silent clamping is the worst available outcome, because
+    the action succeeds at a predictable point unrelated to the request and nothing
+    tells the caller its coordinates were wrong.
+    """
+
+    def _daemon_stub(self, width=1920, height=1080):
+        class Vision:
+            def get_monitor_bounds(self, idx=None):
+                return ({"left": -1920, "top": 351,
+                         "width": width, "height": height}, None)
+
+        stub = daemon.AutopilotDaemon.__new__(daemon.AutopilotDaemon)
+        stub.vision = Vision()
+        return stub
+
+    def test_frame_size_follows_the_monitor_aspect(self):
+        assert self._daemon_stub()._frame_size(None) == (1280, 720)
+        assert self._daemon_stub(2560, 1440)._frame_size(None) == (1280, 720)
+        assert self._daemon_stub(4480, 1440)._frame_size(None) == (1280, 411)
+
+    def test_coordinates_far_outside_are_rejected(self):
+        err = self._daemon_stub()._reject_out_of_frame(
+            None, [("Координаты", -99999, -99999)])
+        assert err is not None and err["status"] == "error"
+        assert "вне кадра" in err["message"]
+        assert err["frame"] == [1280, 720]
+
+    def test_one_pixel_beyond_is_rejected(self):
+        d = self._daemon_stub()
+        assert d._reject_out_of_frame(None, [("Координаты", 1281, 10)]) is not None
+        assert d._reject_out_of_frame(None, [("Координаты", 10, 721)]) is not None
+        assert d._reject_out_of_frame(None, [("Координаты", -1, 10)]) is not None
+
+    def test_coordinates_inside_are_accepted(self):
+        d = self._daemon_stub()
+        assert d._reject_out_of_frame(None, [("Координаты", 0, 0)]) is None
+        assert d._reject_out_of_frame(None, [("Координаты", 1280, 720)]) is None
+        assert d._reject_out_of_frame(None, [("Координаты", 640, 360)]) is None
+
+    def test_drag_endpoint_is_checked_too(self):
+        err = self._daemon_stub()._reject_out_of_frame(
+            None, [("Конечные координаты", 5000, 10)])
+        assert err is not None and "Конечные" in err["message"]
+
+    def test_missing_endpoint_is_skipped(self):
+        """A drag with no explicit endpoint defaults to its start, which is checked."""
+        d = self._daemon_stub()
+        assert d._reject_out_of_frame(None, [("Конечные", None, None)]) is None
+
+    def test_message_points_at_the_likely_cause(self):
+        """A wrong monitor_index is the usual reason coordinates look impossible."""
+        err = self._daemon_stub()._reject_out_of_frame(
+            None, [("Координаты", 2000, 100)])
+        assert "monitor_index" in err["message"]
+
+
 class TestUiElementFiltering:
     def _fake_ctrl(self, left, top, right, bottom, cls="Button", text="OK"):
         class _Rect:
@@ -765,6 +825,18 @@ class TestToolDescriptions:
         desc = self._desc("read_screen_text")
         assert "no accessibility tree" in desc
         assert "diagnose" in desc.lower()
+
+    def test_mouse_action_says_out_of_frame_is_rejected(self):
+        """It used to clamp and click, reporting success at the wrong point."""
+        desc = self._desc("mouse_action")
+        assert "rejected" in desc.lower()
+        assert "clamped" in desc.lower()
+
+    def test_keyboard_action_says_an_unknown_token_aborts(self):
+        """Skipping unknown tokens once pressed a real key from malformed input."""
+        desc = self._desc("keyboard_action")
+        assert "aborts" in desc.lower()
+        assert "sends nothing" in desc.lower()
 # --------------------------------------------------------------------------
 # Session lock state must reach the agent
 # --------------------------------------------------------------------------

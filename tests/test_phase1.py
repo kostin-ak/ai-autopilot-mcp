@@ -167,10 +167,59 @@ class TestHotkeyParsing:
         ic.InputController.press_hotkey(stub, "enter")
         assert stub.keys == [(0x0D, False), (0x0D, True)]
 
-    def test_unknown_token_is_ignored_not_crash(self):
+    def test_unknown_token_aborts_the_whole_combination(self):
+        """Skipping unknown tokens sent real keystrokes for partial garbage.
+
+        A live check with "not+a+key+combo" pressed the letter A: "a" is a
+        single-character token and was sent while the other three were dropped.
+        Nothing may be sent unless every token is understood.
+        """
         stub = StubController()
-        ic.InputController.press_hotkey(stub, "notakey+ctrl")
-        assert stub.keys == [(0x11, False), (0x11, True)]
+        with pytest.raises(ValueError, match="Неизвестные токены"):
+            ic.InputController.press_hotkey(stub, "notakey+ctrl")
+        assert stub.keys == [], "no key may be sent when any token is unknown"
+
+    def test_partial_garbage_does_not_press_the_tokens_it_did_understand(self):
+        """The exact input that leaked a keystroke in the live check."""
+        stub = StubController()
+        with pytest.raises(ValueError):
+            ic.InputController.press_hotkey(stub, "not+a+key+combo")
+        assert 0x41 not in [vk for vk, _down in stub.keys], (
+            "the letter A must not be pressed by a malformed combination"
+        )
+        assert stub.keys == []
+
+    def test_error_names_the_unrecognized_tokens(self):
+        stub = StubController()
+        with pytest.raises(ValueError) as excinfo:
+            ic.InputController.press_hotkey(stub, "ctrl+shifft+c")
+        assert "shifft" in str(excinfo.value)
+        assert "ctrl" not in str(excinfo.value).split("Распознано")[0].replace(
+            "'ctrl+shifft+c'", "")
+
+    def test_empty_token_is_rejected_not_ignored(self):
+        stub = StubController()
+        with pytest.raises(ValueError):
+            ic.InputController.press_hotkey(stub, "ctrl+")
+        assert stub.keys == []
+
+    def test_out_of_range_function_key_is_rejected(self):
+        """f99 previously computed a virtual key code that does not exist."""
+        stub = StubController()
+        with pytest.raises(ValueError):
+            ic.InputController.press_hotkey(stub, "f99")
+        assert stub.keys == []
+
+    def test_valid_combination_still_sends(self):
+        stub = StubController()
+        ic.InputController.press_hotkey(stub, "ctrl+s")
+        assert stub.keys == [(0x11, False), (0x53, False),
+                             (0x53, True), (0x11, True)]
+
+    def test_function_keys_within_range_still_work(self):
+        stub = StubController()
+        ic.InputController.press_hotkey(stub, "f12")
+        assert stub.keys == [(0x6F + 12, False), (0x6F + 12, True)]
 
     def test_aborts_under_user_override(self):
         stub = StubController(state=AutopilotState.USER_OVERRIDE)

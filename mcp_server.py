@@ -257,9 +257,14 @@ async def mouse_action(
     switches the daemon to USER_OVERRIDE and aborts the action mid-flight. Prefer
     element-based actions when the target exposes them.
 
-    Coordinates are in the downscaled frame, not physical pixels. The response reports
-    where the cursor actually ended up, which differs from the requested point whenever
-    a move was clipped or interrupted -- that difference is the signal a click failed.
+    Coordinates are in the downscaled frame, not physical pixels. Coordinates outside
+    that frame are rejected with an error rather than clamped: a click at invalid
+    coordinates would land at a predictable point unrelated to the request, and the
+    response used to report success while doing it.
+
+    The response reports where the cursor actually ended up, which differs from the
+    requested point whenever a move was clipped or interrupted -- that difference is
+    the signal a click failed.
 
     Args:
         action: 'click', 'double_click', 'right_click', 'move' or 'drag'.
@@ -305,6 +310,9 @@ async def keyboard_action(
     Args:
         text: Literal text to type. Newline and tab are sent as their virtual keys.
         hotkey: Key combination such as 'ctrl+c', 'alt+tab', 'enter', 'esc', 'f5'.
+            Every token must be recognized. An unknown token aborts the whole
+            combination and sends nothing, because skipping unknown tokens once
+            caused malformed input to press a real key.
         monitor_index: Which monitor the returned frame should show.
         show_grid: Overlay a grid on the resulting frame. Off by default.
     """
