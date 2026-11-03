@@ -47,7 +47,12 @@ DEFAULT_MAX_NODES = 400
 # Depth is a runaway guard, not the working limit. Measured coverage showed the
 # real work is bounded by time and node count; a low depth just loses subtrees
 # without buying speed, because the time budget already stops a wide walk.
-DEFAULT_MAX_DEPTH = 20
+#
+# 40 rather than 20: Firefox trees were measured at depth 23 on a profile page and
+# 26 on a video page. Depth truncation is terminal and returns no token, so a limit
+# that fires on ordinary content silently throws the deep part of the tree away
+# with no way to page for it. The time budget is what should stop the walk.
+DEFAULT_MAX_DEPTH = 40
 
 # A single FindAll that takes longer than this is treated as a pathological
 # target (Progman took seconds), and the walk stops rather than retrying.
@@ -84,6 +89,15 @@ def _is_sentinel(x: int, y: int) -> bool:
     """True for coordinates belonging to a minimized window, not to a display."""
     return x < SENTINEL_BOUND or y < SENTINEL_BOUND
 
+
+# Roles whose names actually matter for driving an application. Structural roles
+# such as Group, Pane and Text are usually unnamed and that is normal, so counting
+# them drags the fill rate down without saying anything about controllability.
+_ACTIONABLE_ROLES = frozenset({
+    "Button", "Hyperlink", "Link", "Edit", "Document", "CheckBox", "RadioButton",
+    "ComboBox", "ListItem", "TabItem", "MenuItem", "ToggleButton", "Slider",
+    "Spinner", "SplitButton",
+})
 
 # Patterns that mean an element can be acted on without the cursor.
 _ACTIONABLE_PATTERNS = frozenset({
@@ -354,7 +368,7 @@ class UIAClient:
             return False
 
     # ----------------------------------------------------------------- probe
-    def probe_target(self, hwnd: int, sample_nodes: int = 40) -> TargetProbe:
+    def probe_target(self, hwnd: int) -> TargetProbe:
         """Classifies what a target offers, measuring cost rather than assuming it.
 
         Cost per node spans two orders of magnitude between targets, so the
@@ -403,21 +417,13 @@ class UIAClient:
                 notes=notes + [f"FindAll(Children) failed: {exc}"],
             )
 
+        # Cost per node is measured from the real bounded walk below, not from cached
+        # property reads on already-fetched elements. The difference is not academic:
+        # cached reads on a Firefox window measured 7 us/node while the actual walk
+        # cost 419 us/node, a factor of 58, because the dominant cost is the per-node
+        # FindAllBuildCache query rather than the property read. An agent sizing
+        # max_nodes from the wrong number would be badly misled.
         us_per_node = None
-        if child_count:
-            t0 = time.perf_counter()
-            read = 0
-            for i in range(min(child_count, sample_nodes)):
-                e = kids.GetElement(i)
-                try:
-                    # Touching the cached properties is itself the measurement:
-                    # this is what one snapshot node costs on this target.
-                    _ = (e.CachedName, e.CachedControlType, e.CachedBoundingRectangle)
-                    read += 1
-                except COMError:
-                    pass
-            if read:
-                us_per_node = (time.perf_counter() - t0) * 1_000_000 / read
 
         # Patterns must come from an element inside the target. Polling the globally
         # focused element reported an identical inventory for every window unless
@@ -463,6 +469,8 @@ class UIAClient:
             1 for n in sample.nodes
             if n.text_usable or (set(n.patterns) & _ACTIONABLE_PATTERNS)
         )
+        if tree_sample:
+            us_per_node = sample.elapsed_ms * 1000.0 / tree_sample
         area = 0
         wb = self.window_bounds(hwnd)
         if wb:
@@ -470,7 +478,8 @@ class UIAClient:
 
         classification = self._classify(
             child_count=child_count, tree_sample=tree_sample, useful=useful,
-            area=area, us_per_node=us_per_node, el=el, notes=notes,
+            area=area, us_per_node=us_per_node, el=el, nodes=sample.nodes,
+            notes=notes,
         )
         if us_per_node is not None and us_per_node > 2000:
             notes.append(
@@ -489,7 +498,7 @@ class UIAClient:
         )
 
     def _classify(self, *, child_count, tree_sample, useful, area, us_per_node,
-                  el, notes) -> str:
+                  el, nodes, notes) -> str:
         """Thresholds come from the measurements, not from taste.
 
         Node count alone is not an opacity signal. A 420x220 dialog has a complete
@@ -529,34 +538,38 @@ class UIAClient:
                 f"узлов, из них {useful} пригодных. Так устроены Chromium и Electron, "
                 "где наверху цепочка представлений; непрозрачной целью это не считается."
             )
-        named = self._named_fraction(el)
-        if named is not None and named < 0.4:
-            notes.append(f"Имена заполнены у {named*100:.0f}% первого уровня.")
+        fill = self._actionable_name_fill(nodes)
+        if fill is None:
+            return "rich"
+        if fill < 0.4:
+            notes.append(
+                f"Имена заполнены у {fill*100:.0f}% действующих элементов "
+                "(роли Button, Hyperlink, Edit, TabItem и подобные). Дерево есть, но "
+                "опознавать элементы придётся по роли и позиции."
+            )
             return "partial"
+        notes.append(
+            f"Имена заполнены у {fill*100:.0f}% действующих элементов в пробе "
+            f"из {tree_sample} узлов."
+        )
         return "rich"
 
-    def _named_fraction(self, el) -> float | None:
-        auto = self._automation()
-        mod = self._typelib()
-        try:
-            kids = self._retry(
-                lambda: el.FindAllBuildCache(
-                    mod.TreeScope_Children, auto.CreateTrueCondition(),
-                    self._cache_request(),
-                )
-            )
-        except COMError:
+    @staticmethod
+    def _actionable_name_fill(nodes) -> float | None:
+        """Fraction of actionable nodes carrying real text.
+
+        Measured over roles worth acting on -- not over the whole tree, and not over
+        the first level. Structural roles are legitimately unnamed: on a live Firefox
+        window, Group filled 5% of names and Text 20%, dragging the whole-tree figure
+        to 39%, while Hyperlink sat at 97%, Button at 99%, ListItem at 99% and
+        TabItem at 100%. Depth one filled 11%. Classifying on depth one called that
+        browser 'partial' although its links, tabs and buttons were all fully
+        drivable through patterns.
+        """
+        relevant = [n for n in nodes if n.role in _ACTIONABLE_ROLES]
+        if not relevant:
             return None
-        if not kids.Length:
-            return None
-        named = 0
-        for i in range(min(kids.Length, 60)):
-            try:
-                if (kids.GetElement(i).CachedName or "").strip():
-                    named += 1
-            except COMError:
-                pass
-        return named / min(kids.Length, 60)
+        return sum(1 for n in relevant if n.text_usable) / len(relevant)
 
     # ---------------------------------------------------------------- snapshot
     def _cache_request(self):
@@ -1089,15 +1102,22 @@ class UIAClient:
         return f"0x{exc.hresult & 0xFFFFFFFF:08X}"
 
     @staticmethod
-    def _read_back(read, expect, timeout_s: float = 0.5, interval_s: float = 0.03):
+    def _read_back(read, expect, timeout_s: float = 1.5, interval_s: float = 0.03):
         """Polls a read-back until it matches, or the timeout expires.
 
-        UIA state is not necessarily updated synchronously with the call. On a live
-        Qt combo box, Expand returned success and an immediate read still reported
-        Collapsed, while the read a few hundred milliseconds later reported
-        Expanded. A single read turns that into a false negative, which makes an
-        agent retry an action that already succeeded -- and a retry on a toggle or
-        an expand undoes it.
+        UIA state is not necessarily updated synchronously with the call. Two live
+        measurements made the timeout concrete:
+
+        * A Qt combo box reported Collapsed immediately after Expand returned
+          success, and Expanded a few hundred milliseconds later.
+        * Firefox's address bar took about 1000 ms to reflect a ValuePattern write,
+          reproducibly on two windows. A 500 ms window reported "not confirmed" for
+          a write that had in fact succeeded -- and the caller then sent a second
+          write, so the two markers ended up concatenated in the field.
+
+        A false negative here is not harmless: an agent that retries a toggle or an
+        expand undoes the action it just performed. The timeout only costs time when
+        the expectation is not met, since the first matching read returns at once.
         """
         deadline = time.monotonic() + timeout_s
         value = None

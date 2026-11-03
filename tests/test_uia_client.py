@@ -192,7 +192,12 @@ class FakeClient(uc.UIAClient):
         return self.root
 
     def control_type_names(self):
-        return {50000: "Pane", 50004: "Edit", 50032: "Window"}
+        # 50000 stays mapped to a non-actionable role on purpose: the pre-existing
+        # fixtures build trees out of it, and reclassifying them as Button would
+        # change what the fill calculation sees.
+        return {50000: "Pane", 50004: "Edit", 50005: "Hyperlink",
+                50007: "ListItem", 50019: "TabItem", 50026: "Group",
+                50032: "Window"}
 
     def pattern_flags(self):
         return {}
@@ -581,14 +586,79 @@ def test_deep_paging_still_makes_progress(client):
 
 
 # ------------------------------------------------------------- classification
-def build_narrow_deep(top=3, second=10):
+def build_narrow_deep(top=3, second=10, delay=0.0):
     """Narrow at depth one, wide at depth two: the Chromium/Electron shape."""
     tops = []
     for i in range(top):
         tops.append(FakeElement(
-            f"view{i}", children=[FakeElement(f"c{i}_{j}") for j in range(second)]
+            f"view{i}",
+            children=[FakeElement(f"c{i}_{j}", delay=delay) for j in range(second)],
+            delay=delay,
         ))
     return FakeElement("root", children=tops, bounds=(0, 0, 1280, 800))
+
+
+def build_firefox_shape():
+    """Unnamed structural chrome at depth one, well-named actionable nodes below.
+
+    This is the live Firefox shape: depth one filled 11% of names while Hyperlink
+    sat at 97%, Button at 99%, ListItem at 99% and TabItem at 100%. Structural
+    roles were the drag -- Group at 5%, Text at 20%.
+    """
+    chrome = [FakeElement("", control_type=50026) for _ in range(8)]
+    for i in range(6):
+        inner = [FakeElement(f"Link {i}-{j}", control_type=50005) for j in range(8)]
+        chrome.append(FakeElement("", control_type=50026, children=inner))
+    return FakeElement("root", children=chrome, bounds=(0, 0, 1280, 800))
+
+
+def test_firefox_shape_is_rich_not_partial():
+    """Depth-one classification called Firefox 'partial' at 11% name fill although
+    its links, tabs and buttons were all drivable through patterns."""
+    probe = FakeClient(build_firefox_shape()).probe_target(1)
+    assert probe.child_count == 14, "all wrappers, none named at depth one"
+    assert probe.classification == "rich", probe.classification
+    assert any("действующих" in n for n in probe.notes)
+
+
+def snap_node(role, usable):
+    """A NodeSnapshot with just the fields the fill calculation reads."""
+    return uc.NodeSnapshot(
+        depth=1, role=role, text="t" if usable else "",
+        text_source="name" if usable else "none",
+        automation_id="", class_name="", bounds=None, clickable=None,
+        enabled=True, offscreen=False, focusable=True, has_focus=False,
+        patterns=(), path="0", text_usable=usable,
+    )
+
+
+def test_actionable_name_fill_ignores_structural_roles():
+    """Structural roles are legitimately unnamed: 50 unnamed Groups plus 5 named
+    Hyperlinks is a fully controllable tree, not a 9% one."""
+    nodes = ([snap_node("Group", False) for _ in range(50)]
+             + [snap_node("Hyperlink", True) for _ in range(5)])
+    assert uc.UIAClient._actionable_name_fill(nodes) == 1.0
+
+
+def test_actionable_name_fill_reports_unnamed_controls():
+    nodes = [snap_node("Button", False) for _ in range(10)]
+    assert uc.UIAClient._actionable_name_fill(nodes) == 0.0
+
+
+def test_actionable_name_fill_is_none_without_actionable_roles():
+    assert uc.UIAClient._actionable_name_fill([snap_node("Group", False)]) is None
+
+
+def test_probe_cost_reflects_query_time():
+    """The probe once reported 7.2 us/node for a Firefox window whose real walk
+    cost 506 us/node, because it timed cached property reads rather than the
+    per-node query. Sizing max_nodes from that is off by two orders of magnitude."""
+    root = build_narrow_deep(delay=0.002)
+    probe = FakeClient(root).probe_target(1)
+    assert probe.us_per_node is not None
+    assert probe.us_per_node > 1000, (
+        f"{probe.us_per_node:.0f} us/node is implausible for a 2 ms/query tree"
+    )
 
 
 def test_narrow_but_deep_tree_is_not_opaque():
