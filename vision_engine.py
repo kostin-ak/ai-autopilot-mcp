@@ -117,7 +117,7 @@ def _target_from(wrapper: Any, resolution: str = "") -> WindowTarget:
     )
 
 
-def _find_hwnd_by_win32_title(
+def find_hwnd_by_win32_title(
     title_fragment: str, class_name: str | None = None
 ) -> int | None:
     """Finds a top-level window by its Win32 title, ignoring case.
@@ -685,7 +685,7 @@ class VisionEngine:
             # can legitimately match nothing here. Fall back to Win32 matching
             # before giving up.
             if window_title:
-                handle = _find_hwnd_by_win32_title(window_title, class_name)
+                handle = find_hwnd_by_win32_title(window_title, class_name)
                 if handle:
                     return (
                         _target_from(desktop.window(handle=handle), "win32-title"),

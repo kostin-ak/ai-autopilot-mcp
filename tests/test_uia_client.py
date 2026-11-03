@@ -20,6 +20,8 @@ errors in the token arithmetic:
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 import uia_client as uc
@@ -43,7 +45,8 @@ class FakeElement:
 
     def __init__(self, name, children=(), control_type=50000, class_name="",
                  bounds=(0, 0, 10, 10), enabled=True, offscreen=False,
-                 focusable=True, has_focus=False, automation_id=""):
+                 focusable=True, has_focus=False, automation_id="",
+                 delay=0.0, pid=4242):
         self.CachedName = name
         self.CachedControlType = control_type
         self.CachedClassName = class_name
@@ -53,9 +56,16 @@ class FakeElement:
         self.CachedIsKeyboardFocusable = focusable
         self.CachedHasKeyboardFocus = has_focus
         self.CachedBoundingRectangle = _Rect(*bounds)
+        self.CurrentName = name
+        self.CurrentClassName = class_name
+        self.CurrentProcessId = pid
+        self.CurrentBoundingRectangle = _Rect(*bounds)
         self._children = list(children)
+        self._delay = delay
 
     def FindAllBuildCache(self, scope, cond, req):
+        if self._delay:
+            time.sleep(self._delay)
         return FakeArray(self._children)
 
     def GetCachedPropertyValue(self, pid):
@@ -70,6 +80,9 @@ class _Rect:
 class _FakeAuto:
     def CreateTrueCondition(self):
         return object()
+
+    def PollForPotentialSupportedPatterns(self, el):
+        return ([], [])
 
 
 class _FakeTypelib:
@@ -433,3 +446,183 @@ def test_class_chain_in_classname_only_is_rejected():
     assert uc.UIAClient._resolve_text("", "class Ui::PlainShadow") == (
         "", "none", False
     )
+
+
+# ------------------------------------------------ deep tokens and slow queries
+def build_deep_chain(depth, delay=0.0):
+    """A chain of `depth` nodes, each with one child and one leaf sibling."""
+    node = FakeElement("leaf", delay=delay)
+    for i in range(depth):
+        node = FakeElement(f"n{i}", children=[node, FakeElement(f"sib{i}", delay=delay)],
+                           delay=delay)
+    return FakeElement("root", children=[node], delay=delay)
+
+
+def test_budget_starts_after_the_rebuild():
+    """A deep token costs one query per segment to rebuild.
+
+    Counting that against the walk budget makes the page emit nothing and return
+    the same token -- a livelock. Observed live with a 15-segment token and the
+    150 ms budget: zero nodes, 203 ms, identical token.
+    """
+    root = build_deep_chain(6, delay=0.004)
+    client = FakeClient(root)
+    deep_token = "0" + ".0" * 5 + ".1"
+
+    snap = client.snapshot(1, max_nodes=5, time_budget_s=0.010, token=deep_token)
+    assert snap.nodes, "page emitted nothing: the rebuild consumed the whole budget"
+
+
+def test_elapsed_includes_navigation_cost():
+    """elapsed_ms is wall clock, so a slow rebuild is not hidden from the caller."""
+    root = build_deep_chain(4, delay=0.010)
+    client = FakeClient(root)
+    snap = client.snapshot(1, max_nodes=2, time_budget_s=5.0, token="0.0.0.0")
+    assert snap.elapsed_ms >= 40, f"expected >=40 ms, got {snap.elapsed_ms:.0f}"
+
+
+def test_deep_paging_still_makes_progress(client):
+    """Paging down a deep path must advance rather than re-emit."""
+    emitted, token, rounds = [], None, 0
+    while rounds < 20:
+        rounds += 1
+        snap = client.snapshot(1, max_nodes=1, max_depth=30,
+                               time_budget_s=30.0, token=token)
+        emitted.extend(n.path for n in snap.nodes)
+        if not snap.next_token:
+            break
+        assert snap.next_token not in emitted, "token names an already-emitted node"
+        token = snap.next_token
+    assert emitted == EXPECTED_ORDER
+
+
+# ------------------------------------------------------------- classification
+def build_narrow_deep(top=3, second=10):
+    """Narrow at depth one, wide at depth two: the Chromium/Electron shape."""
+    tops = []
+    for i in range(top):
+        tops.append(FakeElement(
+            f"view{i}", children=[FakeElement(f"c{i}_{j}") for j in range(second)]
+        ))
+    return FakeElement("root", children=tops, bounds=(0, 0, 1280, 800))
+
+
+def test_narrow_but_deep_tree_is_not_opaque():
+    """A live Electron window reported 2 children at depth one and had 184 usable
+    nodes when walked, yet fan-out alone classified it as opaque and recommended
+    the pixel path -- steering the agent away from a perfectly good tree.
+
+    One extra level was not enough either: Chromium puts a view chain four to six
+    levels deep above the real content, so the sample has to walk rather than peek.
+    """
+    probe = FakeClient(build_narrow_deep()).probe_target(1)
+    assert probe.child_count == 3
+    assert probe.tree_sample >= 20
+    assert probe.classification == "rich", probe.classification
+    assert any("Chromium" in n for n in probe.notes)
+
+
+def build_deep_wide(depth=5, breadth=4):
+    """Narrow at the top for several levels, wide only below them.
+
+    This is the shape that defeats a one-level-deeper opacity test, and roughly
+    what Chromium's view hierarchy looks like.
+    """
+    node = FakeElement("leaf")
+    for i in range(depth):
+        kids = [FakeElement(f"s{i}_{j}") for j in range(breadth - 1)] + [node]
+        node = FakeElement(f"n{i}", children=kids)
+    return FakeElement("root", children=[node], bounds=(0, 0, 1280, 800))
+
+
+def test_deep_narrow_chain_is_not_misread_as_opaque():
+    """A tree that stays narrow for several levels before widening."""
+    probe = FakeClient(build_deep_wide()).probe_target(1)
+    assert probe.child_count == 1
+    assert probe.tree_sample >= 20
+    assert probe.classification != "opaque"
+
+
+def test_shallow_tree_is_opaque():
+    root = FakeElement("root", children=[FakeElement("a"), FakeElement("b")],
+                       bounds=(0, 0, 800, 600))
+    probe = FakeClient(root).probe_target(1)
+    assert probe.child_count == 2
+    assert probe.tree_sample < 20
+    assert probe.classification == "opaque"
+
+
+def test_empty_tree_is_opaque():
+    probe = FakeClient(FakeElement("root", children=[],
+                                   bounds=(0, 0, 800, 600))).probe_target(1)
+    assert probe.child_count == 0
+    assert probe.tree_sample == 0
+    assert probe.classification == "opaque"
+
+
+@pytest.mark.parametrize("cls", ["CASCADIA_HOSTING_WINDOW_CLASS", "ConsoleWindowClass"])
+def test_terminal_class_is_recognised(cls):
+    """Detected by window class, which is stable, rather than by tree shape."""
+    root = FakeElement("term", class_name=cls, children=[FakeElement("c")],
+                       bounds=(0, 0, 800, 600))
+    assert FakeClient(root).probe_target(1).classification == "terminal"
+
+
+class SlowElement:
+    """Every cached read is slow, simulating a pathological provider."""
+
+    def __init__(self, name):
+        self._name = name
+        self.CurrentName = name
+        self.CurrentClassName = "Slow"
+        self.CurrentProcessId = 1
+        self.CurrentBoundingRectangle = _Rect(0, 0, 10, 10)
+
+    def __getattr__(self, item):
+        if item.startswith("Cached"):
+            time.sleep(0.006)
+            if item == "CachedName":
+                return self._name
+            if item == "CachedControlType":
+                return 50000
+            if item == "CachedClassName":
+                return "Slow"
+            if item == "CachedAutomationId":
+                return ""
+            if item == "CachedBoundingRectangle":
+                return _Rect(0, 0, 10, 10)
+            return False
+        raise AttributeError(item)
+
+    def FindAllBuildCache(self, scope, cond, req):
+        return FakeArray([])
+
+    def GetCachedPropertyValue(self, pid):
+        return False
+
+
+def test_expensive_target_is_flagged_by_measured_cost():
+    """Cost per node varied by a factor of 100 between live targets, so the
+    classification has to come from a measurement, not a constant."""
+    kids = [SlowElement(f"c{i}") for i in range(6)]
+    root = FakeElement("root", children=kids, bounds=(0, 0, 800, 600))
+    probe = FakeClient(root).probe_target(1)
+    assert probe.us_per_node is not None
+    assert probe.us_per_node > 2000
+    assert probe.classification == "expensive"
+    assert any("дорогая" in n for n in probe.notes)
+
+
+def test_probe_reports_iconic_and_restoration_advice():
+    root = build_narrow_deep()
+    probe = FakeClient(root, minimized=True).probe_target(1)
+    assert probe.iconic
+    assert any("свёрнуто" in n for n in probe.notes)
+
+
+def test_probe_patterns_are_not_from_global_focus():
+    """Polling the globally focused element reported the same inventory for every
+    window unless that window happened to be focused."""
+    client = FakeClient(build_narrow_deep())
+    probe = client.probe_target(1)
+    assert probe.patterns == ()

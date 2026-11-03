@@ -580,7 +580,7 @@ class TestWindowResolution:
             seen["title"] = title
             return 132212
 
-        monkeypatch.setattr(ve, "_find_hwnd_by_win32_title", fake_lookup)
+        monkeypatch.setattr(ve, "find_hwnd_by_win32_title", fake_lookup)
         target, n, how = ve.VisionEngine._resolve_window(
             _Desktop(), hwnd=None, window_title="Избранное", class_name=None
         )
@@ -591,15 +591,15 @@ class TestWindowResolution:
 
     def test_win32_lookup_of_a_nonexistent_title_returns_none(self):
         """Real EnumWindows call; read-only."""
-        from vision_engine import _find_hwnd_by_win32_title
+        from vision_engine import find_hwnd_by_win32_title
 
-        assert _find_hwnd_by_win32_title("zzz_definitely_no_such_window_zzz") is None
+        assert find_hwnd_by_win32_title("zzz_definitely_no_such_window_zzz") is None
 
     def test_win32_lookup_rejects_empty_input(self):
-        from vision_engine import _find_hwnd_by_win32_title
+        from vision_engine import find_hwnd_by_win32_title
 
-        assert _find_hwnd_by_win32_title("") is None
-        assert _find_hwnd_by_win32_title("   ") is None
+        assert find_hwnd_by_win32_title("") is None
+        assert find_hwnd_by_win32_title("   ") is None
 
 
 # --------------------------------------------------------------------------
@@ -614,6 +614,7 @@ class TestToolDescriptions:
         "take_control", "release_control", "get_screen_state", "mouse_action",
         "keyboard_action", "scroll_screen", "list_windows_and_monitors",
         "get_ui_elements", "reset_user_override", "get_hud_state",
+        "probe_target", "get_snapshot", "resolve_clickable",
     }
 
     def test_every_tool_has_a_non_empty_english_description(self):
@@ -666,6 +667,40 @@ class TestToolDescriptions:
         assert "hwnd" in desc
         assert "largest-of-N" in desc
         assert "win32-title" in desc
+
+    def _desc(self, name):
+        import asyncio
+
+        import mcp_server
+
+        return {
+            t.name: (t.description or "")
+            for t in asyncio.run(mcp_server.mcp.list_tools())
+        }[name]
+
+    def test_probe_target_names_every_classification(self):
+        """The classification decides which control path gets used, so all five
+        have to be discoverable from the description alone."""
+        desc = self._desc("probe_target")
+        for cls in ("terminal", "rich", "partial", "opaque", "expensive"):
+            assert cls in desc, f"{cls} classification undocumented"
+        # The trap that made ADR-0009 necessary.
+        assert "IsReadOnly" in desc
+
+    def test_get_snapshot_documents_the_continuation_contract(self):
+        desc = self._desc("get_snapshot")
+        assert "token" in desc
+        assert "frame space" in desc, "coordinates must be declared frame-relative"
+        # Depth truncation is terminal; the description has to say so or the agent
+        # will page with the same max_depth and stall.
+        assert "max_depth" in desc
+        assert "time_budget_ms" in desc
+
+    def test_resolve_clickable_explains_why_the_snapshot_has_no_exact_point(self):
+        """Otherwise the two tools look redundant and one gets skipped."""
+        desc = self._desc("resolve_clickable")
+        assert "centre" in desc
+        assert "stale" in desc
 # --------------------------------------------------------------------------
 # Session lock state must reach the agent
 # --------------------------------------------------------------------------

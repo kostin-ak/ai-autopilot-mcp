@@ -27,6 +27,12 @@ import session_state
 from config import AutopilotState
 from input_controller import InputController, InterruptedByUserError
 from overlay_ui import HUDOverlayWindow
+from uia_client import (
+    DEFAULT_MAX_DEPTH,
+    DEFAULT_MAX_NODES,
+    DEFAULT_TIME_BUDGET_S,
+    UIAClient,
+)
 from vision_engine import ScreenCaptureError, VisionEngine
 
 # Must run before logging.basicConfig: StreamHandler captures sys.stderr at
@@ -51,6 +57,9 @@ NON_INPUT_ACTIONS: frozenset[str] = frozenset({
     "get_screen_state",
     "list_windows_and_monitors",
     "get_ui_elements",
+    "probe_target",
+    "get_snapshot",
+    "resolve_clickable",
     "reset_override",
     "release_control",
     "hud_state",
@@ -65,6 +74,10 @@ class AutopilotDaemon:
         self.auth_token = self._init_auth_token()
 
         self.vision = VisionEngine()
+        # The UIA-first path from ADR-0007. Kept separate from VisionEngine so the
+        # snapshot layer stays free of pywinauto, which ADR-0007 rules out of the
+        # hot path.
+        self.uia = UIAClient()
         self.overlay = HUDOverlayWindow()
         self.input_ctrl = InputController(on_state_change=self._on_input_state_changed)
 
@@ -288,6 +301,12 @@ class AutopilotDaemon:
                 return await self._action_list_windows_and_monitors()
             elif action == "get_ui_elements":
                 return await self._action_get_ui_elements(params)
+            elif action == "probe_target":
+                return await self._action_probe_target(params)
+            elif action == "get_snapshot":
+                return await self._action_get_snapshot(params)
+            elif action == "resolve_clickable":
+                return await self._action_resolve_clickable(params)
             elif action == "hud_state":
                 return await self._action_hud_state()
             elif action == "reset_override":
@@ -666,6 +685,266 @@ class AutopilotDaemon:
             data["warning"] = result.error
 
         return {"status": "ok", "data": data}
+
+    # ------------------------------------------------------- UIA-first path
+    async def _resolve_target(self, params: dict[str, Any]) -> tuple[int | None, str]:
+        """Resolves a target handle, or returns a reason the caller can act on.
+
+        A title alone does not identify a window, so the reason string distinguishes
+        a dead handle from nothing matching. Sending both back as one generic
+        message would make the agent try both remedies at once.
+        """
+        handle, how, _candidates = await asyncio.to_thread(
+            self.uia.resolve_handle,
+            params.get("hwnd"),
+            params.get("window_title"),
+            params.get("class_name"),
+        )
+        if handle is not None:
+            return handle, how
+        if how == "hwnd-invalid":
+            return None, (
+                f"Дескриптор окна {params.get('hwnd')} недействителен "
+                "(IsWindow вернул false) — окно могло быть закрыто. Запросите "
+                "list_windows_and_monitors для получения актуальных дескрипторов."
+            )
+        return None, (
+            "Ни одно видимое окно не подошло под заданные критерии. Запросите "
+            "list_windows_and_monitors и передайте точный handle."
+        )
+
+    @staticmethod
+    def _path_recommendation(classification: str, iconic: bool) -> str:
+        """Which control path a target actually supports, from its classification.
+
+        Derived from measurement, not from guesswork: ADR-0007/0008 for the
+        tree-based classes and ADR-0009 for terminals.
+        """
+        base = {
+            "terminal": (
+                "Терминал. Читается через TextPattern и пишется WM_CHAR в дочернее "
+                "окно ввода — обе операции Класса B, курсор не требуется. "
+                "ValuePattern принимать запись не будет, несмотря на IsReadOnly=0."
+            ),
+            "rich": (
+                "Семантический путь. Снимок дерева и действия через паттерны "
+                "(Invoke, Value, Toggle) — Класс B, курсор и фокус не требуются."
+            ),
+            "partial": (
+                "Смешанный путь. Имена заполнены частично: сверяйте элементы по "
+                "роли, позиции и доступным паттернам, а не только по тексту."
+            ),
+            "opaque": (
+                "Пиксельный путь. Дерево недоступно или пусто — используйте снимок "
+                "экрана и координаты. Это действия Класса A: они занимают курсор."
+            ),
+            "expensive": (
+                "Цель патологически дорогая для обхода. Снимок будет заведомо "
+                "неполным; задайте малый max_nodes и работайте по токенам."
+            ),
+        }.get(classification, "Классификация неизвестна; начните с probe_target.")
+        if iconic:
+            base += (
+                " Окно свёрнуто: координаты недействительны, а захват вернёт чёрный "
+                "кадр. Разверните его перед наблюдением по пикселям."
+            )
+        return base
+
+    async def _action_probe_target(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Classifies a target and reports which control path it supports."""
+        handle, how = await self._resolve_target(params)
+        if handle is None:
+            return {"status": "error", "message": how}
+
+        probe = await asyncio.to_thread(self.uia.probe_target, handle)
+        return {
+            "status": "ok",
+            "data": {
+                "handle": probe.handle,
+                "title": probe.title,
+                "class_name": probe.class_name,
+                "pid": probe.pid,
+                "resolution": how,
+                "iconic": probe.iconic,
+                "child_count": probe.child_count,
+                "tree_sample": probe.tree_sample,
+                "us_per_node": (
+                    round(probe.us_per_node, 1) if probe.us_per_node else None
+                ),
+                "classification": probe.classification,
+                "patterns": list(probe.patterns),
+                "notes": list(probe.notes),
+                "recommendation": self._path_recommendation(
+                    probe.classification, probe.iconic
+                ),
+            },
+        }
+
+    def _frame_point(self, bbox: dict[str, int], x: int, y: int) -> list[int] | None:
+        """Absolute desktop point -> frame coordinate, or None if off this monitor.
+
+        Off-monitor elements get no frame coordinate rather than a negative one:
+        a point outside the captured frame is not a place the agent can aim at in
+        the image it is looking at.
+        """
+        if not (bbox["left"] <= x < bbox["left"] + bbox["width"]
+                and bbox["top"] <= y < bbox["top"] + bbox["height"]):
+            return None
+        scale_x = bbox["width"] / float(config.TARGET_IMAGE_WIDTH)
+        scaled_h = round(bbox["height"] / scale_x)
+        scale_y = bbox["height"] / float(scaled_h)
+        return [round((x - bbox["left"]) / scale_x), round((y - bbox["top"]) / scale_y)]
+
+    def _containing_monitor_index(self, handle: int) -> int | None:
+        """Index of the monitor holding the window's centre, or None.
+
+        Index 0 is skipped: the virtual desktop contains every window, so it can
+        never answer "which screen is this on".
+        """
+        bounds = self.uia.window_bounds(handle)
+        if not bounds:
+            return None
+        cx, cy = (bounds[0] + bounds[2]) // 2, (bounds[1] + bounds[3]) // 2
+        for m in self.vision.list_monitors():
+            if m.index == 0:
+                continue
+            if m.left <= cx < m.left + m.width and m.top <= cy < m.top + m.height:
+                return m.index
+        return None
+
+    async def _action_get_snapshot(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Bounded UIA snapshot with frame-space coordinates and a continuation token."""
+        handle, how = await self._resolve_target(params)
+        if handle is None:
+            return {"status": "error", "message": how}
+
+        budget_ms = params.get("time_budget_ms")
+        snap = await asyncio.to_thread(
+            lambda: self.uia.snapshot(
+                handle,
+                max_depth=int(params.get("max_depth") or DEFAULT_MAX_DEPTH),
+                max_nodes=int(params.get("max_nodes") or DEFAULT_MAX_NODES),
+                time_budget_s=(float(budget_ms) / 1000.0 if budget_ms
+                               else DEFAULT_TIME_BUDGET_S),
+                token=params.get("token"),
+                auto_restore=bool(params.get("auto_restore")),
+            )
+        )
+        mon_idx = params.get("monitor_index")
+        bbox, mon = await asyncio.to_thread(self.vision.get_monitor_bounds, mon_idx)
+
+        # A target that does not lie on the requested monitor produces no usable
+        # coordinate at all. Saying so, with the index that would work, beats
+        # returning a tree where every element reads "outside the frame".
+        containing = await asyncio.to_thread(self._containing_monitor_index, handle)
+        if containing is not None and containing != mon.index:
+            snap_hint = (
+                f"Окно находится на мониторе {containing}, а снимок запрошен для "
+                f"монитора {mon.index}: координаты недействительны. Повторите с "
+                f"monitor_index={containing}."
+            )
+        else:
+            snap_hint = None
+
+        # Frame coordinates must be in the text the model reads, not only in the
+        # structured payload, or the model has to convert them itself and will
+        # occasionally get it wrong.
+        def to_frame(point):
+            if point is None:
+                return None
+            return self._frame_point(bbox, point[0], point[1])
+
+        actionable_patterns = {"Invoke", "Value", "Toggle", "SelectionItem",
+                               "ExpandCollapse", "RangeValue"}
+        nodes = []
+        for n in snap.nodes:
+            fp = to_frame(n.clickable)
+            if not (fp or (set(n.patterns) & actionable_patterns)):
+                continue
+            nodes.append({
+                "path": n.path,
+                "depth": n.depth,
+                "role": n.role,
+                "text": n.text,
+                "text_source": n.text_source,
+                "text_usable": n.text_usable,
+                "patterns": list(n.patterns),
+                "enabled": n.enabled,
+                "offscreen": n.offscreen,
+                "abs_point": list(n.clickable) if n.clickable else None,
+                "frame_point": fp,
+            })
+
+        data: dict[str, Any] = {
+            "handle": handle,
+            "resolution": how,
+            "monitor": {
+                "index": mon.index, "name": mon.name,
+                "bounds": [bbox["left"], bbox["top"], bbox["width"], bbox["height"]],
+            },
+            "frame": [config.TARGET_IMAGE_WIDTH,
+                      round(bbox["height"] / (bbox["width"] / config.TARGET_IMAGE_WIDTH))],
+            "node_count": len(snap.nodes),
+            "actionable_count": len(nodes),
+            "truncated": snap.truncated,
+            "truncated_reason": snap.truncated_reason,
+            "next_token": snap.next_token,
+            "elapsed_ms": round(snap.elapsed_ms, 1),
+            "queries": snap.queries,
+            "failed_queries": snap.failed_queries,
+            "minimized": snap.minimized,
+            "auto_restored": snap.auto_restored,
+            "monitor_hint": snap_hint,
+            "warnings": snap.warnings,
+            "tree": self.uia.format_snapshot(snap, to_frame=to_frame),
+            "nodes": nodes[:150],
+        }
+        return {"status": "ok", "data": data}
+
+    async def _action_resolve_clickable(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Resolves one node's precise clickable point, in frame coordinates.
+
+        The snapshot carries a rect centre because UIA's own clickable point is a
+        live round trip that costs 162 us per node. This resolves the precise one
+        for the single element about to be acted on, which is also fresher.
+        """
+        handle, how = await self._resolve_target(params)
+        if handle is None:
+            return {"status": "error", "message": how}
+        path = params.get("path")
+        if not path:
+            return {"status": "error", "message": "Не указан path узла из снимка."}
+
+        point = await asyncio.to_thread(self.uia.clickable_point, handle, str(path))
+        bbox, mon = await asyncio.to_thread(
+            self.vision.get_monitor_bounds, params.get("monitor_index")
+        )
+        if point is None:
+            return {
+                "status": "error",
+                "message": (
+                    f"Узел {path} не имеет точки клика: элемент вне экрана, свёрнут "
+                    "или путь больше не разрешается (дерево изменилось). Сделайте "
+                    "новый снимок вместо клика по устаревшей координате."
+                ),
+            }
+        fp = self._frame_point(bbox, point[0], point[1])
+        containing = None
+        if fp is None:
+            # Without this the caller only learns that the point is not on the
+            # requested monitor, and has to enumerate monitors to find the right one.
+            containing = await asyncio.to_thread(self._containing_monitor_index, handle)
+        return {
+            "status": "ok",
+            "data": {
+                "handle": handle, "resolution": how, "path": str(path),
+                "abs_point": list(point),
+                "frame_point": fp,
+                "monitor_index": mon.index,
+                "on_monitor": fp is not None,
+                "containing_monitor": containing,
+            },
+        }
 
     async def _action_hud_state(self) -> dict[str, Any]:
         """Reports live overlay geometry so frame placement is checkable, not assumed.

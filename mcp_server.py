@@ -496,6 +496,215 @@ async def get_ui_elements(
 
 
 @mcp.tool()
+async def probe_target(
+    hwnd: int | None = None,
+    window_title: str | None = None,
+    class_name: str | None = None,
+) -> str:
+    """
+    Classifies a target window before a control path is chosen, and says which path it supports.
+
+    Call this before deciding between the accessibility tree and pixel coordinates.
+    It reports the target's classification, the pattern inventory found inside the
+    target, the measured cost per element in microseconds, how many nodes a trial
+    walk found, whether the window is minimized, and a concrete recommendation.
+
+    Classification is based on a trial walk, not on first-level fan-out. Chromium
+    and Electron place a view chain four to six levels deep above the real content,
+    so a window reporting two children at depth one can still expose hundreds of
+    usable nodes.
+
+    Classifications:
+      'terminal'  - a console host. Readable through TextPattern and writable through
+                    WM_CHAR to its input child window, both without using the cursor.
+                    ValuePattern reports IsReadOnly=0 there and then does nothing.
+      'rich'      - a usable accessibility tree. Semantic path, Class B.
+      'partial'   - tree present but names sparsely populated. Match on role and
+                    position as well as text.
+      'opaque'    - no usable tree. Pixel path, which means Class A and the cursor.
+      'expensive' - walking costs orders of magnitude more than a normal window, so
+                    any snapshot will be incomplete. Use a small max_nodes.
+
+    Cost per element varies by a factor of 100 between targets (217 us on one
+    browser page, 16.9 ms on another, 41 ms on a Qt window), which is why it is
+    measured here rather than assumed.
+
+    Args:
+        hwnd: Exact handle from list_windows_and_monitors. Takes priority.
+        window_title: Substring of the window title.
+        class_name: Win32 window class, narrows a title search.
+    """
+    resp = await _send_daemon_request("probe_target", {
+        "hwnd": hwnd, "window_title": window_title, "class_name": class_name,
+    })
+    if resp.get("status") != "ok":
+        return f"Ошибка обследования цели: {resp.get('message', 'Неизвестная ошибка')}"
+
+    d = resp.get("data", {})
+    lines = [
+        f"Цель: handle={d.get('handle')} '{d.get('title')}' "
+        f"class='{d.get('class_name')}' pid={d.get('pid')} выбрано={d.get('resolution')}",
+        f"Классификация: {d.get('classification')}",
+        f"Элементов первого уровня: {d.get('child_count')}  "
+        f"узлов в пробном обходе: {d.get('tree_sample')}  "
+        f"стоимость узла: {d.get('us_per_node')} мкс  свёрнуто: {d.get('iconic')}",
+    ]
+    patterns = d.get("patterns") or []
+    lines.append(
+        "Паттерны цели: "
+        + (", ".join(patterns[:14]) if patterns else "не обнаружено")
+    )
+    for note in d.get("notes") or []:
+        lines.append(f"Замечание: {note}")
+    lines.append(f"Рекомендация: {d.get('recommendation')}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_snapshot(
+    hwnd: int | None = None,
+    window_title: str | None = None,
+    class_name: str | None = None,
+    monitor_index: int | None = None,
+    max_nodes: int | None = None,
+    max_depth: int | None = None,
+    time_budget_ms: int | None = None,
+    token: str | None = None,
+    auto_restore: bool = False,
+) -> str:
+    """
+    Returns a bounded semantic snapshot of a window's accessibility tree.
+
+    This is the primary observation path. It does not use the cursor, works on
+    inactive and occluded windows, and does not depend on the screenshot scale.
+    Coordinates in the output are in frame space (width 1280), ready for
+    mouse_action, and elements outside the given monitor are marked rather than
+    given a negative coordinate.
+
+    The snapshot is deliberately incomplete whenever the target is large. The
+    header says which limit was hit and, for time and node limits, gives a token to
+    continue from. Pass that token back to page through the rest. Truncation by
+    depth cannot be resumed -- raise max_depth instead.
+
+    Each line is: path [role] 'text' @x,y {patterns}. The path is a stable
+    sibling-index address and is what resolve_clickable takes. Text annotated as
+    class-sourced is a control class name, not UI content: good for telling
+    elements apart, not for identifying a message recipient.
+
+    Args:
+        hwnd: Exact handle from list_windows_and_monitors. Takes priority.
+        window_title: Substring of the window title.
+        class_name: Win32 window class, narrows a title search.
+        monitor_index: Which monitor's frame the coordinates are scaled to.
+        max_nodes: Node cap for this page (default 400).
+        max_depth: Depth cap (default 20). Raising it is the only way past a
+            depth truncation.
+        time_budget_ms: Wall-clock budget for the walk (default 150). This is the
+            primary limit, because cost per node varies by a factor of 100 between
+            targets.
+        token: Continuation token from a previous truncated snapshot.
+        auto_restore: Restore the window first if it is minimized. Off by default
+            because it changes the user's desktop.
+    """
+    resp = await _send_daemon_request("get_snapshot", {
+        "hwnd": hwnd, "window_title": window_title, "class_name": class_name,
+        "monitor_index": monitor_index, "max_nodes": max_nodes,
+        "max_depth": max_depth, "time_budget_ms": time_budget_ms,
+        "token": token, "auto_restore": auto_restore,
+    })
+    if resp.get("status") != "ok":
+        return f"Ошибка снимка дерева: {resp.get('message', 'Неизвестная ошибка')}"
+
+    d = resp.get("data", {})
+    session_note = (
+        f"ВНИМАНИЕ: {d['session_warning']}" if d.get("session_warning") else None
+    )
+    header = [session_note] if session_note else []
+    header.append(
+        f"Цель: handle={d.get('handle')} выбрано={d.get('resolution')}  "
+        f"монитор {d.get('monitor', {}).get('index')} кадр={d.get('frame')}"
+    )
+    header.append(
+        f"Узлов: {d.get('node_count')} (действующих {d.get('actionable_count')})  "
+        f"время {d.get('elapsed_ms')} мс  запросов {d.get('queries')}  "
+        f"отказов {d.get('failed_queries')}"
+    )
+    if d.get("monitor_hint"):
+        header.append(f"НЕВЕРНЫЙ МОНИТОР: {d['monitor_hint']}")
+    if d.get("minimized"):
+        header.append(
+            "ОКНО СВЁРНУТО: дерево читается, но координаты недействительны и захват "
+            "вернёт чёрный кадр. Разверните окно перед действием по координатам."
+        )
+    if d.get("auto_restored"):
+        header.append("Окно было развёрнуто автоматически.")
+    for w in (d.get("warnings") or [])[:4]:
+        header.append(f"Внимание: {w}")
+
+    tree = d.get("tree") or ""
+    nodes = d.get("nodes") or []
+    offscreen_actionable = sum(
+        1 for n in nodes if n.get("frame_point") is None and n.get("abs_point")
+    )
+    footer = []
+    if offscreen_actionable:
+        footer.append(
+            f"{offscreen_actionable} действующих элементов лежат вне этого кадра; "
+            "повторите с monitor_index их монитора."
+        )
+    return "\n".join([*header, "", tree, *footer])
+
+
+@mcp.tool()
+async def resolve_clickable(
+    path: str,
+    hwnd: int | None = None,
+    window_title: str | None = None,
+    class_name: str | None = None,
+    monitor_index: int | None = None,
+) -> str:
+    """
+    Resolves the precise clickable point of one snapshot node, in frame coordinates.
+
+    A snapshot carries a node's rectangle centre, because asking UIA for its own
+    clickable point is a live round trip costing 162 us per node -- 26% of a walk.
+    Call this for the single element you are about to act on. It is also fresher
+    than the snapshot value, and it returns None rather than a stale coordinate
+    when the element is offscreen, minimized, or the tree has changed.
+
+    Args:
+        path: The node's path from a snapshot, e.g. '1.0.2'.
+        hwnd: Exact handle of the window the snapshot came from.
+        window_title: Substring of the window title.
+        class_name: Win32 window class.
+        monitor_index: Which monitor's frame to scale the point into.
+    """
+    resp = await _send_daemon_request("resolve_clickable", {
+        "path": path, "hwnd": hwnd, "window_title": window_title,
+        "class_name": class_name, "monitor_index": monitor_index,
+    })
+    if resp.get("status") != "ok":
+        return f"Точка клика не получена: {resp.get('message', 'Неизвестная ошибка')}"
+
+    d = resp.get("data", {})
+    fp = d.get("frame_point")
+    if fp is None:
+        containing = d.get("containing_monitor")
+        where = (
+            f"Повторите с monitor_index={containing}." if containing is not None
+            else "Повторите с monitor_index того монитора, на котором лежит элемент."
+        )
+        return (
+            f"Узел {d.get('path')} находится вне монитора {d.get('monitor_index')}. "
+            + where
+        )
+    return (
+        f"Узел {d.get('path')}: точка клика в кадре x={fp[0]}, y={fp[1]} "
+        f"(абсолютные {d.get('abs_point')}, монитор {d.get('monitor_index')})."
+    )
+
+
+@mcp.tool()
 async def reset_user_override() -> str:
     """
     Resets USER_OVERRIDE back to IDLE.

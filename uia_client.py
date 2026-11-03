@@ -151,6 +151,9 @@ class TargetProbe:
     classification: str  # terminal | rich | partial | opaque | expensive
     patterns: tuple[str, ...]
     notes: list[str] = field(default_factory=list)
+    # Nodes found by a small bounded walk. Fan-out at depth one is a poor opacity
+    # signal on its own; see _classify.
+    tree_sample: int = 0
 
 
 class UIAClient:
@@ -262,6 +265,20 @@ class UIAClient:
             "pid": self._retry(lambda: int(el.CurrentProcessId)),
         }
 
+    def window_bounds(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        """Absolute rect of a window, or None if it cannot be read.
+
+        Used to tell the caller when a requested monitor does not contain the
+        target, which otherwise surfaces only as every coordinate being
+        "outside the frame" with no explanation.
+        """
+        try:
+            el = self.element_from_handle(hwnd)
+            r = self._retry(lambda: el.CurrentBoundingRectangle)
+            return (r.left, r.top, r.right, r.bottom)
+        except (COMError, AttributeError, TypeError):
+            return None
+
     def is_minimized(self, hwnd: int) -> bool:
         """Minimized windows capture as black, so this gates observation."""
         try:
@@ -364,21 +381,50 @@ class UIAClient:
             if read:
                 us_per_node = (time.perf_counter() - t0) * 1_000_000 / read
 
-        # Pattern inventory from the focused element, per ADR-0007: this is the
-        # documented probe path and does not need a tree walk.
+        # Patterns must come from an element inside the target. Polling the globally
+        # focused element reported an identical inventory for every window unless
+        # the target happened to be focused, which it usually is not -- the first
+        # live run returned the same five patterns for two unrelated applications.
         pattern_names: tuple[str, ...] = ()
+        candidates = [el]
         try:
-            focus = self._retry(auto.GetFocusedElement)
-            ids, names = self._retry(
-                lambda: auto.PollForPotentialSupportedPatterns(focus)
+            first_level = self._retry(
+                lambda: el.FindAllBuildCache(
+                    mod.TreeScope_Children, true_cond, self._cache_request()
+                )
             )
-            pattern_names = tuple(str(n) for n in names)
+            if first_level.Length:
+                candidates.insert(0, first_level.GetElement(0))
         except COMError:
             pass
+        for cand in candidates:
+            try:
+                _ids, names = self._retry(
+                    lambda c=cand: auto.PollForPotentialSupportedPatterns(c)
+                )
+                got = tuple(str(n) for n in names)
+                if got:
+                    pattern_names = got
+                    break
+            except COMError:
+                continue
+
+        # Fan-out at depth one misreads Chromium and Electron: they place a view chain
+        # four to six levels deep above the real tree, so a live Electron window
+        # reported 2 children and 1 grandchild while having 184 usable nodes further
+        # down. Sample the tree the way the walk actually does instead.
+        #
+        # The sample must use the same depth as a real walk. With max_depth=10 it
+        # collected 15 nodes from a window that has 182, because Chromium's chain
+        # alone is nine levels deep and all the width sits below the tenth.
+        sample = self.snapshot(
+            hwnd, max_nodes=40, max_depth=DEFAULT_MAX_DEPTH, time_budget_s=0.15
+        )
+        tree_sample = len(sample.nodes)
 
         classification = self._classify(
-            child_count=child_count, us_per_node=us_per_node,
-            iconic=iconic, el=el, notes=notes,
+            child_count=child_count, tree_sample=tree_sample,
+            us_per_node=us_per_node, el=el, notes=notes,
         )
         if us_per_node is not None and us_per_node > 2000:
             notes.append(
@@ -392,16 +438,16 @@ class UIAClient:
             handle=hwnd, title=info["title"], class_name=info["class_name"],
             pid=info["pid"], iconic=iconic, child_count=child_count,
             us_per_node=us_per_node, classification=classification,
-            patterns=pattern_names, notes=notes,
+            patterns=pattern_names, notes=notes, tree_sample=tree_sample,
         )
 
-    def _classify(self, *, child_count, us_per_node, iconic, el, notes) -> str:
+    def _classify(self, *, child_count, tree_sample, us_per_node, el, notes) -> str:
         """Thresholds come from the measurements, not from taste."""
         if us_per_node is not None and us_per_node > 2000:
             return "expensive"
 
         # Terminals: tiny tree with one large TextPattern buffer. Detected by the
-        # window class, which is stable, rather than by tree shape alone.
+        # window class, which is stable, rather than by tree shape.
         try:
             cls = (self._retry(lambda: el.CurrentClassName) or "").lower()
         except COMError:
@@ -409,14 +455,19 @@ class UIAClient:
         if "cascadia_hosting" in cls or "consolewindowclass" in cls:
             return "terminal"
 
-        if child_count == 0:
+        if child_count == 0 or tree_sample < 20:
+            notes.append(
+                f"Дерево мелкое: {child_count} элементов первого уровня и "
+                f"{tree_sample} узлов в ограниченном обходе. Для большого окна это "
+                "признак непрозрачной цели."
+            )
             return "opaque"
         if child_count < 20:
             notes.append(
-                f"Первый уровень содержит {child_count} элементов; для большого "
-                "окна это признак непрозрачной цели."
+                f"Первый уровень узкий ({child_count}), но обход нашёл {tree_sample} "
+                "узлов глубже. Так устроены Chromium и Electron, где наверху цепочка "
+                "представлений; непрозрачной целью это не считается."
             )
-            return "opaque"
         named = self._named_fraction(el)
         if named is not None and named < 0.4:
             notes.append(f"Имена заполнены у {named*100:.0f}% первого уровня.")
@@ -497,7 +548,7 @@ class UIAClient:
         shape that can be stopped mid-way and that yields real depth and paths.
         The time budget does the real limiting; depth is only a runaway guard.
         """
-        started = time.monotonic()
+        wall_started = time.monotonic()
         auto = self._automation()
         mod = self._typelib()
         true_cond = auto.CreateTrueCondition()
@@ -526,8 +577,15 @@ class UIAClient:
                 "перед любым действием по координатам."
             )
 
+        # Navigation and observation are budgeted separately. Rebuilding a deep token
+        # costs one query per path segment, and a 15-segment token measured live at
+        # ~200 ms -- the entire budget -- after which no node was emitted and the
+        # same token came back. That is a livelock, so the budget starts once the
+        # stack is ready and every page is guaranteed to make progress.
+        deadline_base = [wall_started]
+
         def over_deadline() -> bool:
-            return (time.monotonic() - started) >= time_budget_s
+            return (time.monotonic() - deadline_base[0]) >= time_budget_s
 
         def children_of(el):
             nonlocal queries, failed
@@ -564,12 +622,14 @@ class UIAClient:
                 return Snapshot(
                     nodes=[], truncated=False, truncated_reason="",
                     next_token=None,
-                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    elapsed_ms=(time.monotonic() - wall_started) * 1000,
                     queries=queries, failed_queries=failed,
                     warnings=warnings + ["Не удалось получить дочерние элементы окна."],
                     minimized=minimized, auto_restored=restored,
                 )
             stack = [[root_el, 0, "", kids, 0]]
+
+        deadline_base[0] = time.monotonic()
 
         next_token = None
         role_map = self.control_type_names()
@@ -631,7 +691,7 @@ class UIAClient:
             truncated=bool(truncated_reason),
             truncated_reason=truncated_reason,
             next_token=next_token,
-            elapsed_ms=(time.monotonic() - started) * 1000,
+            elapsed_ms=(time.monotonic() - wall_started) * 1000,
             queries=queries,
             failed_queries=failed,
             warnings=warnings,
@@ -812,6 +872,126 @@ class UIAClient:
             return None
         return point
 
+    # ------------------------------------------------------------- target resolve
+    def resolve_handle(
+        self,
+        hwnd: int | None = None,
+        window_title: str | None = None,
+        class_name: str | None = None,
+    ) -> tuple[int | None, str, int]:
+        """Picks the window to work with and says how it was picked.
+
+        Returns ``(handle, how, candidates)``. ``how`` is one of ``hwnd``,
+        ``unique``, ``largest-of-N``, ``win32-title``, ``foreground``,
+        ``hwnd-invalid`` or ``none``.
+
+        A title alone does not identify a window: one application can own several
+        top-level windows with the same title, and picking the wrong one yields an
+        empty tree that looks exactly like an application exposing nothing. When
+        several match, the largest by area wins, since notification popups are the
+        small ones.
+
+        Top-level windows are enumerated in one cached query rather than matched
+        through a UIA property condition, because that keeps the hot path free of
+        pywinauto and does not depend on substring-match flags being available.
+        """
+        if hwnd:
+            if not self._is_window(hwnd):
+                return None, "hwnd-invalid", 0
+            return hwnd, "hwnd", 1
+
+        auto = self._automation()
+        mod = self._typelib()
+        req = auto.CreateCacheRequest()
+        req.AddProperty(int(mod.UIA_NamePropertyId))
+        req.AddProperty(int(mod.UIA_ClassNamePropertyId))
+        req.AddProperty(int(mod.UIA_BoundingRectanglePropertyId))
+
+        if not window_title and not class_name:
+            fg = self._foreground_window()
+            if not fg:
+                return None, "none", 0
+            return fg, "foreground", 1
+
+        needle = (window_title or "").strip().lower()
+        want_class = (class_name or "").strip().lower()
+
+        try:
+            top = self._retry(
+                lambda: auto.GetRootElement().FindAllBuildCache(
+                    mod.TreeScope_Children, auto.CreateTrueCondition(), req
+                )
+            )
+        except COMError:
+            return None, "none", 0
+
+        matches: list[tuple[int, int]] = []  # (area, hwnd)
+        for i in range(top.Length):
+            e = top.GetElement(i)
+            try:
+                name = (e.CachedName or "").strip().lower()
+                cls = (e.CachedClassName or "").strip().lower()
+            except COMError:
+                continue
+            if needle and needle not in name:
+                continue
+            if want_class and cls != want_class:
+                continue
+            # IsOffscreen is deliberately not filtered on. A minimized window
+            # reports it, but the tree still reads and restoring it is a Class B
+            # action, so excluding such windows would make a minimized application
+            # unreachable by title with no way for the caller to tell why.
+            try:
+                h = int(e.CurrentNativeWindowHandle)
+            except COMError:
+                continue
+            if not h:
+                continue
+            try:
+                r = e.CachedBoundingRectangle
+                area = max(r.right - r.left, 0) * max(r.bottom - r.top, 0)
+            except COMError:
+                area = 0
+            matches.append((area, h))
+
+        if not matches:
+            # The Win32 title and the UIA Name are different strings for the same
+            # window: Qt derives the Name from the application name while
+            # GetWindowText returns the document title. list_windows_and_monitors
+            # reports Win32 titles, so a title copied out of that list matches
+            # nothing here. Fall back instead of reporting failure.
+            if needle:
+                from vision_engine import find_hwnd_by_win32_title
+
+                handle = find_hwnd_by_win32_title(window_title, class_name)
+                if handle:
+                    return handle, "win32-title", 1
+            return None, "none", 0
+        if len(matches) == 1:
+            return matches[0][1], "unique", 1
+        best = max(matches)[1]
+        return best, f"largest-of-{len(matches)}", len(matches)
+
+    def _is_window(self, hwnd: int) -> bool:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            user32.IsWindow.argtypes = [wintypes.HWND]
+            user32.IsWindow.restype = wintypes.BOOL
+            return bool(user32.IsWindow(hwnd))
+        except Exception:
+            return False
+
+    def _foreground_window(self) -> int:
+        try:
+            import ctypes
+
+            return int(ctypes.windll.user32.GetForegroundWindow())
+        except Exception:
+            return 0
+
     # ------------------------------------------------------- continuation
     @staticmethod
     def _token_from(stack: list[list]) -> str | None:
@@ -870,12 +1050,26 @@ class UIAClient:
         return stack
 
     # ------------------------------------------------------------ formatting
-    def format_snapshot(self, snap: Snapshot, *, max_lines: int = 120) -> str:
-        """Compact text rendering of a snapshot for a model to read."""
+    def format_snapshot(
+        self, snap: Snapshot, *, max_lines: int = 120, to_frame=None
+    ) -> str:
+        """Compact text rendering of a snapshot for a model to read.
+
+        ``to_frame`` maps an absolute desktop point to a frame coordinate and
+        returns None when the point is outside the captured monitor. Passing it
+        makes the rendered coordinates directly usable for a click; leaving it out
+        renders absolute points, which are not what a screenshot-based caller
+        needs.
+        """
         lines = [
             f"Снимок: {len(snap.nodes)} узлов за {snap.elapsed_ms:.0f} мс, "
             f"запросов {snap.queries}, отказов {snap.failed_queries}"
         ]
+        if to_frame:
+            lines.append(
+                "Координаты @x,y приведены к кадру снимка (ширина 1280), "
+                "а не к физическим пикселям монитора."
+            )
         if snap.truncated:
             reason = {
                 "time": "исчерпан бюджет времени",
@@ -885,6 +1079,8 @@ class UIAClient:
             lines.append(f"СНИМОК НЕПОЛОН: {reason}.")
             if snap.next_token:
                 lines.append(f"Продолжение: token={snap.next_token}")
+            else:
+                lines.append("Продолжение невозможно: увеличьте max_depth.")
         for w in snap.warnings[:6]:
             lines.append(f"Внимание: {w}")
 
@@ -896,10 +1092,17 @@ class UIAClient:
             bits = [f"{indent}{n.path} [{n.role}]"]
             if n.text:
                 bits.append(repr(n.text[:60]))
+                if not n.text_usable:
+                    # The label is a control class, not UI content. Enough to tell
+                    # elements apart, not enough to identify a recipient.
+                    bits.append("[по классу]")
             else:
                 bits.append("(без текста)")
-            if n.clickable:
-                bits.append(f"@{n.clickable[0]},{n.clickable[1]}")
+            point = to_frame(n.clickable) if to_frame else n.clickable
+            if point:
+                bits.append(f"@{point[0]},{point[1]}")
+            elif n.clickable:
+                bits.append("@вне кадра")
             if not n.enabled:
                 bits.append("disabled")
             if n.offscreen:
