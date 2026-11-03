@@ -1,0 +1,78 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+
+  // Пример конфигурации Kilo для desktop-autopilot.
+  //
+  // Отличается от mcp_config.example.json: Kilo читает kilo.json / kilo.jsonc,
+  // секция называется "mcp", а "command" — это МАССИВ, а не строка. Формат
+  // "mcpServers" с командой-строкой принадлежит Claude Desktop и Cursor и Kilo
+  // не понимается.
+  //
+  // Куда класть:
+  //   глобально  ~/.config/kilo/kilo.jsonc   — доступно во всех проектах
+  //   проект     ./kilo.json                 — только в этом каталоге
+  // Глобальный вариант здесь уместнее: автопилот управляет рабочим столом, а не
+  // одним проектом. Проектный конфиг имеет приоритет над глобальным.
+  //
+  // Обязателен перезапуск Kilo: конфиг MCP читается при старте.
+
+  "mcp": {
+    "desktop-autopilot": {
+      "type": "local",
+      "command": [
+        "F:\\Files\\project\\mcps\\ai-autopilot-mcp\\.venv\\Scripts\\autopilot-mcp.exe"
+      ],
+      "enabled": true,
+
+      // Таймаут в МИЛЛИСЕКУНДАХ, по умолчанию 5000. Десять секунд здесь не
+      // запас, а необходимость: get_ui_elements обходит дерево доступности и по
+      // таблице таймаутов проекта имеет право занимать до 90 с, wait_terminal и
+      // wait_for_text ждут условие до 30 с. С умолчательными 5 с почти каждый
+      // инструмент падал бы по времени, а не по существу.
+      "timeout": 120000
+    }
+  },
+
+  // Разрешения для инструментов MCP строятся как "{сервер}_{инструмент}".
+  // Правила читаются сверху вниз, ПОСЛЕДНЕЕ совпавшее побеждает, поэтому широкое
+  // правило стоит первым, а исключения — после него.
+  //
+  // Разделение повторяет классы A/B из AGENTS.md: наблюдения не двигают курсор и
+  // ничего не меняют, поэтому идут без спроса; всё, что печатает, кликает или
+  // меняет состояние приложения, требует подтверждения.
+  "permission": {
+    "desktop-autopilot_*": "ask",
+
+    // Наблюдения — Класс B, ничего не изменяют.
+    "desktop-autopilot_list_windows_and_monitors": "allow",
+    "desktop-autopilot_get_screen_state": "allow",
+    "desktop-autopilot_get_ui_elements": "allow",
+    "desktop-autopilot_probe_target": "allow",
+    "desktop-autopilot_get_snapshot": "allow",
+    "desktop-autopilot_resolve_clickable": "allow",
+    "desktop-autopilot_read_screen_text": "allow",
+    "desktop-autopilot_find_text_on_screen": "allow",
+    "desktop-autopilot_read_terminal": "allow",
+    "desktop-autopilot_wait_terminal": "allow",
+    "desktop-autopilot_wait_for_text": "allow",
+    "desktop-autopilot_get_hud_state": "allow",
+
+    // Рамка и выход из паузы должны быть доступны всегда: иначе неоновую рамку
+    // не погасить и режим перехвата управления не снять.
+    "desktop-autopilot_take_control": "allow",
+    "desktop-autopilot_release_control": "allow",
+    "desktop-autopilot_reset_user_override": "allow"
+
+    // Остальное остаётся на "ask" через широкое правило выше:
+    //   mouse_action, keyboard_action, scroll_screen  — Класс A, занимают курсор
+    //   act_on_element                                — меняет состояние приложения
+    //   write_terminal                                — печатает в оболочку, то
+    //                                                   есть может выполнить
+    //                                                   произвольную команду
+    //
+    // Для полностью автономной работы замените широкое правило на
+    //   "desktop-autopilot_*": "allow"
+    // и удалите строки исключений. Это снимает подтверждение и с кликов, и с
+    // набора текста в вашу оболочку.
+  }
+}

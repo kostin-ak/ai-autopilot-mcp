@@ -22,7 +22,8 @@ ai-autopilot-mcp/
 ├── docs/                 # ADR, глоссарий и план развития
 ├── install.bat           # Создание .venv и установка зависимостей
 ├── start_daemon.bat      # Скрипт быстрого запуска фонового демона
-└── mcp_config.example.json # Пример конфигурации MCP для клиентов
+├── mcp_config.example.json # Пример конфигурации MCP для Claude Desktop, Cursor, Gemini
+└── kilo.json.example       # Пример конфигурации для Kilo (другой формат: секция mcp)
 ```
 
 ---
@@ -73,16 +74,41 @@ python -m venv .venv
 > переменные среды `SystemRoot` и приводит к сбою загрузчика DLL.
 
 ### Kilo
-В `kilo.json` или через `ctrl+p` → MCP:
-```json
+Формат Kilo **отличается** от остальных разделов: секция называется `mcp`, а не
+`mcpServers`, и `command` — это массив, а не строка. Файл — `kilo.json`/`kilo.jsonc`
+в корне проекта либо `~/.config/kilo/kilo.jsonc` глобально; глобальный вариант
+уместнее, потому что автопилот управляет рабочим столом, а не одним проектом.
+Готовый пример с комментариями — в [`kilo.json.example`](kilo.json.example).
+
+```jsonc
 {
-  "mcpServers": {
+  "mcp": {
     "desktop-autopilot": {
-      "command": "C:\\path\\to\\ai-autopilot-mcp\\.venv\\Scripts\\autopilot-mcp.exe"
+      "type": "local",
+      "command": [
+        "C:\\path\\to\\ai-autopilot-mcp\\.venv\\Scripts\\autopilot-mcp.exe"
+      ],
+      "enabled": true,
+      "timeout": 120000
     }
   }
 }
 ```
+
+Таймаут указывается в миллисекундах и **по умолчанию равен 5000**. Его нужно
+поднять: `get_ui_elements` обходит дерево доступности и по таблице таймаутов проекта
+может занимать до 90 с, `wait_terminal` и `wait_for_text` ждут условие до 30 с. С
+умолчательными пятью секундами инструменты падали бы по времени, а не по существу.
+
+Разрешения на инструменты MCP задаются ключом `{сервер}_{инструмент}`; правила
+читаются сверху вниз, и последнее совпавшее побеждает. В `kilo.json.example`
+наблюдения разрешены, а пять изменяющих инструментов (`mouse_action`,
+`keyboard_action`, `scroll_screen`, `act_on_element`, `write_terminal`) оставлены на
+подтверждении. Для полностью автономной работы широкое правило заменяется на
+`"desktop-autopilot_*": "allow"`.
+
+После правки конфига Kilo нужно перезапустить: серверы MCP читаются при старте.
+Проверить подключение можно через `ctrl+p` → MCP или команду `/mcps`.
 
 ### Claude Code
 ```powershell
