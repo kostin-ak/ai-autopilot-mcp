@@ -307,6 +307,8 @@ class AutopilotDaemon:
                 return await self._action_get_snapshot(params)
             elif action == "resolve_clickable":
                 return await self._action_resolve_clickable(params)
+            elif action == "element_action":
+                return await self._action_element_action(params)
             elif action == "hud_state":
                 return await self._action_hud_state()
             elif action == "reset_override":
@@ -768,6 +770,8 @@ class AutopilotDaemon:
                 "iconic": probe.iconic,
                 "child_count": probe.child_count,
                 "tree_sample": probe.tree_sample,
+                "useful_nodes": probe.useful,
+                "area": probe.area,
                 "us_per_node": (
                     round(probe.us_per_node, 1) if probe.us_per_node else None
                 ),
@@ -943,6 +947,62 @@ class AutopilotDaemon:
                 "monitor_index": mon.index,
                 "on_monitor": fp is not None,
                 "containing_monitor": containing,
+            },
+        }
+
+    async def _action_element_action(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Performs one Class B pattern action and reports whether it verified.
+
+        Pattern actions do not touch the input queue, so they need no cursor. They do
+        mutate application state, so they take the input lock (serializing against
+        any in-flight input) and they stay blocked during USER_OVERRIDE: a human who
+        has taken over is also manipulating that application.
+        """
+        handle, how = await self._resolve_target(params)
+        if handle is None:
+            return {"status": "error", "message": how}
+        path = params.get("path")
+        kind = params.get("action")
+        if not path:
+            return {"status": "error", "message": "Не указан path узла из снимка."}
+
+        if kind == "invoke":
+            res = await asyncio.to_thread(self.uia.invoke, handle, str(path))
+        elif kind == "set_value":
+            text = params.get("text")
+            if text is None:
+                return {"status": "error",
+                        "message": "Для действия set_value требуется параметр text."}
+            res = await asyncio.to_thread(
+                self.uia.set_value, handle, str(path), str(text)
+            )
+        elif kind == "toggle":
+            res = await asyncio.to_thread(self.uia.toggle, handle, str(path))
+        elif kind == "select":
+            res = await asyncio.to_thread(self.uia.select_item, handle, str(path))
+        elif kind in ("expand", "collapse"):
+            res = await asyncio.to_thread(
+                self.uia.expand_collapse, handle, str(path), kind == "expand"
+            )
+        else:
+            return {
+                "status": "error",
+                "message": f"Неизвестное действие {kind!r}. Допустимо: invoke, "
+                           "set_value, toggle, select, expand, collapse.",
+            }
+
+        return {
+            "status": "ok",
+            "data": {
+                "handle": handle,
+                "resolution": how,
+                "action": res.action,
+                "path": res.path,
+                "ok": res.ok,
+                "verified": res.verified,
+                "before": res.before,
+                "after": res.after,
+                "message": res.message,
             },
         }
 

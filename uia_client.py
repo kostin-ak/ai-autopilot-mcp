@@ -85,6 +85,22 @@ def _is_sentinel(x: int, y: int) -> bool:
     return x < SENTINEL_BOUND or y < SENTINEL_BOUND
 
 
+# Patterns that mean an element can be acted on without the cursor.
+_ACTIONABLE_PATTERNS = frozenset({
+    "Invoke", "Value", "Toggle", "SelectionItem", "ExpandCollapse", "RangeValue",
+})
+
+# A window larger than this, reporting almost nothing usable, is opaque. The size
+# qualifier is what ADR-0008 actually said -- "a large window reporting fewer than
+# about twenty elements". Dropping it misclassified a 420x220 dialog whose entire
+# tree is ten nodes and every one of which is actionable.
+OPAQUE_AREA_THRESHOLD = 400_000
+OPAQUE_USEFUL_THRESHOLD = 5
+# Absolute floor, deliberately low: a two-widget dialog is genuinely small, and
+# large-but-empty cases are already caught by the area rule above.
+OPAQUE_SAMPLE_FLOOR = 2
+
+
 @dataclass(frozen=True)
 class NodeSnapshot:
     """One element in a bounded snapshot."""
@@ -138,6 +154,25 @@ class Snapshot:
 
 
 @dataclass
+class ActionResult:
+    """Outcome of a Class B action, and whether that outcome was verified.
+
+    ``verified`` is tri-state on purpose. True and False mean the effect was read
+    back and did or did not match. None means the action has no readable state of
+    its own, so success is only "the call was accepted" -- which is a materially
+    weaker claim and must not be presented as confirmation.
+    """
+
+    ok: bool
+    action: str
+    path: str
+    verified: bool | None
+    message: str = ""
+    before: str | None = None
+    after: str | None = None
+
+
+@dataclass
 class TargetProbe:
     """What a target actually offers, before choosing a path."""
 
@@ -154,6 +189,9 @@ class TargetProbe:
     # Nodes found by a small bounded walk. Fan-out at depth one is a poor opacity
     # signal on its own; see _classify.
     tree_sample: int = 0
+    # Of those, how many carry usable text or an actionable pattern.
+    useful: int = 0
+    area: int = 0
 
 
 class UIAClient:
@@ -418,13 +456,21 @@ class UIAClient:
         # collected 15 nodes from a window that has 182, because Chromium's chain
         # alone is nine levels deep and all the width sits below the tenth.
         sample = self.snapshot(
-            hwnd, max_nodes=40, max_depth=DEFAULT_MAX_DEPTH, time_budget_s=0.15
+            hwnd, max_nodes=120, max_depth=DEFAULT_MAX_DEPTH, time_budget_s=0.20
         )
         tree_sample = len(sample.nodes)
+        useful = sum(
+            1 for n in sample.nodes
+            if n.text_usable or (set(n.patterns) & _ACTIONABLE_PATTERNS)
+        )
+        area = 0
+        wb = self.window_bounds(hwnd)
+        if wb:
+            area = max(wb[2] - wb[0], 0) * max(wb[3] - wb[1], 0)
 
         classification = self._classify(
-            child_count=child_count, tree_sample=tree_sample,
-            us_per_node=us_per_node, el=el, notes=notes,
+            child_count=child_count, tree_sample=tree_sample, useful=useful,
+            area=area, us_per_node=us_per_node, el=el, notes=notes,
         )
         if us_per_node is not None and us_per_node > 2000:
             notes.append(
@@ -439,10 +485,18 @@ class UIAClient:
             pid=info["pid"], iconic=iconic, child_count=child_count,
             us_per_node=us_per_node, classification=classification,
             patterns=pattern_names, notes=notes, tree_sample=tree_sample,
+            useful=useful, area=area,
         )
 
-    def _classify(self, *, child_count, tree_sample, us_per_node, el, notes) -> str:
-        """Thresholds come from the measurements, not from taste."""
+    def _classify(self, *, child_count, tree_sample, useful, area, us_per_node,
+                  el, notes) -> str:
+        """Thresholds come from the measurements, not from taste.
+
+        Node count alone is not an opacity signal. A 420x220 dialog has a complete
+        ten-node tree and every node is actionable, while a 2560x1440 Explorer pane
+        reports seven nodes of pure chrome. What separates them is how much usable
+        content was found relative to how much window there is.
+        """
         if us_per_node is not None and us_per_node > 2000:
             return "expensive"
 
@@ -455,18 +509,25 @@ class UIAClient:
         if "cascadia_hosting" in cls or "consolewindowclass" in cls:
             return "terminal"
 
-        if child_count == 0 or tree_sample < 20:
+        if child_count == 0:
+            notes.append("Первый уровень пуст: дерево недоступно.")
+            return "opaque"
+        if useful < OPAQUE_USEFUL_THRESHOLD and area > OPAQUE_AREA_THRESHOLD:
             notes.append(
-                f"Дерево мелкое: {child_count} элементов первого уровня и "
-                f"{tree_sample} узлов в ограниченном обходе. Для большого окна это "
-                "признак непрозрачной цели."
+                f"Окно большое ({area} px²), но обход нашёл {useful} пригодных "
+                f"узлов из {tree_sample}. Признак непрозрачной цели."
+            )
+            return "opaque"
+        if tree_sample < OPAQUE_SAMPLE_FLOOR:
+            notes.append(
+                f"Обход нашёл {tree_sample} узлов — дерево практически недоступно."
             )
             return "opaque"
         if child_count < 20:
             notes.append(
                 f"Первый уровень узкий ({child_count}), но обход нашёл {tree_sample} "
-                "узлов глубже. Так устроены Chromium и Electron, где наверху цепочка "
-                "представлений; непрозрачной целью это не считается."
+                f"узлов, из них {useful} пригодных. Так устроены Chromium и Electron, "
+                "где наверху цепочка представлений; непрозрачной целью это не считается."
             )
         named = self._named_fraction(el)
         if named is not None and named < 0.4:
@@ -809,13 +870,12 @@ class UIAClient:
         """
         return ((bounds[0] + bounds[2]) // 2, (bounds[1] + bounds[3]) // 2)
 
-    def clickable_point(self, hwnd: int, path: str) -> tuple[int, int] | None:
-        """Resolves UIA's own clickable point for one element, by snapshot path.
+    def _element_at_path(self, hwnd: int, path: str):
+        """Resolves a snapshot path to a live element, or None.
 
-        The path is the sibling-index path from a snapshot, so this is how a node
-        from an earlier snapshot is turned into a coordinate for an action.
-        Returns None if the path no longer resolves, which means the tree changed
-        and the caller should re-snapshot rather than click a stale location.
+        The path is the sibling-index path from a snapshot. Returning None means the
+        tree changed since the snapshot was taken, and the caller must re-snapshot
+        rather than act on a stale address.
         """
         try:
             segments = [int(s) for s in path.strip(".").split(".") if s != ""]
@@ -845,6 +905,19 @@ class UIAClient:
                 current = kids.GetElement(seg)
             except COMError:
                 return None
+        return current
+
+    def clickable_point(self, hwnd: int, path: str) -> tuple[int, int] | None:
+        """Resolves UIA's own clickable point for one element, by snapshot path.
+
+        The path is the sibling-index path from a snapshot, so this is how a node
+        from an earlier snapshot is turned into a coordinate for an action.
+        Returns None if the path no longer resolves, which means the tree changed
+        and the caller should re-snapshot rather than click a stale location.
+        """
+        current = self._element_at_path(hwnd, path)
+        if current is None:
+            return None
 
         # An offscreen element has no clickable point. Returning its degenerate bounds
         # centre would hand the caller a coordinate that is not on any monitor, and
@@ -991,6 +1064,205 @@ class UIAClient:
             return int(ctypes.windll.user32.GetForegroundWindow())
         except Exception:
             return 0
+
+    # --------------------------------------------------------- Class B actions
+    def _pattern_on(self, el, pattern_name: str, iface: str):
+        """Live pattern interface on one element, or None.
+
+        The cached availability flags in a snapshot say a pattern may be supported.
+        Getting the interface is a live call, which is the right cost here because
+        an action is about to be taken on this single element.
+        """
+        try:
+            pid = self.patterns().get(pattern_name)
+            if pid is None:
+                return None
+            unk = self._retry(lambda: el.GetCurrentPattern(pid))
+            if not unk:
+                return None
+            return unk.QueryInterface(getattr(self._typelib(), iface))
+        except (COMError, AttributeError, KeyError, TypeError):
+            return None
+
+    @staticmethod
+    def _hresult(exc) -> str:
+        return f"0x{exc.hresult & 0xFFFFFFFF:08X}"
+
+    @staticmethod
+    def _read_back(read, expect, timeout_s: float = 0.5, interval_s: float = 0.03):
+        """Polls a read-back until it matches, or the timeout expires.
+
+        UIA state is not necessarily updated synchronously with the call. On a live
+        Qt combo box, Expand returned success and an immediate read still reported
+        Collapsed, while the read a few hundred milliseconds later reported
+        Expanded. A single read turns that into a false negative, which makes an
+        agent retry an action that already succeeded -- and a retry on a toggle or
+        an expand undoes it.
+        """
+        deadline = time.monotonic() + timeout_s
+        value = None
+        while True:
+            try:
+                value = read()
+            except COMError:
+                value = None
+            if expect(value):
+                return value, True
+            if time.monotonic() >= deadline:
+                return value, False
+            time.sleep(interval_s)
+
+    def invoke(self, hwnd: int, path: str) -> ActionResult:
+        """Fires InvokePattern.
+
+        Invoke has no readable state of its own, so unlike a value or a toggle it
+        cannot be verified by reading anything back. Success here means only that
+        the call was accepted. The caller must confirm the effect it actually cares
+        about -- a dialog appeared, a list changed -- by observing afterwards, and
+        presenting this as confirmation would be a lie.
+        """
+        el = self._element_at_path(hwnd, path)
+        if el is None:
+            return ActionResult(False, "invoke", path, None,
+                                message="Путь не разрешается: дерево изменилось. "
+                                        "Сделайте новый снимок.")
+        pat = self._pattern_on(el, "Invoke", "IUIAutomationInvokePattern")
+        if pat is None:
+            return ActionResult(False, "invoke", path, None,
+                                message="Элемент не поддерживает InvokePattern.")
+        try:
+            self._retry(pat.Invoke)
+        except COMError as exc:
+            return ActionResult(
+                False, "invoke", path, None,
+                message=f"Invoke отказал: {self._hresult(exc)}")
+        return ActionResult(
+            True, "invoke", path, None,
+            message="Вызов принят. Эффект не проверяем: у Invoke нет собственного "
+                    "состояния. Подтвердите результатом наблюдением.")
+
+    def set_value(self, hwnd: int, path: str, text: str) -> ActionResult:
+        """Writes a value and confirms it by reading the property back.
+
+        Read-back is mandatory, not a nicety: on a terminal, ValuePattern.SetValue
+        returns success and changes nothing at all.
+        """
+        el = self._element_at_path(hwnd, path)
+        if el is None:
+            return ActionResult(False, "set_value", path, False,
+                                message="Путь не разрешается: дерево изменилось.")
+        pat = self._pattern_on(el, "Value", "IUIAutomationValuePattern")
+        if pat is None:
+            return ActionResult(False, "set_value", path, False,
+                                message="Элемент не поддерживает ValuePattern.")
+        try:
+            before = pat.CurrentValue
+        except COMError:
+            before = None
+        try:
+            self._retry(lambda: pat.SetValue(text))
+        except COMError as exc:
+            return ActionResult(False, "set_value", path, False, before=before,
+                                message=f"SetValue отказал: {self._hresult(exc)}")
+        after, verified = self._read_back(lambda: pat.CurrentValue,
+                                          lambda v: v == text)
+        return ActionResult(
+            verified, "set_value", path, verified, before=before, after=after,
+            message=("Значение подтверждено перечитыванием." if verified else
+                     f"Значение НЕ подтверждено: ожидалось {text!r}, "
+                     f"прочитано {after!r}."))
+
+    def toggle(self, hwnd: int, path: str) -> ActionResult:
+        """Toggles and confirms the new state."""
+        el = self._element_at_path(hwnd, path)
+        if el is None:
+            return ActionResult(False, "toggle", path, False,
+                                message="Путь не разрешается: дерево изменилось.")
+        pat = self._pattern_on(el, "Toggle", "IUIAutomationTogglePattern")
+        if pat is None:
+            return ActionResult(False, "toggle", path, False,
+                                message="Элемент не поддерживает TogglePattern.")
+        names = {0: "Off", 1: "On", 2: "Indeterminate"}
+        try:
+            before = names.get(int(pat.CurrentToggleState), str(pat.CurrentToggleState))
+        except COMError:
+            before = None
+        try:
+            self._retry(pat.Toggle)
+        except COMError as exc:
+            return ActionResult(False, "toggle", path, False, before=before,
+                                message=f"Toggle отказал: {self._hresult(exc)}")
+        after, verified = self._read_back(
+            lambda: names.get(int(pat.CurrentToggleState),
+                              str(pat.CurrentToggleState)),
+            lambda v: v is not None and v != before,
+        )
+        return ActionResult(
+            verified, "toggle", path, verified, before=before, after=after,
+            message=(f"Состояние изменилось: {before} -> {after}." if verified else
+                     f"Состояние НЕ изменилось (осталось {after!r})."))
+
+    def select_item(self, hwnd: int, path: str) -> ActionResult:
+        """Selects a list or tree item and confirms IsSelected."""
+        el = self._element_at_path(hwnd, path)
+        if el is None:
+            return ActionResult(False, "select_item", path, False,
+                                message="Путь не разрешается: дерево изменилось.")
+        pat = self._pattern_on(el, "SelectionItem",
+                               "IUIAutomationSelectionItemPattern")
+        if pat is None:
+            return ActionResult(False, "select_item", path, False,
+                                message="Элемент не поддерживает SelectionItemPattern.")
+        try:
+            before = str(bool(pat.CurrentIsSelected))
+        except COMError:
+            before = None
+        try:
+            self._retry(pat.Select)
+        except COMError as exc:
+            return ActionResult(False, "select_item", path, False, before=before,
+                                message=f"Select отказал: {self._hresult(exc)}")
+        selected, verified = self._read_back(
+            lambda: bool(pat.CurrentIsSelected), lambda v: v is True
+        )
+        return ActionResult(
+            selected, "select_item", path, verified, before=before,
+            after=str(selected),
+            message=("Выбор подтверждён перечитыванием IsSelected." if selected else
+                     "Выбор НЕ подтверждён: IsSelected остался ложным."))
+
+    def expand_collapse(self, hwnd: int, path: str, expand: bool) -> ActionResult:
+        """Expands or collapses and confirms the resulting state."""
+        el = self._element_at_path(hwnd, path)
+        if el is None:
+            return ActionResult(False, "expand_collapse", path, False,
+                                message="Путь не разрешается: дерево изменилось.")
+        pat = self._pattern_on(el, "ExpandCollapse",
+                               "IUIAutomationExpandCollapsePattern")
+        if pat is None:
+            return ActionResult(False, "expand_collapse", path, False,
+                                message="Элемент не поддерживает ExpandCollapsePattern.")
+        names = {0: "Collapsed", 1: "Expanded", 2: "PartiallyExpanded",
+                 3: "LeafNode"}
+
+        def state():
+            try:
+                return names.get(int(pat.CurrentExpandCollapseState), "?")
+            except COMError:
+                return None
+
+        before = state()
+        try:
+            self._retry(pat.Expand if expand else pat.Collapse)
+        except COMError as exc:
+            return ActionResult(False, "expand_collapse", path, False, before=before,
+                                message=f"Expand/Collapse отказал: {self._hresult(exc)}")
+        want = "Expanded" if expand else "Collapsed"
+        after, verified = self._read_back(state, lambda v: v == want)
+        return ActionResult(
+            verified, "expand_collapse", path, verified, before=before, after=after,
+            message=(f"Состояние: {before} -> {after}." if verified else
+                     f"Ожидалось {want}, получено {after!r}."))
 
     # ------------------------------------------------------- continuation
     @staticmethod

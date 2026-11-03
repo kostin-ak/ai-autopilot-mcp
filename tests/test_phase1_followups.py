@@ -614,7 +614,7 @@ class TestToolDescriptions:
         "take_control", "release_control", "get_screen_state", "mouse_action",
         "keyboard_action", "scroll_screen", "list_windows_and_monitors",
         "get_ui_elements", "reset_user_override", "get_hud_state",
-        "probe_target", "get_snapshot", "resolve_clickable",
+        "probe_target", "get_snapshot", "resolve_clickable", "act_on_element",
     }
 
     def test_every_tool_has_a_non_empty_english_description(self):
@@ -701,6 +701,21 @@ class TestToolDescriptions:
         desc = self._desc("resolve_clickable")
         assert "centre" in desc
         assert "stale" in desc
+
+    def test_act_on_element_documents_verification_and_its_one_exception(self):
+        """Read-back is what separates a real action from a silent no-op, and the
+        one action that cannot be read back has to say so."""
+        desc = self._desc("act_on_element")
+        for act in ("invoke", "set_value", "toggle", "select", "expand", "collapse"):
+            assert f"'{act}'" in desc, f"{act} undocumented"
+        assert "IsReadOnly" in desc, "the terminal trap must be in the description"
+        assert "Not verifiable" in desc or "not verifiable" in desc.lower()
+
+    def test_act_on_element_says_it_does_not_use_the_cursor(self):
+        """That is the whole reason to prefer it over mouse_action."""
+        desc = self._desc("act_on_element")
+        assert "cursor" in desc.lower()
+        assert "Class B" in desc
 # --------------------------------------------------------------------------
 # Session lock state must reach the agent
 # --------------------------------------------------------------------------

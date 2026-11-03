@@ -46,7 +46,7 @@ class FakeElement:
     def __init__(self, name, children=(), control_type=50000, class_name="",
                  bounds=(0, 0, 10, 10), enabled=True, offscreen=False,
                  focusable=True, has_focus=False, automation_id="",
-                 delay=0.0, pid=4242):
+                 delay=0.0, pid=4242, pattern_objs=None):
         self.CachedName = name
         self.CachedControlType = control_type
         self.CachedClassName = class_name
@@ -60,8 +60,10 @@ class FakeElement:
         self.CurrentClassName = class_name
         self.CurrentProcessId = pid
         self.CurrentBoundingRectangle = _Rect(*bounds)
+        self.CurrentIsOffscreen = offscreen
         self._children = list(children)
         self._delay = delay
+        self._patterns = dict(pattern_objs or {})
 
     def FindAllBuildCache(self, scope, cond, req):
         if self._delay:
@@ -70,6 +72,79 @@ class FakeElement:
 
     def GetCachedPropertyValue(self, pid):
         return False
+
+    def GetCurrentPattern(self, pid):
+        return _FakeUnknown(self._patterns.get(pid))
+
+
+class _FakeUnknown:
+    """Stands in for the IUnknown that GetCurrentPattern returns."""
+
+    def __init__(self, pattern):
+        self._pattern = pattern
+
+    def QueryInterface(self, iface):
+        if self._pattern is None:
+            raise uc.COMError(-2147024809, "pattern not supported", None)
+        return self._pattern
+
+
+class FakeValuePattern:
+    def __init__(self, value="", ignore_writes=False):
+        self.CurrentValue = value
+        self._ignore = ignore_writes
+
+    def SetValue(self, text):
+        # ignore_writes models the terminal trap: the call succeeds, IsReadOnly
+        # reports 0, and the value does not change.
+        if not self._ignore:
+            self.CurrentValue = text
+
+
+class FakeTogglePattern:
+    def __init__(self, state=0, ignore_calls=False):
+        self.CurrentToggleState = state
+        self._ignore = ignore_calls
+
+    def Toggle(self):
+        if not self._ignore:
+            self.CurrentToggleState = 1 - self.CurrentToggleState
+
+
+class FakeSelectionItemPattern:
+    def __init__(self):
+        self.CurrentIsSelected = False
+
+    def Select(self):
+        self.CurrentIsSelected = True
+
+
+class FakeExpandCollapsePattern:
+    def __init__(self, state=0):
+        self.CurrentExpandCollapseState = state
+        self.calls = []
+
+    def Expand(self):
+        self.calls.append("expand")
+        self.CurrentExpandCollapseState = 1
+
+    def Collapse(self):
+        self.calls.append("collapse")
+        self.CurrentExpandCollapseState = 0
+
+
+class FakeInvokePattern:
+    def __init__(self):
+        self.calls = 0
+
+    def Invoke(self):
+        self.calls += 1
+
+
+PATTERN_IDS = {
+    "Invoke": 10000, "Value": 10002, "Toggle": 10015,
+    "SelectionItem": 10010, "ExpandCollapse": 10005,
+}
 
 
 class _Rect:
@@ -87,6 +162,12 @@ class _FakeAuto:
 
 class _FakeTypelib:
     TreeScope_Children = 2
+    IUIAutomationInvokePattern = "IID_INVOKE"
+    IUIAutomationValuePattern = "IID_VALUE"
+    IUIAutomationTogglePattern = "IID_TOGGLE"
+    IUIAutomationSelectionItemPattern = "IID_SELITEM"
+    IUIAutomationExpandCollapsePattern = "IID_EXPCOLL"
+    IUIAutomationWindowPattern = "IID_WINDOW"
 
 
 class FakeClient(uc.UIAClient):
@@ -115,6 +196,9 @@ class FakeClient(uc.UIAClient):
 
     def pattern_flags(self):
         return {}
+
+    def patterns(self):
+        return PATTERN_IDS
 
     def is_minimized(self, hwnd):
         return self._minimized
@@ -543,6 +627,30 @@ def test_deep_narrow_chain_is_not_misread_as_opaque():
     assert probe.classification != "opaque"
 
 
+def test_large_window_with_nothing_usable_is_opaque():
+    """The Explorer and Java AWT shape: a big window reporting only chrome."""
+    kids = [FakeElement("", class_name="Pane") for _ in range(7)]
+    root = FakeElement("root", children=kids, bounds=(0, 0, 2560, 1440))
+    probe = FakeClient(root).probe_target(1)
+    assert probe.area > uc.OPAQUE_AREA_THRESHOLD
+    assert probe.useful < uc.OPAQUE_USEFUL_THRESHOLD
+    assert probe.classification == "opaque"
+
+
+def test_small_dialog_with_few_but_usable_nodes_is_not_opaque():
+    """What broke a plain node-count threshold: ten nodes, all actionable.
+
+    A live Qt dialog of this shape was classified opaque and sent to the pixel
+    path, and its checkbox then toggled perfectly through TogglePattern. Node count
+    says nothing without window size, which is the qualifier ADR-0008 actually had.
+    """
+    kids = [FakeElement("Apply"), FakeElement("Cancel"), FakeElement("Enable")]
+    root = FakeElement("dialog", children=kids, bounds=(0, 0, 420, 220))
+    probe = FakeClient(root).probe_target(1)
+    assert probe.area < uc.OPAQUE_AREA_THRESHOLD
+    assert probe.classification != "opaque"
+
+
 def test_shallow_tree_is_opaque():
     root = FakeElement("root", children=[FakeElement("a"), FakeElement("b")],
                        bounds=(0, 0, 800, 600))
@@ -626,3 +734,154 @@ def test_probe_patterns_are_not_from_global_focus():
     client = FakeClient(build_narrow_deep())
     probe = client.probe_target(1)
     assert probe.patterns == ()
+
+
+# ------------------------------------------------------------- Class B actions
+def one_element(pattern_obj, pid):
+    """A tree whose single child carries one pattern."""
+    child = FakeElement("target", pattern_objs={pid: pattern_obj})
+    return FakeElement("root", children=[child], bounds=(0, 0, 100, 100))
+
+
+class TestPatternActions:
+    def test_set_value_confirms_by_readback(self):
+        pat = FakeValuePattern("before")
+        root = one_element(pat, PATTERN_IDS["Value"])
+        r = FakeClient(root).set_value(1, "0", "after")
+        assert r.ok and r.verified is True
+        assert (r.before, r.after) == ("before", "after")
+        assert pat.CurrentValue == "after"
+
+    def test_set_value_detects_silent_success(self):
+        """The terminal trap: SetValue returns success, IsReadOnly reports 0, and
+        the value does not change. Reporting ok here is exactly the failure that
+        made ADR-0009 require read-back on every terminal write.
+        """
+        pat = FakeValuePattern("unchanged", ignore_writes=True)
+        root = one_element(pat, PATTERN_IDS["Value"])
+        r = FakeClient(root).set_value(1, "0", "ignored")
+        assert r.ok is False
+        assert r.verified is False
+        assert "НЕ подтверждено" in r.message
+        assert pat.CurrentValue == "unchanged"
+
+    def test_invoke_is_reported_as_unverifiable(self):
+        """Invoke has no readable state of its own, so ok=True must not be dressed
+        up as confirmation."""
+        pat = FakeInvokePattern()
+        root = one_element(pat, PATTERN_IDS["Invoke"])
+        r = FakeClient(root).invoke(1, "0")
+        assert r.ok is True
+        assert r.verified is None, "invoke must not claim verification"
+        assert pat.calls == 1
+        assert "не проверяем" in r.message.lower()
+
+    def test_toggle_confirms_state_change(self):
+        pat = FakeTogglePattern(0)
+        root = one_element(pat, PATTERN_IDS["Toggle"])
+        r = FakeClient(root).toggle(1, "0")
+        assert r.ok and r.verified is True
+        assert (r.before, r.after) == ("Off", "On")
+
+    def test_toggle_detects_a_state_that_did_not_change(self):
+        pat = FakeTogglePattern(1, ignore_calls=True)
+        root = one_element(pat, PATTERN_IDS["Toggle"])
+        r = FakeClient(root).toggle(1, "0")
+        assert r.ok is False and r.verified is False
+        assert "НЕ изменилось" in r.message
+
+    def test_select_item_confirms(self):
+        pat = FakeSelectionItemPattern()
+        root = one_element(pat, PATTERN_IDS["SelectionItem"])
+        r = FakeClient(root).select_item(1, "0")
+        assert r.ok and r.verified is True
+        assert r.after == "True"
+
+    def test_expand_and_collapse(self):
+        pat = FakeExpandCollapsePattern(0)
+        root = one_element(pat, PATTERN_IDS["ExpandCollapse"])
+        c = FakeClient(root)
+        assert c.expand_collapse(1, "0", True).after == "Expanded"
+        assert c.expand_collapse(1, "0", False).after == "Collapsed"
+        assert pat.calls == ["expand", "collapse"]
+
+    def test_missing_pattern_is_reported_not_guessed(self):
+        root = one_element(None, PATTERN_IDS["Value"])
+        r = FakeClient(root).set_value(1, "0", "x")
+        assert r.ok is False
+        assert "ValuePattern" in r.message
+
+    @pytest.mark.parametrize("method,args", [
+        ("set_value", ("0.9", "x")),
+        ("invoke", ("9",)),
+        ("toggle", ("0.9",)),
+        ("select_item", ("0.9",)),
+        ("expand_collapse", ("0.9", True)),
+    ])
+    def test_stale_path_is_refused(self, method, args):
+        """Acting on a path the tree no longer has must fail rather than land on
+        some other element."""
+        root = FakeElement("root", children=[FakeElement("a")],
+                           bounds=(0, 0, 10, 10))
+        r = getattr(FakeClient(root), method)(1, *args)
+        assert r.ok is False, f"{method} acted on a stale path"
+        assert "разрешается" in r.message
+
+
+class TestReadBack:
+    """UIA state is not synchronous with the call that changed it.
+
+    On a live Qt combo box, Expand returned success and an immediate read still
+    reported Collapsed; the read a few hundred milliseconds later reported
+    Expanded. A single read turns that into a false negative, and an agent that
+    retries a toggle or an expand undoes the action it just performed.
+    """
+
+    def test_polls_until_the_state_arrives(self):
+        calls = {"n": 0}
+
+        def read():
+            calls["n"] += 1
+            return "Collapsed" if calls["n"] < 3 else "Expanded"
+
+        value, ok = uc.UIAClient._read_back(
+            read, lambda v: v == "Expanded", timeout_s=1.0, interval_s=0.0
+        )
+        assert ok is True
+        assert value == "Expanded"
+        assert calls["n"] == 3
+
+    def test_gives_up_and_reports_the_last_value(self):
+        value, ok = uc.UIAClient._read_back(
+            lambda: "Collapsed", lambda v: v == "Expanded",
+            timeout_s=0.05, interval_s=0.01
+        )
+        assert ok is False
+        assert value == "Collapsed"
+
+    def test_survives_a_transient_com_error(self):
+        calls = {"n": 0}
+
+        def read():
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise uc.COMError(-2147024809, "transient", None)
+            return "On"
+
+        value, ok = uc.UIAClient._read_back(
+            read, lambda v: v == "On", timeout_s=1.0, interval_s=0.0
+        )
+        assert ok is True and value == "On"
+
+    def test_succeeds_immediately_when_already_correct(self):
+        calls = {"n": 0}
+
+        def read():
+            calls["n"] += 1
+            return "Expanded"
+
+        value, ok = uc.UIAClient._read_back(
+            read, lambda v: v == "Expanded", timeout_s=1.0, interval_s=0.0
+        )
+        assert ok is True
+        assert calls["n"] == 1, "no reason to sleep when the first read matches"

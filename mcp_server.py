@@ -546,7 +546,9 @@ async def probe_target(
         f"class='{d.get('class_name')}' pid={d.get('pid')} выбрано={d.get('resolution')}",
         f"Классификация: {d.get('classification')}",
         f"Элементов первого уровня: {d.get('child_count')}  "
-        f"узлов в пробном обходе: {d.get('tree_sample')}  "
+        f"узлов в пробном обходе: {d.get('tree_sample')} "
+        f"(пригодных {d.get('useful_nodes')})  "
+        f"площадь окна: {d.get('area')} px²  "
         f"стоимость узла: {d.get('us_per_node')} мкс  свёрнуто: {d.get('iconic')}",
     ]
     patterns = d.get("patterns") or []
@@ -702,6 +704,83 @@ async def resolve_clickable(
         f"Узел {d.get('path')}: точка клика в кадре x={fp[0]}, y={fp[1]} "
         f"(абсолютные {d.get('abs_point')}, монитор {d.get('monitor_index')})."
     )
+
+
+@mcp.tool()
+async def act_on_element(
+    action: Literal["invoke", "set_value", "toggle", "select", "expand", "collapse"],
+    path: str,
+    text: str | None = None,
+    hwnd: int | None = None,
+    window_title: str | None = None,
+    class_name: str | None = None,
+) -> str:
+    """
+    Acts on a snapshot node through a UIA pattern, without using the cursor.
+
+    This is the Class B path: the window need not be focused or visible, and the
+    human can keep using the machine. Prefer it over mouse_action and
+    keyboard_action whenever the node's patterns allow it, because it is both more
+    reliable and parallel-safe.
+
+    Every action is confirmed by reading the element back, except invoke, which has
+    no readable state of its own. The result says plainly which happened. A
+    'verified: False' outcome means the call was accepted and the state did not
+    change -- that is a real failure mode, not a theoretical one: on a terminal
+    ValuePattern.SetValue reports IsReadOnly=0, accepts the call, and changes
+    nothing at all.
+
+    Actions:
+      'invoke'     - press a button or menu item. Not verifiable; confirm the effect
+                     by observing afterwards.
+      'set_value'  - write text into an edit or value field. Requires `text`.
+      'toggle'     - flip a checkbox or toggle button; before/after states returned.
+      'select'     - select a list, tree or tab item.
+      'expand'     - open a combo box or tree node.
+      'collapse'   - close one.
+
+    Args:
+        action: One of the six above.
+        path: The node's path from a get_snapshot result, e.g. '1.0.2'.
+        text: The value to write, for 'set_value' only.
+        hwnd: Exact handle of the window the snapshot came from.
+        window_title: Substring of the window title.
+        class_name: Win32 window class.
+    """
+    resp = await _send_daemon_request("element_action", {
+        "action": action, "path": path, "text": text,
+        "hwnd": hwnd, "window_title": window_title, "class_name": class_name,
+    })
+    if resp.get("status") != "ok":
+        return f"Действие не выполнено: {resp.get('message', 'Неизвестная ошибка')}"
+
+    d = resp.get("data", {})
+    ok = d.get("ok")
+    verified = d.get("verified")
+    if ok and verified is True:
+        status = "ВЫПОЛНЕНО И ПОДТВЕРЖДЕНО"
+    elif ok and verified is None:
+        status = "ВЫЗОВ ПРИНЯТ, ЭФФЕКТ НЕ ПРОВЕРЕН"
+    elif verified is False:
+        status = "НЕ ПОДТВЕРЖДЕНО"
+    else:
+        status = "ОТКАЗ"
+
+    lines = [f"{status}: {d.get('action')} на узле {d.get('path')}"]
+    if d.get("before") is not None or d.get("after") is not None:
+        lines.append(f"  было: {d.get('before')!r}  стало: {d.get('after')!r}")
+    lines.append(f"  {d.get('message')}")
+    if ok and verified is None:
+        lines.append(
+            "  Проверьте результат наблюдением (новый снимок или снимок экрана), "
+            "прежде чем считать действие состоявшимся."
+        )
+    if not ok:
+        lines.append(
+            "  Повторять вслепую нельзя. Сделайте новый снимок: путь мог устареть "
+            "или элемент не поддерживает этот паттерн."
+        )
+    return "\n".join(lines)
 
 
 @mcp.tool()
