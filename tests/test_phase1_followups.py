@@ -616,6 +616,7 @@ class TestToolDescriptions:
         "get_ui_elements", "reset_user_override", "get_hud_state",
         "probe_target", "get_snapshot", "resolve_clickable", "act_on_element",
         "read_terminal", "write_terminal", "wait_terminal",
+        "find_text_on_screen", "read_screen_text", "wait_for_text",
     }
 
     def test_every_tool_has_a_non_empty_english_description(self):
@@ -740,6 +741,30 @@ class TestToolDescriptions:
         assert "after_text" in desc
         assert "echo" in desc.lower()
         assert "0.00" in desc and "6.16" in desc
+
+    def test_find_text_on_screen_says_a_miss_is_not_proof_of_absence(self):
+        """OCR substitutes individual letters, so an empty result must not be read
+        as 'the control is not there'."""
+        desc = self._desc("find_text_on_screen")
+        assert "not proof of absence" in desc
+        assert "homoglyph" in desc.lower()
+        assert "read_screen_text" in desc, "must point at the way to diagnose a miss"
+
+    def test_find_text_on_screen_says_it_is_the_fallback(self):
+        """Otherwise it competes with get_snapshot and the weaker path gets chosen."""
+        desc = self._desc("find_text_on_screen")
+        assert "fallback" in desc.lower()
+        assert "get_snapshot" in desc
+
+    def test_wait_for_text_carries_the_same_caveat(self):
+        desc = self._desc("wait_for_text")
+        assert "substitutes individual letters" in desc
+        assert "short" in desc.lower(), "must advise a short stable fragment"
+
+    def test_read_screen_text_says_what_it_is_for(self):
+        desc = self._desc("read_screen_text")
+        assert "no accessibility tree" in desc
+        assert "diagnose" in desc.lower()
 # --------------------------------------------------------------------------
 # Session lock state must reach the agent
 # --------------------------------------------------------------------------

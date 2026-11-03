@@ -423,6 +423,34 @@ class VisionEngine:
         # Fill cursor body with saturated red
         draw.polygon(arrow_vertices, fill=config.CURSOR_COLOR_FILL)
 
+    def capture_for_ocr(
+        self, monitor_index: int | None = None
+    ) -> tuple[Any, dict[str, int], Any]:
+        """Native-resolution capture for OCR, without grid or cursor overlay.
+
+        Deliberately separate from capture_screen. The frame that goes to a model is
+        scaled to a fixed width, which a vision model tolerates and a text recognizer
+        does not: on a 1920x1080 monitor, native recognition returned 76 lines and
+        2555 characters while the 1280-wide frame returned 51 lines and 1358, with
+        visible corruption. On the 4480-wide virtual desktop the 3.5x reduction lost
+        everything and returned zero lines.
+
+        Coordinates come back in native pixels relative to the desktop, so the caller
+        must convert them to frame space before they can be used with mouse_action.
+
+        Returns:
+            (image, bbox, monitor) where bbox is left/top/width/height in native
+            desktop pixels.
+        """
+        config.ensure_interactive_desktop()
+        bbox, target_monitor = self.get_monitor_bounds(monitor_index)
+        import mss
+
+        with mss.MSS() as sct:
+            raw = sct.grab(bbox)
+        image = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+        return image, bbox, target_monitor
+
     def list_windows(self) -> list[WindowInfo]:
         """Lists active top-level windows and their bounding rects across monitors."""
         windows: list[WindowInfo] = []

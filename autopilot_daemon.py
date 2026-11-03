@@ -14,6 +14,7 @@ import json
 import logging
 import secrets
 import sys
+import time
 from typing import Any
 
 import qasync
@@ -26,6 +27,7 @@ import config
 import session_state
 from config import AutopilotState
 from input_controller import InputController, InterruptedByUserError
+from ocr_engine import OcrReader
 from overlay_ui import HUDOverlayWindow
 from uia_client import (
     DEFAULT_MAX_DEPTH,
@@ -66,6 +68,10 @@ NON_INPUT_ACTIONS: frozenset[str] = frozenset({
     # stays blocked while a human has taken over.
     "read_terminal",
     "wait_terminal",
+    # OCR reads pixels; it changes nothing and touches no input queue.
+    "read_screen_text",
+    "find_text_on_screen",
+    "wait_for_text",
     "reset_override",
     "release_control",
     "hud_state",
@@ -84,6 +90,9 @@ class AutopilotDaemon:
         # snapshot layer stays free of pywinauto, which ADR-0007 rules out of the
         # hot path.
         self.uia = UIAClient()
+        # OCR is the fallback for targets with no accessibility tree. Created once:
+        # engine construction does a language lookup not worth repeating per frame.
+        self.ocr = OcrReader()
         self.overlay = HUDOverlayWindow()
         self.input_ctrl = InputController(on_state_change=self._on_input_state_changed)
 
@@ -321,6 +330,12 @@ class AutopilotDaemon:
                 return await self._action_write_terminal(params)
             elif action == "wait_terminal":
                 return await self._action_wait_terminal(params)
+            elif action == "read_screen_text":
+                return await self._action_read_screen_text(params)
+            elif action == "find_text_on_screen":
+                return await self._action_find_text_on_screen(params)
+            elif action == "wait_for_text":
+                return await self._action_wait_for_text(params)
             elif action == "hud_state":
                 return await self._action_hud_state()
             elif action == "reset_override":
@@ -1145,6 +1160,166 @@ class AutopilotDaemon:
                 "tail": res.tail, "message": res.message,
             },
         }
+
+    # --------------------------------------------------------------- OCR path
+    async def _ocr_capture(self, params: dict[str, Any]):
+        """Recognizes a native-resolution capture, returning frame-space coordinates.
+
+        Two concerns that must not be conflated. Recognition runs on the native
+        capture, because the model-facing frame is scaled to a fixed width and that
+        costs OCR roughly half its characters: measured at 76 lines and 2555
+        characters natively versus 51 lines and 1358 at 1280 wide on the same screen,
+        and zero lines on the 4480-wide virtual desktop. But the caller acts in frame
+        space, so the recognized boxes are converted to it here rather than being
+        handed back in native pixels.
+
+        The grid overlay and cursor marker are off, since both draw over the text.
+        """
+        image, bbox, mon = await asyncio.to_thread(
+            self.vision.capture_for_ocr, params.get("monitor_index")
+        )
+        page = await self.ocr.recognize_image(image)
+        frame_w = config.TARGET_IMAGE_WIDTH
+        if page.error:
+            return page, frame_w, 0, mon
+        scale_x = frame_w / float(bbox["width"])
+        frame_h = round(bbox["height"] * scale_x)
+        scale_y = frame_h / float(bbox["height"])
+        # Origin is (0, 0), not the monitor's desktop offset. capture_for_ocr grabs
+        # just this monitor, so the recognized boxes are already relative to its own
+        # top-left corner; subtracting bbox left/top shifts them off the frame and
+        # produces coordinates outside 0..frame_w. Caught by a bounds check, not by
+        # comparing against read_screen_text, which used the same wrong offset and so
+        # agreed with itself.
+        page = page.scaled(0, 0, scale_x, scale_y)
+        return page, frame_w, frame_h, mon
+
+    @staticmethod
+    def _ocr_envelope(mon, width: int, height: int, page) -> dict[str, Any]:
+        return {
+            "monitor": {"index": mon.index, "name": mon.name},
+            "frame": [width, height],
+            "language": page.language,
+            "ocr_ms": round(page.elapsed_ms, 1),
+            "line_count": len(page.lines),
+        }
+
+    async def _action_read_screen_text(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Reads all recognized text on a monitor, with boxes, for opaque targets."""
+        page, width, height, mon = await self._ocr_capture(params)
+        if page.error:
+            return {"status": "error", "message": page.error}
+
+        limit = int(params.get("limit") or 120)
+        with_words = bool(params.get("with_words"))
+        selected = page.lines[:limit]
+        data = self._ocr_envelope(mon, width, height, page)
+        data["truncated"] = len(page.lines) > limit
+        data["lines"] = [
+            {
+                "text": ln.text,
+                "box": [ln.x, ln.y, ln.w, ln.h],
+                "center": list(ln.center),
+                **({"words": [{"text": w.text, "box": [w.x, w.y, w.w, w.h]}
+                              for w in ln.words[:16]]} if with_words else {}),
+            }
+            for ln in selected
+        ]
+        return {"status": "ok", "data": data}
+
+    async def _action_find_text_on_screen(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Locates recognized text and returns frame coordinates to click."""
+        needle = params.get("text")
+        if not needle or not str(needle).strip():
+            return {"status": "error", "message": "Не указан text для поиска."}
+
+        page, width, height, mon = await self._ocr_capture(params)
+        if page.error:
+            return {"status": "error", "message": page.error}
+
+        fuzzy = bool(params.get("fuzzy", True))
+        matches = page.find(str(needle), fuzzy=fuzzy)
+        data = self._ocr_envelope(mon, width, height, page)
+        data.update({
+            "needle": str(needle),
+            "fuzzy": fuzzy,
+            "match_count": len(matches),
+            "matches": [
+                {"text": m.text, "kind": m.kind, "box": [m.x, m.y, m.w, m.h],
+                 "center": list(m.center), "line_text": m.line_text}
+                for m in matches[:40]
+            ],
+        })
+        if not matches:
+            # A miss here is evidence about the recognizer, not about the screen.
+            data["hint"] = (
+                "Совпадений нет, но это не доказательство отсутствия текста. "
+                "Распознаватель ошибается в отдельных буквах: в замере латинское "
+                "ALPHA было прочитано как кириллическое АЕРНА, а подчёркивания "
+                "теряются. Нормализация уже сводит регистр, омоглифы и пунктуацию, "
+                "но не исправляет подмену букв. Попробуйте более короткую строку, "
+                "либо прочитайте экран целиком через read_screen_text и посмотрите, "
+                "что распозналось на самом деле."
+            )
+        return {"status": "ok", "data": data}
+
+    async def _action_wait_for_text(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Waits for text to appear on (or disappear from) screen, instead of sleeping.
+
+        Polling is coarser than the terminal equivalent because each pass captures
+        and recognizes a frame rather than reading a buffer.
+        """
+        needle = params.get("text")
+        if not needle or not str(needle).strip():
+            return {"status": "error", "message": "Не указан text для ожидания."}
+
+        timeout_s = float(params.get("timeout_s") or 20.0)
+        interval_s = max(float(params.get("interval_s") or 0.75), 0.15)
+        appear = bool(params.get("appear", True))
+        fuzzy = bool(params.get("fuzzy", True))
+
+        started = time.monotonic()
+        polls = 0
+        matches: list = []
+        envelope: dict[str, Any] = {}
+        error = None
+        while True:
+            polls += 1
+            page, width, height, mon = await self._ocr_capture(params)
+            envelope = self._ocr_envelope(mon, width, height, page)
+            if page.error:
+                error = page.error
+            else:
+                error = None
+                matches = page.find(str(needle), fuzzy=fuzzy)
+                if bool(matches) == appear:
+                    envelope.update({
+                        "found": True, "elapsed_s": round(time.monotonic() - started, 2),
+                        "polls": polls, "needle": str(needle), "appear": appear,
+                        "match_count": len(matches),
+                        "matches": [{"text": m.text, "box": [m.x, m.y, m.w, m.h],
+                                     "center": list(m.center)}
+                                    for m in matches[:10]],
+                    })
+                    return {"status": "ok", "data": envelope}
+            if time.monotonic() - started >= timeout_s:
+                break
+            await asyncio.sleep(interval_s)
+
+        envelope.update({
+            "found": False, "elapsed_s": round(time.monotonic() - started, 2),
+            "polls": polls, "needle": str(needle), "appear": appear,
+            "match_count": 0, "error": error,
+            "message": (
+                f"За {timeout_s:.0f} с текст {str(needle)!r} "
+                + ("не появился" if appear else "не исчез")
+                + f" ({polls} опросов)."
+                + (f" Последняя ошибка распознавания: {error}" if error else "")
+            ),
+        })
+        return {"status": "ok", "data": envelope}
 
     async def _action_hud_state(self) -> dict[str, Any]:
         """Reports live overlay geometry so frame placement is checkable, not assumed.

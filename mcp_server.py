@@ -994,6 +994,182 @@ async def wait_terminal(
 
 
 @mcp.tool()
+async def find_text_on_screen(
+    text: str,
+    monitor_index: int | None = None,
+    fuzzy: bool = True,
+) -> str:
+    """
+    Finds text on screen by OCR and returns frame coordinates to click.
+
+    This is the fallback for targets with no accessibility tree -- Explorer's content
+    pane, Java AWT applications, canvas surfaces. Prefer get_snapshot and
+    act_on_element whenever the target exposes a tree: they give exact text, roles
+    and stable addresses, while OCR gives glyphs with boxes and no semantics.
+
+    Recognition uses Windows.Media.Ocr and is fast (about 13 ms for a 760x260 region),
+    so there is no need to restrict it to small areas. Coordinates come back in frame
+    space and can be passed straight to mouse_action.
+
+    Matching normalizes case, folds Cyrillic and Latin homoglyphs, and discards
+    punctuation, because a Russian recognizer renders Latin labels with Cyrillic
+    look-alikes: measured output rendered the Latin word OK with two Cyrillic
+    letters and dropped an underscore.
+    Without normalization, plain substring matching reports text as absent when it is
+    plainly visible.
+
+    A miss is not proof of absence. The recognizer does substitute individual letters
+    -- measured on a rendered sample, where Latin ALPHA came back as a Cyrillic
+    look-alike that normalization cannot reach -- so on a miss try a shorter string,
+    or call read_screen_text and look at what was actually recognized.
+
+    Args:
+        text: The text to locate.
+        monitor_index: Which monitor to capture. Defaults to the one under control.
+        fuzzy: Normalize case, homoglyphs and punctuation (default True). Set False
+            to require an exact casefolded substring, which is for proving what the
+            recognizer returned rather than for finding a control.
+    """
+    resp = await _send_daemon_request("find_text_on_screen", {
+        "text": text, "monitor_index": monitor_index, "fuzzy": fuzzy,
+    })
+    if resp.get("status") != "ok":
+        return f"Поиск текста не выполнен: {resp.get('message', 'Неизвестная ошибка')}"
+
+    d = resp.get("data", {})
+    header = [
+        f"Поиск {d.get('needle')!r} на мониторе {d.get('monitor', {}).get('index')}, "
+        f"кадр {d.get('frame')}, язык распознавания {d.get('language')}, "
+        f"{d.get('ocr_ms')} мс, строк распознано {d.get('line_count')}.",
+    ]
+    matches = d.get("matches") or []
+    if not matches:
+        header.append("Совпадений: 0.")
+        if d.get("hint"):
+            header.append(d["hint"])
+        return "\n".join(header)
+
+    header.append(f"Совпадений: {d.get('match_count')}.")
+    for m in matches[:12]:
+        header.append(
+            f"  x={m['center'][0]}, y={m['center'][1]}  ({m['kind']}) "
+            f"{m['text']!r}  box={m['box']}"
+            + (f"  в строке {m['line_text'][:56]!r}" if m.get("line_text") else "")
+        )
+    if len(matches) > 12:
+        header.append(f"  ... ещё {len(matches) - 12} совпадений")
+    return "\n".join(header)
+
+
+@mcp.tool()
+async def read_screen_text(
+    monitor_index: int | None = None,
+    limit: int = 120,
+    with_words: bool = False,
+) -> str:
+    """
+    Reads all recognized text on a monitor, with boxes, through OCR.
+
+    For a target that exposes no accessibility tree this is the only way to see what
+    is on screen as text rather than as pixels. It is also how to diagnose a failed
+    find_text_on_screen: the recognizer substitutes individual letters, so reading
+    what actually came back shows whether the text is absent or merely misread.
+
+    Coordinates are in frame space. Recognition takes tens of milliseconds for a
+    full frame.
+
+    Args:
+        monitor_index: Which monitor to capture. Defaults to the one under control.
+        limit: Maximum number of text lines to return (default 120).
+        with_words: Include per-word boxes, not just per-line (default False).
+    """
+    resp = await _send_daemon_request("read_screen_text", {
+        "monitor_index": monitor_index, "limit": limit, "with_words": with_words,
+    })
+    if resp.get("status") != "ok":
+        return f"Чтение текста с экрана не выполнено: {resp.get('message', 'Неизвестная ошибка')}"
+
+    d = resp.get("data", {})
+    header = [
+        f"Экран: монитор {d.get('monitor', {}).get('index')} "
+        f"({d.get('monitor', {}).get('name')}), кадр {d.get('frame')}, "
+        f"язык {d.get('language')}, {d.get('ocr_ms')} мс.",
+        f"Строк распознано: {d.get('line_count')}"
+        + (f", отдано {len(d.get('lines') or [])}." if d.get("truncated") else "."),
+    ]
+    lines = d.get("lines") or []
+    if not lines:
+        return "\n".join([*header, "", "Текст не распознан."])
+
+    body = []
+    for ln in lines:
+        c = ln.get("center") or [0, 0]
+        body.append(f"@{c[0]},{c[1]}  {ln.get('text', '')[:150]}")
+        for w in ln.get("words") or []:
+            body.append(f"      word {w['text'][:60]!r} box={w['box']}")
+    return "\n".join([*header, "", *body])
+
+
+@mcp.tool()
+async def wait_for_text(
+    text: str,
+    monitor_index: int | None = None,
+    timeout_s: float = 20.0,
+    interval_s: float = 0.75,
+    appear: bool = True,
+    fuzzy: bool = True,
+) -> str:
+    """
+    Waits for text to appear on (or disappear from) screen, instead of sleeping.
+
+    Use this to wait for a dialog, a progress message, a confirmation or an error,
+    rather than sleeping a guessed duration and then looking. It returns as soon as
+    the condition holds and says plainly when it never did.
+
+    Polling is coarser than wait_terminal, because each pass captures and recognizes
+    a frame instead of reading a buffer. The same caveat applies as for
+    find_text_on_screen: OCR substitutes individual letters, so waiting on a long
+    distinctive string can time out even when the text is on screen. Prefer a short
+    stable fragment, and prefer get_snapshot plus a UIA condition when the target has
+    a tree at all.
+
+    Args:
+        text: The text to wait for.
+        monitor_index: Which monitor to capture. Defaults to the one under control.
+        timeout_s: How long to wait before reporting failure (default 20).
+        interval_s: Poll interval, minimum 0.15 (default 0.75).
+        appear: True to wait for the text to show up, False to wait for it to go
+            away -- for example a progress indicator clearing.
+        fuzzy: Normalize case, homoglyphs and punctuation (default True).
+    """
+    resp = await _send_daemon_request("wait_for_text", {
+        "text": text, "monitor_index": monitor_index, "timeout_s": timeout_s,
+        "interval_s": interval_s, "appear": appear, "fuzzy": fuzzy,
+    })
+    if resp.get("status") != "ok":
+        return f"Ожидание не выполнено: {resp.get('message', 'Неизвестная ошибка')}"
+
+    d = resp.get("data", {})
+    want = "появился" if d.get("appear") else "исчез"
+    if d.get("found"):
+        head = (
+            f"ДОЖДАЛИСЬ: текст {d.get('needle')!r} {want} через "
+            f"{d.get('elapsed_s')} с ({d.get('polls')} опросов)."
+        )
+        body = []
+        for m in (d.get("matches") or [])[:6]:
+            body.append(f"  x={m['center'][0]}, y={m['center'][1]}  "
+                        f"{m['text']!r} box={m['box']}")
+        return "\n".join([head, *body]) if body else head
+    return (
+        f"НЕ ДОЖДАЛИСЬ: {d.get('message')}\n"
+        "  Отсутствие совпадения не доказывает отсутствие текста: распознаватель "
+        "подменяет отдельные буквы. Попробуйте более короткий фрагмент или "
+        "прочитайте экран через read_screen_text."
+    )
+
+
+@mcp.tool()
 async def reset_user_override() -> str:
     """
     Resets USER_OVERRIDE back to IDLE.
