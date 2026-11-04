@@ -47,9 +47,24 @@ WS_ACTION_TIMEOUTS: dict[str, float] = {
 }
 
 
+# How far the gateway's transport timeout must sit above a waiting tool's own
+# polling deadline. The waiting tools (wait_terminal, wait_for_text) are the only
+# actions whose duration is the caller's choice, so a fixed table entry cannot
+# cover them: with the transport timeout equal to the polling timeout the two race,
+# and when the transport wins the caller gets a generic error instead of the
+# structured "did not arrive, here is what the buffer actually says" result.
+# Ten seconds is comfortably above one poll interval plus the round trip.
+WS_WAIT_MARGIN_SEC: float = 10.0
+
+
 def ws_timeout_for(action: str) -> float:
     """Resolves the response timeout for a daemon action."""
     return WS_ACTION_TIMEOUTS.get(action, WS_DEFAULT_TIMEOUT)
+
+
+def ws_timeout_for_wait(timeout_s: float) -> float:
+    """Transport timeout for a waiting action: the caller's deadline plus margin."""
+    return max(timeout_s, 0.0) + WS_WAIT_MARGIN_SEC
 
 # ---------------------------------------------------------
 # HUD Overlay Settings

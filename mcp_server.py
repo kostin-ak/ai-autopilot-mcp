@@ -40,6 +40,17 @@ mcp = MCPServer("desktop-autopilot")
 # into context as text.
 #
 # Any change to a tool's return annotation must be re-measured, not assumed.
+#
+# The same doubling applies to a plain ``-> str`` return, which the SDK treats as
+# structured by default: it publishes ``{name}Output`` with a single ``result``
+# field and emits the whole string again as ``structured_content``. For a tool
+# that returns one short label this is harmless. For a tool that returns a tree,
+# a console buffer or an OCR page it doubles the token cost of every call, on
+# exactly the tools called most often.
+#
+# So the four highest-volume text tools pass ``structured_output=False``. The
+# rule is about payload size, not about the annotation: a short string keeps the
+# schema.
 ContentBlock = TextContent | ImageContent
 
 
@@ -55,16 +66,28 @@ def _read_auth_token() -> str:
     return ""
 
 
-async def _send_daemon_request(action: str, params: dict[str, Any]) -> dict[str, Any]:
+async def _send_daemon_request(
+    action: str,
+    params: dict[str, Any],
+    timeout: float | None = None,
+) -> dict[str, Any]:
     """Sends a JSON command to the local autopilot daemon over WebSocket.
 
     Every await is bounded. An unbounded ``recv()`` turns a hung daemon -- a UIA
     tree walk on a large Electron app is the usual cause -- into a tool call that
     never returns, which the host eventually kills with a useless error.
+
+    ``timeout`` overrides the per-action table. Waiting tools need it: their
+    deadline is the caller's, not the daemon's, and a transport timeout that
+    equals the polling deadline races it. Losing that race replaces the
+    structured "did not arrive within N s, here is the buffer" answer with a
+    generic transport error, which is strictly less information at the moment
+    the caller most needs it.
     """
     token = _read_auth_token()
     uri = f"ws://{config.WS_HOST}:{config.WS_PORT}"
-    timeout = config.ws_timeout_for(action)
+    if timeout is None:
+        timeout = config.ws_timeout_for(action)
 
     req_id = str(uuid.uuid4())[:8]
     payload = {
@@ -415,7 +438,8 @@ async def list_windows_and_monitors() -> str:
     return "\n".join(output)
 
 
-@mcp.tool()
+# Unstructured on purpose: up to 60 elements, each a full line. See ContentBlock.
+@mcp.tool(structured_output=False)
 async def get_ui_elements(
     window_title: str | None = None,
     monitor_index: int | None = None,
@@ -570,7 +594,8 @@ async def probe_target(
     return "\n".join(lines)
 
 
-@mcp.tool()
+# Unstructured on purpose: up to 150 nodes per page. See ContentBlock.
+@mcp.tool(structured_output=False)
 async def get_snapshot(
     hwnd: int | None = None,
     window_title: str | None = None,
@@ -875,7 +900,8 @@ def _format_class_b_result(resp: dict[str, Any], target: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+# Unstructured on purpose: a console slice can be thousands of characters.
+@mcp.tool(structured_output=False)
 async def read_terminal(
     hwnd: int | None = None,
     window_title: str | None = None,
@@ -1055,11 +1081,17 @@ async def wait_terminal(
         after_text: Only search buffer text occurring after the last occurrence of
             this string. Use it to skip past the echoed command line.
     """
-    resp = await _send_daemon_request("wait_terminal", {
-        "expect": expect, "hwnd": hwnd, "window_title": window_title,
-        "class_name": class_name, "timeout_s": timeout_s,
-        "interval_s": interval_s, "after_text": after_text,
-    })
+    resp = await _send_daemon_request(
+        "wait_terminal",
+        {
+            "expect": expect, "hwnd": hwnd, "window_title": window_title,
+            "class_name": class_name, "timeout_s": timeout_s,
+            "interval_s": interval_s, "after_text": after_text,
+        },
+        # The deadline belongs to the caller, so the transport has to be derived
+        # from it: the table's 30 s default tied the tool's own default exactly.
+        timeout=config.ws_timeout_for_wait(timeout_s),
+    )
     if resp.get("status") != "ok":
         return f"Ожидание не выполнено: {resp.get('message', 'Неизвестная ошибка')}"
 
@@ -1153,7 +1185,8 @@ async def find_text_on_screen(
     return "\n".join(header)
 
 
-@mcp.tool()
+# Unstructured on purpose: up to 120 OCR lines with boxes. See ContentBlock.
+@mcp.tool(structured_output=False)
 async def read_screen_text(
     monitor_index: int | None = None,
     limit: int = 120,
@@ -1234,10 +1267,17 @@ async def wait_for_text(
             away -- for example a progress indicator clearing.
         fuzzy: Normalize case, homoglyphs and punctuation (default True).
     """
-    resp = await _send_daemon_request("wait_for_text", {
-        "text": text, "monitor_index": monitor_index, "timeout_s": timeout_s,
-        "interval_s": interval_s, "appear": appear, "fuzzy": fuzzy,
-    })
+    resp = await _send_daemon_request(
+        "wait_for_text",
+        {
+            "text": text, "monitor_index": monitor_index, "timeout_s": timeout_s,
+            "interval_s": interval_s, "appear": appear, "fuzzy": fuzzy,
+        },
+        # Safe by coincidence at the 20 s default (transport is 30 s), and broken
+        # for any longer wait the caller asks for. Deriving it removes the
+        # coincidence.
+        timeout=config.ws_timeout_for_wait(timeout_s),
+    )
     if resp.get("status") != "ok":
         return f"Ожидание не выполнено: {resp.get('message', 'Неизвестная ошибка')}"
 

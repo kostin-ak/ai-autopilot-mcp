@@ -480,6 +480,73 @@ class TestGateway:
         assert structured is None, "frame is duplicated into structured_content"
         assert len(result.content) == 2
         assert type(result.content[0]).__name__ == "ImageContent"
+
+    def test_high_volume_text_tools_publish_no_output_schema(self):
+        """The doubling fix has to cover text, not only base64 frames.
+
+        Phase 1.2 removed the duplication from five screenshot tools and the
+        guarantee was recorded as holding for "four `-> str` tools where the
+        duplication of a short string is harmless". The surface then grew to
+        fifteen `-> str` tools, including four that return a tree, a console
+        buffer or an OCR page. Those are the most frequently called tools in the
+        set, and each was paying for its payload twice.
+        """
+        import mcp_server
+
+        tools = asyncio.run(mcp_server.mcp.list_tools())
+        by_name = {t.name: t for t in tools}
+        for name in ["get_ui_elements", "get_snapshot", "read_terminal", "read_screen_text"]:
+            tool = by_name[name]
+            schema = getattr(tool, "outputSchema", None) or getattr(
+                tool, "output_schema", None
+            )
+            assert not schema, f"{name} publishes an output_schema -> text duplication"
+
+    def test_short_text_tools_keep_their_schema(self):
+        """Short strings stay structured: the rule is payload size, not annotation."""
+        import mcp_server
+
+        tools = asyncio.run(mcp_server.mcp.list_tools())
+        by_name = {t.name: t for t in tools}
+        tool = by_name["get_hud_state"]
+        schema = getattr(tool, "outputSchema", None) or getattr(
+            tool, "output_schema", None
+        )
+        assert schema, "a short string should not lose its output_schema"
+
+    def test_text_tool_call_emits_no_structured_content(self, monkeypatch):
+        import mcp_server
+
+        async def fake_request(action, params):
+            return {
+                "status": "ok",
+                "state": "AI_ACTIVE",
+                "data": {
+                    "handle": 1,
+                    "host": "conhost",
+                    "resolution": "unique",
+                    "row_count": 3,
+                    "char_count": 11,
+                    "read_ms": 1.0,
+                    "selected_count": 3,
+                    "mode": "tail",
+                    "lines": ["one", "two", "three"],
+                },
+            }
+
+        monkeypatch.setattr(mcp_server, "_send_daemon_request", fake_request)
+
+        async def run():
+            return await mcp_server.mcp.call_tool("read_terminal", {})
+
+        result = asyncio.run(run())
+        structured = getattr(result, "structuredContent", None) or getattr(
+            result, "structured_content", None
+        )
+        assert structured is None, "terminal buffer is duplicated into structured_content"
+        assert result.content, "the text payload must still reach the model"
+
+
 # --------------------------------------------------------------------------
 # USER_OVERRIDE auto-release after user stillness
 # --------------------------------------------------------------------------
@@ -620,3 +687,26 @@ class TestInputValueRejection:
             stub.click("back")
 
 
+class TestWaitTransportTimeout:
+    """The transport deadline for a waiting tool must outlive the tool's own.
+
+    wait_terminal's own default deadline is 30 s and the gateway's default
+    transport timeout was also 30 s, so the two raced. When the transport won, a
+    caller got "daemon did not answer" instead of the structured "did not arrive,
+    and here is what the buffer actually contained" -- strictly less information
+    at the moment it matters most.
+    """
+
+    def test_transport_exceeds_the_polling_deadline(self):
+        for deadline in (0.0, 3.0, 20.0, 30.0, 600.0):
+            assert config.ws_timeout_for_wait(deadline) > deadline
+
+    def test_margin_is_applied_uniformly(self):
+        for deadline in (1.0, 45.0):
+            assert (
+                config.ws_timeout_for_wait(deadline) - deadline
+                == config.WS_WAIT_MARGIN_SEC
+            )
+
+    def test_negative_deadline_does_not_shrink_the_transport_timeout(self):
+        assert config.ws_timeout_for_wait(-5.0) == config.WS_WAIT_MARGIN_SEC
