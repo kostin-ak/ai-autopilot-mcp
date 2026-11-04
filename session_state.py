@@ -173,17 +173,32 @@ def session_state() -> dict:
         return result
 
 
-def describe_state() -> str:
-    """Human-facing one-line summary, empty when the session is fine."""
-    s = session_state()
-    if s["locked"] is True:
+def describe(info: dict) -> str:
+    """Human-facing one-line summary of an already-fetched state, empty when fine.
+
+    Split out of describe_state because the daemon was paying for the WTS query
+    twice per response: once for the structured ``session`` block and once again
+    inside describe_state, which re-fetched what the caller already held. The
+    query is cheap but it runs on every successful response, including the
+    high-frequency ones like get_snapshot.
+
+    A TTL cache was considered and rejected. Staleness would trade directly against
+    the guarantee this module exists to provide -- that the agent is never left
+    looking at a lock screen without being told -- and there is no lock event to
+    invalidate on, so any cache would be a guess about a state whose whole purpose
+    is to be authoritative.
+    """
+    if info["locked"] is True:
         return (
             "СЕССИЯ ЗАБЛОКИРОВАНА. Захват экрана возвращает экран блокировки, "
             "а ввод не принимается рабочим столом приложений. Снимок не описывает "
             "целевую программу. Разблокируйте сессию перед продолжением."
         )
-    if s["state"] == "disconnected":
-        return (
-            "СЕССИЯ ОТКЛЮЧЕНА. Окна не рендерятся, захват и ввод недостоверны."
-        )
+    if info["state"] == "disconnected":
+        return "СЕССИЯ ОТКЛЮЧЕНА. Окна не рендерятся, захват и ввод недостоверны."
     return ""
+
+
+def describe_state() -> str:
+    """Fetches the session state and summarises it. See describe for the split."""
+    return describe(session_state())

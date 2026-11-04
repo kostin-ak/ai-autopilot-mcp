@@ -379,7 +379,9 @@ class AutopilotDaemon:
         info = session_state.session_state()
         data = resp.setdefault("data", {})
         data["session"] = {"locked": info["locked"], "state": info["state"]}
-        note = session_state.describe_state()
+        # describe takes the dict rather than re-querying: describe_state would run
+        # the same WTS call a second time on every successful response.
+        note = session_state.describe(info)
         if note:
             data["session_warning"] = note
         return resp

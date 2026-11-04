@@ -1027,6 +1027,49 @@ class TestSessionState:
         resp = AutopilotDaemon._annotate_session({"status": "error", "message": "boom"})
         assert "data" not in resp
         assert resp["message"] == "boom"
+
+    def test_annotation_queries_session_state_once(self, monkeypatch):
+        """It used to query twice: describe_state() re-fetched what the caller held.
+
+        The query runs on every successful response, including high-frequency ones
+        like get_snapshot, so paying for it twice is a permanent tax for no gain.
+        """
+        import session_state as ss
+        from autopilot_daemon import AutopilotDaemon
+
+        calls = []
+
+        def counted():
+            calls.append(1)
+            return {"locked": True, "state": "active", "session_id": 1, "reason": ""}
+
+        monkeypatch.setattr(ss, "session_state", counted)
+        resp = AutopilotDaemon._annotate_session({"status": "ok", "data": {}})
+        assert len(calls) == 1, f"expected one WTS query, got {len(calls)}"
+        assert resp["data"]["session"]["locked"] is True
+
+    def test_describe_is_pure_and_matches_describe_state(self, monkeypatch):
+        """describe() takes the dict; describe_state() stays the zero-arg form."""
+        import session_state as ss
+
+        cases = [
+            ({"locked": True, "state": "active", "session_id": 1, "reason": ""},
+             "ЗАБЛОКИРОВАНА"),
+            ({"locked": False, "state": "disconnected", "session_id": 1, "reason": ""},
+             "ОТКЛЮЧЕНА"),
+            ({"locked": False, "state": "active", "session_id": 1, "reason": ""}, ""),
+            ({"locked": None, "state": "unknown", "session_id": None, "reason": ""}, ""),
+        ]
+        for info, expected in cases:
+            text = ss.describe(info)
+            if expected:
+                assert expected in text
+            else:
+                assert text == ""
+            monkeypatch.setattr(ss, "session_state", lambda i=info: i)
+            assert ss.describe_state() == text, "the two entry points must agree"
+
+
 class TestDaemonRequestValidation:
     """Requests that could not be executed used to report success.
 
