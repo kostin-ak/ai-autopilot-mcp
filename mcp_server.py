@@ -632,8 +632,9 @@ async def get_snapshot(
         class_name: Win32 window class, narrows a title search.
         monitor_index: Which monitor's frame the coordinates are scaled to.
         max_nodes: Node cap for this page (default 400).
-        max_depth: Depth cap (default 20). Raising it is the only way past a
-            depth truncation.
+        max_depth: Depth cap (default 40). Raising it is the only way past a
+            depth truncation, which unlike the other two is terminal -- it emits
+            no continuation token.
         time_budget_ms: Wall-clock budget for the walk (default 150). This is the
             primary limit, because cost per node varies by a factor of 100 between
             targets.
