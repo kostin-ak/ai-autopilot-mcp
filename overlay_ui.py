@@ -164,7 +164,10 @@ class HUDOverlayWindow(QMainWindow):
         that the border is where it should be.
         """
         geom = self.geometry()
-        target = self._target_rect
+        # Through the property, so the accessor has a caller. Reading the private
+        # attribute here left target_rect_global as the only caller-less member of
+        # this class's public surface.
+        target = self.target_rect_global
         local = self._global_to_local_rect(target) if target is not None else None
         return {
             "visible": self.isVisible(),

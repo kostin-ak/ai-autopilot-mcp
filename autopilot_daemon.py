@@ -276,8 +276,15 @@ class AutopilotDaemon:
 
     def _update_overlay_target(self, monitor_index: int | None) -> tuple[int, int, float, float]:
         """Aligns HUD frame geometry with target monitor bounds and computes coordinate scale."""
-        bbox, target_mon = self.vision.get_monitor_bounds(monitor_index)
-        self.overlay.sig_set_target_rect.emit(
+        # The MonitorInfo half of the return is discarded: bbox already carries
+        # left/top/width/height, and binding a name nobody reads hides that fact
+        # from F841, which does not report unused tuple unpacking.
+        bbox, _ = self.vision.get_monitor_bounds(monitor_index)
+        # Through the overlay's public entry point rather than emitting its signal
+        # directly. Both reach the same slot, but having two ways to set the frame
+        # means the one nobody calls rots -- and it was already the only caller-less
+        # member of the overlay's public surface.
+        self.overlay.set_target_geometry(
             bbox["left"], bbox["top"], bbox["width"], bbox["height"]
         )
 

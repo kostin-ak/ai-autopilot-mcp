@@ -133,9 +133,13 @@ STABILIZATION_INTERVAL_SEC: float = 0.10
 STABILIZATION_RESIZE_DIMS: tuple[int, int] = (64, 64)
 
 # Cursor Overlay Appearance on Screenshot
+#
+# The arrow's geometry lives in vision_engine._draw_cursor_pointer, whose vertices
+# reach 21 px from the tip. A CURSOR_SIZE_PX constant used to sit here declaring 16
+# and was read nowhere, so it described a cursor that does not exist -- removing it
+# is better than leaving a number that invites someone to trust it.
 CURSOR_COLOR_FILL: tuple[int, int, int] = (255, 0, 50)       # High-contrast Red
 CURSOR_COLOR_OUTLINE: tuple[int, int, int] = (0, 0, 0)       # Black border
-CURSOR_SIZE_PX: int = 16
 
 
 def configure_stdio_encoding() -> None:

@@ -237,3 +237,46 @@ def test_recognize_reports_an_error_page_instead_of_raising():
     assert isinstance(result, oe.OcrPage)
     assert result.error
     assert result.lines == []
+
+
+# --------------------------------------------------------------------------
+# recognize_base64: the path a captured frame arrives by
+# --------------------------------------------------------------------------
+def test_recognize_base64_decodes_and_delegates(monkeypatch):
+    """capture_screen hands out base64 WebP, so this is the natural entry point.
+
+    The method had no caller in the shipped code. Rather than leave an unexercised
+    public surface -- which is how a wrapper silently rots into something that no
+    longer matches what it wraps -- it is pinned here.
+    """
+    import asyncio
+    import base64
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (40, 20), (255, 255, 255)).save(buf, format="WEBP")
+    payload = base64.b64encode(buf.getvalue()).decode()
+
+    seen = {}
+
+    async def fake_recognize(self, image):
+        seen["size"] = image.size
+        return oe.OcrPage(text="ok", width=image.width, height=image.height)
+
+    monkeypatch.setattr(oe.OcrReader, "recognize_image", fake_recognize)
+    result = asyncio.run(oe.OcrReader().recognize_base64(payload))
+    assert result.text == "ok"
+    assert seen["size"] == (40, 20), "the decoded image must reach recognize_image"
+
+
+def test_recognize_base64_reports_a_bad_payload_instead_of_raising():
+    """Same contract as recognize_image: an error page, never an exception."""
+    import asyncio
+
+    result = asyncio.run(oe.OcrReader().recognize_base64("!!!not-base64!!!"))
+    assert isinstance(result, oe.OcrPage)
+    assert result.error
+    assert "декодировать" in result.error
+    assert result.lines == []
