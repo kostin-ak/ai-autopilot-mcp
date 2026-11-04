@@ -267,6 +267,28 @@ class TestHostTree:
     def test_pid_of_window_returns_none_for_a_null_handle(self):
         assert hg.pid_of_window(0) is None
 
+    def test_a_failed_snapshot_is_reported_as_a_failure(self, monkeypatch):
+        """INVALID_HANDLE_VALUE is a full 64-bit -1.
+
+        ctypes returns c_int when restype is undeclared, so the handle came back
+        truncated and the comparison never matched: a failed snapshot was not detected
+        as failed, and the guard reported "empty process snapshot" instead of the real
+        cause. Same truncation the elevation spike hit in GetCurrentProcess.
+        """
+        import ctypes
+
+        fake = ctypes.c_void_p(-1).value
+
+        def boom(*_a, **_k):
+            return fake
+
+        monkeypatch.setattr(ctypes.windll.kernel32, "CreateToolhelp32Snapshot", boom,
+                            raising=False)
+        tree = hg.build_host_tree(1)
+        assert tree.error, "an invalid handle must not be mistaken for a snapshot"
+        assert "CreateToolhelp32Snapshot" in tree.error
+        assert tree.blocks(1) is True, "must fail closed"
+
     def test_real_snapshot_resolves_this_process(self):
         """Ends the unit-test chain with one real Win32 call, so the ctypes struct
         layout is not merely plausible."""

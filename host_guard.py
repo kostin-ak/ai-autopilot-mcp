@@ -137,8 +137,18 @@ def process_table() -> dict[int, tuple[int, str]]:
     if sys.platform != "win32":
         return table
     kernel32 = ctypes.windll.kernel32
+    # Declared, not assumed. Without restype ctypes returns c_int and truncates a
+    # 64-bit handle; real handles survive that because Windows keeps them 32-bit
+    # significant, but INVALID_HANDLE_VALUE does not -- it is a full 64-bit -1. The
+    # comparison below then never matches, a failed snapshot is not detected as
+    # failed, and the guard reports "empty process snapshot" instead of the real
+    # cause. The elevation spike found this by hitting the identical truncation in
+    # GetCurrentProcess, where it reported elevated=False from an elevated process.
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snap == INVALID_HANDLE_VALUE or snap is None:
+    if not snap or int(snap) == INVALID_HANDLE_VALUE:
         raise OSError(f"CreateToolhelp32Snapshot failed: {ctypes.GetLastError()}")
     try:
         entry = PROCESSENTRY32W()
