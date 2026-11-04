@@ -26,7 +26,12 @@ from websockets.asyncio.server import ServerConnection
 import config
 import session_state
 from config import AutopilotState
-from input_controller import InputController, InterruptedByUserError
+from input_controller import (
+    MOUSE_SUB_ACTIONS,
+    SCROLL_DIRECTIONS,
+    InputController,
+    InterruptedByUserError,
+)
 from ocr_engine import OcrReader
 from overlay_ui import HUDOverlayWindow
 from uia_client import (
@@ -630,6 +635,22 @@ class AutopilotDaemon:
         mon_idx = params.get("monitor_index")
         show_grid = params.get("show_grid", False)
 
+        # Rejected here rather than left to the dispatch chain below, because the
+        # chain has no else branch: an unrecognized sub_action used to fall through
+        # every elif, do nothing at all, and still return status "ok" with a fresh
+        # screenshot. That is the most damaging silent acceptance in the daemon --
+        # the caller sees a successful mouse action that never happened, on a frame
+        # that looks like evidence it did. Validating first also keeps the rejection
+        # ahead of the ripple and the cursor move, so a bad request changes nothing.
+        if sub_action not in MOUSE_SUB_ACTIONS:
+            return {
+                "status": "error",
+                "message": (
+                    f"Неизвестное действие мыши {sub_action!r}; ничего не выполнено. "
+                    f"Допустимые значения: {', '.join(sorted(MOUSE_SUB_ACTIONS))}."
+                ),
+            }
+
         points = [("Координаты", x, y)]
         if sub_action == "drag":
             points.append(("Конечные координаты", params.get("end_x"),
@@ -666,6 +687,18 @@ class AutopilotDaemon:
             abs_end_x = left + int(round(end_x * sx))
             abs_end_y = top + int(round(end_y * sy))
             await asyncio.to_thread(self.input_ctrl.drag, abs_x, abs_y, abs_end_x, abs_end_y)
+        else:
+            # Unreachable while MOUSE_SUB_ACTIONS and this chain agree, which is
+            # precisely why it is spelled out: the accepted set is a literal above
+            # and the handlers are literals here, and two literals drift. Falling
+            # through silently is what it did before.
+            return {
+                "status": "error",
+                "message": (
+                    f"Действие мыши {sub_action!r} принято, но не обработано. "
+                    "Список MOUSE_SUB_ACTIONS и цепочка обработчиков разошлись."
+                ),
+            }
 
         # Capture stabilized post-action screen
         cursor_abs = self.input_ctrl.get_cursor_pos()
@@ -720,6 +753,19 @@ class AutopilotDaemon:
         mon_idx = params.get("monitor_index")
         show_grid = params.get("show_grid", False)
 
+        # A request with neither payload used to return status "ok" plus a
+        # screenshot, having typed nothing. Same defect as the mouse chain above:
+        # success reported for an action that never happened. Rejected before the
+        # state change so a malformed request cannot flip the session to AI_ACTIVE.
+        if text is None and hotkey is None:
+            return {
+                "status": "error",
+                "message": (
+                    "Ни text, ни hotkey не переданы; ничего не отправлено. "
+                    "Укажите хотя бы одно из двух."
+                ),
+            }
+
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
 
         if text:
@@ -756,6 +802,29 @@ class AutopilotDaemon:
         y = params.get("y")
         mon_idx = params.get("monitor_index")
         show_grid = params.get("show_grid", False)
+
+        # InputController.scroll raises on the same two conditions, and that stays
+        # the authority. Checking here as well is not duplication of the rule but of
+        # its timing: without it a bad direction is discovered after the cursor has
+        # already been moved to (x, y), so a rejected request still leaves a visible
+        # side effect.
+        if direction not in SCROLL_DIRECTIONS:
+            return {
+                "status": "error",
+                "message": (
+                    f"Неизвестное направление прокрутки {direction!r}; ничего не "
+                    f"выполнено. Допустимые значения: "
+                    f"{', '.join(sorted(SCROLL_DIRECTIONS))}."
+                ),
+            }
+        if amount < 0:
+            return {
+                "status": "error",
+                "message": (
+                    f"Количество шагов прокрутки не может быть отрицательным "
+                    f"(получено {amount}); ничего не выполнено."
+                ),
+            }
 
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
 

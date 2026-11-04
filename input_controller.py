@@ -30,6 +30,22 @@ class InterruptedByUserError(Exception):
     """Raised when physical user activity interrupts an autonomous action."""
 
 
+# Accepted values for the free-form string parameters of the mouse actions.
+#
+# Defined here and imported by the daemon, so the set that produces the error
+# message is the same set that does the dispatch. Declaring it in both places is
+# how the actionable-pattern list ended up duplicated.
+#
+# Deliberately outside the win32 block: the daemon validates against these before
+# touching any input queue, and a constant that only exists on one platform is a
+# NameError waiting to happen on import order.
+MOUSE_BUTTONS: frozenset[str] = frozenset({"left", "right", "middle"})
+SCROLL_DIRECTIONS: frozenset[str] = frozenset({"up", "down"})
+MOUSE_SUB_ACTIONS: frozenset[str] = frozenset({
+    "move", "click", "double_click", "right_click", "drag",
+})
+
+
 # =====================================================================
 # Win32 Structures and Constants for LL Hooks and SendInput
 # =====================================================================
@@ -537,7 +553,17 @@ class InputController:
                 self._send_absolute_move(target_x, target_y)
 
     def click(self, button: str = "left") -> None:
-        """Sends mouse down and up events."""
+        """Sends mouse down and up events.
+
+        An unrecognized button name raises instead of falling through to a left
+        click. The gateway shields this with a Literal annotation, but the daemon
+        forwards params verbatim, so a direct WebSocket call asking for button
+        "back" used to receive a left click and a success status -- the same
+        silent-acceptance defect already fixed twice in this project, in
+        press_hotkey and in the out-of-frame coordinate check. The failure mode is
+        worse than a crash: a left click is the destructive one, so the caller
+        that asked for a side button gets the action it was trying to avoid.
+        """
         if self.state == AutopilotState.USER_OVERRIDE:
             raise InterruptedByUserError("Click aborted: System is in USER_OVERRIDE mode.")
 
@@ -552,8 +578,10 @@ class InputController:
                 down = MOUSEEVENTF_MIDDLEDOWN
                 up = MOUSEEVENTF_MIDDLEUP
             else:
-                down = MOUSEEVENTF_LEFTDOWN
-                up = MOUSEEVENTF_LEFTUP
+                raise ValueError(
+                    f"Неизвестная кнопка мыши {button!r}; клик НЕ отправлен. "
+                    f"Допустимые значения: {', '.join(sorted(MOUSE_BUTTONS))}."
+                )
 
             self._send_win32_mouse_input(down)
             time.sleep(0.04)
@@ -580,9 +608,33 @@ class InputController:
             self._send_win32_mouse_input(MOUSEEVENTF_LEFTUP)
 
     def scroll(self, direction: str = "down", amount: int = 3) -> None:
-        """Scrolls mouse wheel up or down."""
+        """Scrolls mouse wheel up or down.
+
+        An unrecognized direction raises rather than defaulting to down, and a
+        negative amount raises rather than silently reversing the direction. Both
+        used to be accepted: ``direction="left"`` scrolled down, and
+        ``amount=-3`` with ``direction="up"`` also scrolled down. The gateway's
+        Literal annotations hide this, but the daemon forwards params verbatim, so
+        the two paths disagree about what is a valid request.
+
+        ``amount=0`` is a no-op and stays one: it is a coherent request to scroll
+        by nothing, not a malformed one.
+        """
         if self.state == AutopilotState.USER_OVERRIDE:
             raise InterruptedByUserError("Scroll aborted: System is in USER_OVERRIDE mode.")
+
+        if direction not in SCROLL_DIRECTIONS:
+            raise ValueError(
+                f"Неизвестное направление прокрутки {direction!r}; событие НЕ "
+                f"отправлено. Допустимые значения: {', '.join(sorted(SCROLL_DIRECTIONS))}."
+            )
+        if amount < 0:
+            raise ValueError(
+                f"Количество шагов прокрутки не может быть отрицательным "
+                f"(получено {amount}); событие НЕ отправлено."
+            )
+        if amount == 0:
+            return
 
         clicks = amount if direction == "up" else -amount
         wheel_delta = clicks * 120

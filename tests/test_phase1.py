@@ -50,6 +50,9 @@ class StubController:
     set_state = ic.InputController.set_state
     reset_override = ic.InputController.reset_override
     maybe_auto_resume = ic.InputController.maybe_auto_resume
+    _send_win32_mouse_input = ic.InputController._send_win32_mouse_input
+    click = ic.InputController.click
+    scroll = ic.InputController.scroll
 
 
 @pytest.fixture
@@ -544,5 +547,76 @@ class TestIdleAutoResume:
         assert stub.maybe_auto_resume() is False
         monkeypatch.setattr(ic, "seconds_since_physical_input", lambda: 5.001)
         assert stub.maybe_auto_resume() is True
+
+
+# --------------------------------------------------------------------------
+# 8. Silent acceptance in the input layer
+# --------------------------------------------------------------------------
+class TestInputValueRejection:
+    """A malformed mouse request used to be quietly turned into a valid one.
+
+    click() fell through to a left click for any unrecognized button, and scroll()
+    treated any direction other than "up" as down and let a negative amount invert
+    the result. The MCP gateway's Literal annotations shield the shipped tool
+    surface, but the daemon forwards params verbatim, so a direct WebSocket call
+    asking for button "back" received a left click and a success status. A left
+    click is the destructive one, which makes the fallback worse than a failure.
+    """
+
+    def test_unknown_button_raises_and_sends_nothing(self, captured_sendinput):
+        stub = StubController()
+        with pytest.raises(ValueError, match="Неизвестная кнопка"):
+            stub.click("back")
+        assert captured_sendinput == [], "no mouse event may be sent for a bad button"
+
+    def test_error_names_the_allowed_buttons(self, captured_sendinput):
+        stub = StubController()
+        with pytest.raises(ValueError) as excinfo:
+            stub.click("forward")
+        message = str(excinfo.value)
+        for allowed in ("left", "right", "middle"):
+            assert allowed in message
+
+    @pytest.mark.parametrize("button", ["left", "right", "middle"])
+    def test_known_buttons_still_send_down_and_up(self, captured_sendinput, button):
+        stub = StubController()
+        stub.click(button)
+        assert len(captured_sendinput) == 2, "one down, one up"
+
+    def test_unknown_direction_raises_and_sends_nothing(self, captured_sendinput):
+        stub = StubController()
+        with pytest.raises(ValueError, match="Неизвестное направление"):
+            stub.scroll("left", 3)
+        assert captured_sendinput == []
+
+    def test_negative_amount_is_rejected(self, captured_sendinput):
+        """amount=-3 with direction="up" used to scroll down: the sign inverted it."""
+        stub = StubController()
+        with pytest.raises(ValueError, match="отрицательным"):
+            stub.scroll("up", -3)
+        assert captured_sendinput == []
+
+    def test_zero_amount_is_a_noop_not_an_error(self, captured_sendinput):
+        stub = StubController()
+        stub.scroll("down", 0)
+        assert captured_sendinput == []
+
+    @pytest.mark.parametrize("direction,expected", [("up", 360), ("down", -360)])
+    def test_direction_still_selects_the_wheel_sign(
+        self, captured_sendinput, direction, expected
+    ):
+        stub = StubController()
+        stub.scroll(direction, 3)
+        assert len(captured_sendinput) == 1
+        # mouseData is a DWORD, so a negative wheel delta arrives wrapped. Comparing
+        # against the wrapped value keeps the intent readable while matching what the
+        # struct actually holds.
+        assert captured_sendinput[0].union.mi.mouseData == expected & 0xFFFFFFFF
+
+    def test_validation_happens_under_override_too(self):
+        """The override check comes first, so a pause reports a pause, not a typo."""
+        stub = StubController(state=AutopilotState.USER_OVERRIDE)
+        with pytest.raises(ic.InterruptedByUserError):
+            stub.click("back")
 
 

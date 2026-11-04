@@ -1027,3 +1027,75 @@ class TestSessionState:
         resp = AutopilotDaemon._annotate_session({"status": "error", "message": "boom"})
         assert "data" not in resp
         assert resp["message"] == "boom"
+class TestDaemonRequestValidation:
+    """Requests that could not be executed used to report success.
+
+    mouse_action had no else branch: an unrecognized sub-action fell through every
+    handler, did nothing, and returned status "ok" with a fresh screenshot. The
+    caller saw a completed mouse action backed by a frame that looked like evidence.
+    keyboard_action did the same when given neither text nor hotkey.
+    """
+
+    def _stub(self):
+        from autopilot_daemon import AutopilotDaemon
+
+        return AutopilotDaemon.__new__(AutopilotDaemon)
+
+    def test_unknown_mouse_sub_action_is_refused_before_anything_happens(self):
+        import asyncio
+
+        stub = self._stub()
+        resp = asyncio.run(stub._action_mouse_action({"action": "triple_click", "x": 1, "y": 2}))
+        assert resp["status"] == "error"
+        assert "triple_click" in resp["message"]
+
+    def test_refusal_names_every_accepted_sub_action(self):
+        import asyncio
+
+        from input_controller import MOUSE_SUB_ACTIONS
+
+        stub = self._stub()
+        resp = asyncio.run(stub._action_mouse_action({"action": "hover"}))
+        for allowed in MOUSE_SUB_ACTIONS:
+            assert allowed in resp["message"]
+
+    def test_unknown_scroll_direction_is_refused(self):
+        import asyncio
+
+        stub = self._stub()
+        resp = asyncio.run(stub._action_scroll_screen({"direction": "left", "amount": 2}))
+        assert resp["status"] == "error"
+        assert "left" in resp["message"]
+
+    def test_negative_scroll_amount_is_refused(self):
+        import asyncio
+
+        stub = self._stub()
+        resp = asyncio.run(stub._action_scroll_screen({"direction": "up", "amount": -2}))
+        assert resp["status"] == "error"
+        assert "отрицательным" in resp["message"]
+
+    def test_keyboard_action_without_payload_is_refused(self):
+        import asyncio
+
+        stub = self._stub()
+        resp = asyncio.run(stub._action_keyboard_action({}))
+        assert resp["status"] == "error"
+        assert "text" in resp["message"] and "hotkey" in resp["message"]
+
+    def test_unknown_action_name_is_still_refused(self):
+        """Sanity check on the guard the others build on."""
+        import asyncio
+
+        stub = self._stub()
+        # _dispatch reads the controller state before dispatching and takes the input
+        # lock for anything outside NON_INPUT_ACTIONS, so both have to exist on the
+        # stub even though the action under test reaches neither handler.
+        class Ctrl:
+            state = config.AutopilotState.IDLE
+
+        stub.input_ctrl = Ctrl()
+        stub._input_lock = asyncio.Lock()
+        resp = asyncio.run(stub._dispatch("does_not_exist", {}))
+        assert resp["status"] == "error"
+        assert "Unknown action" in resp["message"]
