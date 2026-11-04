@@ -681,6 +681,86 @@ class TestWindowResolution:
 # --------------------------------------------------------------------------
 # Tool descriptions are English: they are model-facing instructions
 # --------------------------------------------------------------------------
+class TestSuiteIntegrity:
+    """Every test that is written must be one that runs.
+
+    A live instance of the failure this guards: a module-level helper function was
+    inserted between two methods of a test class. The methods that followed became
+    nested definitions inside the helper, unreachable and uncollected -- fourteen
+    tests vanished and pytest still reported a fully green run, because nothing
+    failed. A count in the log is not evidence of coverage; the set of collected
+    nodes is.
+
+    The check is structural rather than a hard-coded count, so adding tests does not
+    require editing it: every function named test_* must sit either at module level
+    or directly inside a class named Test*. Anything else is invisible to the
+    collector.
+    """
+
+    @staticmethod
+    def _test_files():
+        import glob
+        import os
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        return sorted(glob.glob(os.path.join(here, "test_*.py")))
+
+    def _orphans(self, path):
+        import ast
+
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=path)
+        orphans = []
+
+        def walk(node, parent):
+            for child in ast.iter_child_nodes(node):
+                name = getattr(child, "name", "")
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if name.startswith("test_"):
+                        ok = parent is None or (
+                            isinstance(parent, ast.ClassDef)
+                            and parent.name.startswith("Test")
+                        )
+                        if not ok:
+                            where = getattr(parent, "name", "<module>")
+                            orphans.append(f"{name} (nested in {where}, line {child.lineno})")
+                    walk(child, child)
+                elif isinstance(child, ast.ClassDef):
+                    walk(child, child)
+                else:
+                    walk(child, parent)
+
+        walk(tree, None)
+        return orphans
+
+    def test_no_test_function_is_nested_where_the_collector_cannot_see_it(self):
+        found = []
+        for path in self._test_files():
+            found.extend(f"{path.split('test_')[-1]}: {o}" for o in self._orphans(path))
+        assert not found, "uncollectable tests: " + "; ".join(found)
+
+    def test_the_guard_itself_detects_a_nested_test(self, tmp_path):
+        """A guard that cannot fail is not a guard."""
+        sample = tmp_path / "test_sample.py"
+        sample.write_text(
+            "async def helper():\n"
+            "    return 1\n"
+            "\n"
+            "    def test_swallowed(self):\n"
+            "        assert True\n",
+            encoding="utf-8",
+        )
+        assert self._orphans(str(sample)), "the guard missed a nested test function"
+
+    def test_every_test_file_is_actually_inspected(self):
+        """Four files ship; a glob that silently matches fewer is a false green."""
+        names = [p.replace("\\", "/").rsplit("/", 1)[-1] for p in self._test_files()]
+        assert set(names) == {
+            "test_ocr_engine.py", "test_phase1.py",
+            "test_phase1_followups.py", "test_uia_client.py",
+        }, names
+
+
 class TestToolDescriptions:
     """Descriptions are consumed by the model, not shown to the user, and
     instruction-following is more consistent in English. User-facing strings --
