@@ -1059,6 +1059,37 @@ class UIAClient:
                 return None
         return current
 
+    def node_identity(self, hwnd: int, path: str) -> dict | None:
+        """Name, role and owning PID of the element a path actually resolves to.
+
+        Exists for risk classification, which must read the *resolved* element and
+        never the label the model asked for: the harm ADR-0004 guards against is a
+        path that resolves one element over from the one intended, and no check that
+        trusts the request can see that.
+
+        Costs a second path walk, because the verb handlers resolve the element
+        themselves and return only an outcome. One extra walk is a few milliseconds;
+        classifying the wrong element is the failure this whole layer exists to
+        prevent.
+        """
+        el = self._element_at_path(hwnd, path)
+        if el is None:
+            return None
+        try:
+            name = str(getattr(el, "CurrentName", "") or "")
+        except COMError:
+            name = ""
+        try:
+            ct = int(getattr(el, "CurrentControlType", 0) or 0)
+        except (COMError, ValueError, TypeError):
+            ct = 0
+        try:
+            pid = int(getattr(el, "CurrentProcessId", 0) or 0)
+        except (COMError, ValueError, TypeError):
+            pid = 0
+        return {"name": name, "role": self.control_type_names().get(ct, str(ct)),
+                "pid": pid or None}
+
     def clickable_point(self, hwnd: int, path: str) -> tuple[int, int] | None:
         """Resolves UIA's own clickable point for one element, by snapshot path.
 

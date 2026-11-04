@@ -95,6 +95,11 @@ async def _send_daemon_request(
         "token": token,
         "action": action,
         "params": params,
+        # Who is asking. The daemon walks the process tree from this PID itself and
+        # refuses input into any window the host owns. Sending the PID rather than a
+        # PID list is deliberate: a list the client assembled could be incomplete,
+        # and an incomplete list is a guard with holes that still looks like a guard.
+        "host_pid": os.getpid(),
     }
 
     try:
@@ -758,6 +763,8 @@ async def act_on_element(
     hwnd: int | None = None,
     window_title: str | None = None,
     class_name: str | None = None,
+    dry_run: bool = False,
+    allow_host_input: bool = False,
 ) -> str:
     """
     Acts on a snapshot node through a UIA pattern, without using the cursor.
@@ -798,15 +805,52 @@ async def act_on_element(
         hwnd: Exact handle of the window the snapshot came from.
         window_title: Substring of the window title.
         class_name: Win32 window class.
+        dry_run: Resolve and classify the target, report, change nothing.
+        allow_host_input: Permit input into the host's own process tree. Refused by
+            default, because the window that renders the conversation belongs to it
+            and typing there becomes a message the agent then reads as user input.
     """
     resp = await _send_daemon_request("element_action", {
         "action": action, "path": path, "text": text, "value": value,
         "hwnd": hwnd, "window_title": window_title, "class_name": class_name,
+        "dry_run": dry_run, "allow_host_input": allow_host_input,
     })
+    if resp.get("status") == "refused":
+        return _format_refusal(resp)
     if resp.get("status") != "ok":
         return f"Действие не выполнено: {resp.get('message', 'Неизвестная ошибка')}"
+    if resp.get("dry_run"):
+        return _format_dry_run(resp)
 
     return _format_class_b_result(resp, target="узле")
+
+
+def _format_refusal(resp: dict[str, Any]) -> str:
+    """Renders a guard refusal so the model knows not to work around it.
+
+    Told apart from a plain error on purpose. An error says the action failed and may
+    be retried with different parameters; a refusal says this target is off limits,
+    and retrying it is not a solution.
+    """
+    return (
+        f"ОТКАЗАНО СЛОЕМ БЕЗОПАСНОСТИ ({resp.get('guard', 'guard')}): "
+        f"{resp.get('message', '')}"
+    )
+
+
+def _format_dry_run(resp: dict[str, Any]) -> str:
+    """Renders a dry run: what would be acted on, and how it was classified."""
+    d = resp.get("data", {})
+    lines = [
+        "DRY RUN — ничего не выполнено.",
+        f"  цель: {d.get('resolved_name') or d.get('app') or '?'} "
+        f"(pid {d.get('resolved_pid')}, приложение {d.get('app') or '?'})",
+        f"  уровень риска: {d.get('risk_level')} — {d.get('risk_reason')}",
+        f"  пригодно для пакета: {'да' if d.get('batchable') else 'нет'}",
+    ]
+    if d.get("message"):
+        lines.append(f"  {d['message']}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -819,6 +863,8 @@ async def window_action(
     y: int | None = None,
     width: int | None = None,
     height: int | None = None,
+    dry_run: bool = False,
+    allow_host_input: bool = False,
 ) -> str:
     """
     Acts on a whole window through UIA, without using the cursor or taking focus.
@@ -853,13 +899,21 @@ async def window_action(
         y: Target top edge in physical screen pixels, for 'move'.
         width: Target width in pixels, for 'resize'.
         height: Target height in pixels, for 'resize'.
+        dry_run: Resolve and classify the target, report, change nothing.
+        allow_host_input: Permit acting on a window owned by the host's own process
+            tree. Refused by default.
     """
     resp = await _send_daemon_request("window_action", {
         "action": action, "hwnd": hwnd, "window_title": window_title,
         "class_name": class_name, "x": x, "y": y, "width": width, "height": height,
+        "dry_run": dry_run, "allow_host_input": allow_host_input,
     })
+    if resp.get("status") == "refused":
+        return _format_refusal(resp)
     if resp.get("status") != "ok":
         return f"Действие не выполнено: {resp.get('message', 'Неизвестная ошибка')}"
+    if resp.get("dry_run"):
+        return _format_dry_run(resp)
 
     return _format_class_b_result(resp, target="окне")
 
@@ -887,6 +941,10 @@ def _format_class_b_result(resp: dict[str, Any], target: str) -> str:
     lines = [f"{status}: {d.get('action')} на {target} {d.get('path')}"]
     if d.get("before") is not None or d.get("after") is not None:
         lines.append(f"  было: {d.get('before')!r}  стало: {d.get('after')!r}")
+    if d.get("risk_level"):
+        # Reported so an escalation is visible at the point it happens rather than
+        # only in the trace afterwards.
+        lines.append(f"  риск: {d.get('risk_level')} — {d.get('risk_reason', '')}")
     lines.append(f"  {d.get('message')}")
     if ok and verified is None:
         lines.append(
@@ -983,6 +1041,7 @@ async def write_terminal(
     enter: bool = True,
     expect: str | None = None,
     timeout_s: float = 3.0,
+    allow_host_input: bool = False,
 ) -> str:
     """
     Types into a console without using the keyboard or the cursor. Class B.
@@ -1011,12 +1070,17 @@ async def write_terminal(
         enter: Send a carriage return afterwards (default True).
         expect: Text that must appear in the buffer to confirm the write.
         timeout_s: How long to poll the buffer for confirmation (default 3).
+        allow_host_input: Permit writing into a terminal owned by the host's own
+            process tree. That terminal is the agent's own tool channel, so writing
+            there changes what its next command does rather than failing visibly.
     """
     resp = await _send_daemon_request("write_terminal", {
         "text": text, "hwnd": hwnd, "window_title": window_title,
         "class_name": class_name, "enter": enter, "expect": expect,
-        "timeout_s": timeout_s,
+        "timeout_s": timeout_s, "allow_host_input": allow_host_input,
     })
+    if resp.get("status") == "refused":
+        return _format_refusal(resp)
     if resp.get("status") != "ok":
         return f"Запись в консоль не выполнена: {resp.get('message', 'Неизвестная ошибка')}"
 

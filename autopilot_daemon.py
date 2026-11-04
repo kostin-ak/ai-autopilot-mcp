@@ -23,7 +23,10 @@ from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 from websockets.asyncio.server import ServerConnection
 
+import audit
 import config
+import host_guard
+import risk
 import session_state
 from config import AutopilotState
 from input_controller import (
@@ -203,6 +206,22 @@ class AutopilotDaemon:
         self._input_lock = asyncio.Lock()
 
         self._active_monitor_index: int | None = None
+
+        # --- safety layer (ADR-0004) -------------------------------------
+        # Append-only trace of every action, its target and its verification.
+        # Created here rather than per action: rotation state and the record
+        # sequence have to survive across calls or the log is not a timeline.
+        self.audit = audit.AuditTrail(
+            config.TRACE_PATH,
+            max_bytes=config.TRACE_MAX_BYTES,
+            keep=config.TRACE_KEEP,
+            enabled=config.TRACE_ENABLED,
+        )
+        # Resolved from the gateway's PID at handshake, never carried as a list:
+        # the PIDs recorded in PLAN.md were already stale when read back. None
+        # means "not yet told", and the guard fails closed on that.
+        self.host_tree: host_guard.HostTree | None = None
+
         self._init_tray_icon()
         self.overlay.show()
 
@@ -344,6 +363,8 @@ class AutopilotDaemon:
                     )
                     continue
 
+                self._learn_host_pid(payload.get("host_pid"))
+
                 response = await self.dispatch_action(action, params)
                 response["id"] = req_id
                 await websocket.send(json.dumps(response))
@@ -359,13 +380,24 @@ class AutopilotDaemon:
         Read-only actions bypass the lock: a host may legitimately want a fresh
         screenshot or a tree inspection while a click is still in flight, and
         blocking that would make the observer blind exactly when it matters.
+
+        Every action is traced, including read-only ones and including refusals. A
+        trace that only recorded mutations would hide the observations that led to
+        them, which is the part an investigation actually needs.
         """
+        started = time.monotonic()
         if action in NON_INPUT_ACTIONS:
             resp = await self._dispatch(action, params)
         else:
             async with self._input_lock:
                 resp = await self._dispatch(action, params)
-        return self._annotate_session(resp)
+        level = resp.pop("_risk", None) if isinstance(resp, dict) else None
+        resp = self._annotate_session(resp)
+        try:
+            self._record_trace(action, params, resp, time.monotonic() - started, level)
+        except Exception as exc:  # pragma: no cover - tracing must never break an action
+            logger.debug("trace record failed: %s", exc)
+        return resp
 
     @staticmethod
     def _annotate_session(resp: dict[str, Any]) -> dict[str, Any]:
@@ -392,6 +424,133 @@ class AutopilotDaemon:
         if note:
             data["session_warning"] = note
         return resp
+
+    # ------------------------------------------------------ safety layer
+    # ADR-0004. Three things that must happen around every mutating action:
+    # refuse input into the host's own process tree, classify the resolved target
+    # rather than the stated intent, and record both outcomes in the trace.
+
+    def _learn_host_pid(self, pid: Any) -> None:
+        """Builds the protected process set from the gateway's own PID.
+
+        Done here rather than trusting a PID list from the client: the client says
+        who it is, the daemon walks the tree itself. A list could be incomplete, and
+        an incomplete list is a guard with holes that looks like a guard.
+        """
+        if self.host_tree is not None:
+            return
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return
+        if pid <= 0:
+            return
+        self.host_tree = host_guard.build_host_tree(pid)
+        logger.info(
+            "Host process tree armed: pid=%s ancestors=%s protected=%d%s",
+            pid, [self.host_tree.names.get(p, p) for p in self.host_tree.ancestors],
+            len(self.host_tree.pids),
+            " (TRUNCATED)" if self.host_tree.truncated else "",
+        )
+        if self.host_tree.error:
+            logger.warning("Host tree unusable, guard fails closed: %s",
+                           self.host_tree.error)
+
+    def _host_refusal(self, pid: int | None, allow: bool, what: str,
+                      action: str) -> dict[str, Any] | None:
+        """Refuses input into the host's own process tree, or returns None to allow.
+
+        Fails closed in every direction, including the one that is easy to get
+        wrong: a gateway that never sent its PID gets a refusal, not a permissive
+        guard. Refusing is diagnosable; silently allowing input into the window that
+        renders the conversation is not, and the result is text the agent then reads
+        back as user input.
+        """
+        if not config.HOST_GUARD_ENABLED:
+            return None
+        if allow:
+            # Only tools that address a window explicitly can pass this. Coordinate
+            # actions never do: nothing in such a request says what it will land on.
+            self.audit.record(audit.TraceRecord(
+                action=action, kind="host_override", target=what,
+                message="ввод в дерево процессов хоста разрешён явно",
+                klass=audit.CLASS_B, ok=True, verified=None))
+            return None
+        if self.host_tree is None:
+            return {
+                "status": "refused",
+                "guard": "host_process_tree",
+                "message": (
+                    "Защита дерева процессов хоста не вооружена: шлюз не передал "
+                    "host_pid. Действие не выполнено. Отказ намеренный -- разрешить "
+                    "ввод, не зная, какое окно принадлежит хосту, значило бы открыть "
+                    "ровно тот путь, которым агент печатает в собственный чат."
+                ),
+            }
+        if not self.host_tree.blocks(pid):
+            return None
+        return {
+            "status": "refused",
+            "guard": "host_process_tree",
+            "message": (
+                f"Отказано: цель ({self.host_tree.describe(pid)}) принадлежит дереву "
+                "процессов хоста, который управляет этой сессией. Ввод туда не "
+                f"выполнен. Защищённые PID: {len(self.host_tree.pids)}."
+            ),
+            "protected": sorted(self.host_tree.pids)[:32],
+        }
+
+    @staticmethod
+    def _risk_of(kind: str, verb: str = "", control_name: str = "",
+                 app: str = "") -> risk.Risk:
+        """Classifies one action against config.CRITICAL_APPS."""
+        if kind == "element":
+            return risk.classify_action(verb, control_name=control_name, app=app,
+                                        critical_apps=config.CRITICAL_APPS)
+        if kind == "hotkey":
+            return risk.classify_hotkey(verb, app=app,
+                                        critical_apps=config.CRITICAL_APPS)
+        return risk.classify_click(app=app, critical_apps=config.CRITICAL_APPS)
+
+    def _record_trace(self, action: str, params: dict[str, Any],
+                      resp: dict[str, Any], elapsed_s: float,
+                      level: risk.Risk | None = None) -> None:
+        """Writes one trace record from whatever the response actually carries.
+
+        Reads fields rather than requiring each action to build a record: the
+        response envelope already holds ok/verified/status/message, and a second
+        source of truth for the same facts is how a trace starts disagreeing with
+        what was returned.
+        """
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        target = params.get("path") or params.get("hwnd") or ""
+        if not target:
+            x, y = params.get("x"), params.get("y")
+            if x is not None and y is not None:
+                target = f"{x},{y}"
+        frame_after = data.get("screenshot")
+        rec = audit.TraceRecord(
+            action=action,
+            klass=(audit.CLASS_B if action in ("element_action", "window_action",
+                                               "write_terminal", "read_terminal")
+                   else audit.CLASS_A if action in ("mouse_action", "keyboard_action",
+                                                    "scroll_screen") else ""),
+            target=str(target),
+            element=str(data.get("path") or ""),
+            level=(level.level if level else ""),
+            ok=resp.get("ok", data.get("ok")),
+            verified=data.get("verified", resp.get("verified")),
+            status=str(resp.get("status", "")),
+            message=str(resp.get("message") or data.get("message") or ""),
+            # Hashed from the base64 the response already carries, not from decoded
+            # bytes: decoding every frame just to hash it would cost more than the
+            # record is worth, and the digest only has to correlate records.
+            frame_after=(audit.frame_hash(frame_after.encode("utf-8"))
+                         if isinstance(frame_after, str) else None),
+            elapsed_ms=elapsed_s * 1000.0,
+            extra=({"guard": resp["guard"]} if resp.get("guard") else {}),
+        )
+        self.audit.record(rec)
 
     async def _dispatch(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         """Dispatches and executes requested tool action."""
@@ -672,6 +831,16 @@ class AutopilotDaemon:
         abs_x = left + int(round(x * sx))
         abs_y = top + int(round(y * sy))
 
+        # Guarded before the state change and before the ripple, so a refusal leaves
+        # no visible trace on the desktop. Coordinate actions get no override: unlike
+        # a window-addressed verb, nothing in the request says what the point will
+        # land on, so an "I meant to" from the caller is not evidence.
+        guard = self._host_refusal(
+            await asyncio.to_thread(host_guard.pid_at_point, abs_x, abs_y),
+            False, f"точка ({abs_x}, {abs_y})", "mouse_action")
+        if guard is not None:
+            return guard
+
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
 
         # Trigger 250ms predictive ripple at target location
@@ -735,6 +904,7 @@ class AutopilotDaemon:
         return {
             "status": "ok",
             "state": self.input_ctrl.state.value,
+            "_risk": self._risk_of("click"),
             "data": {
                 "screenshot": encoded_webp,
                 "scaled_width": w,
@@ -775,6 +945,42 @@ class AutopilotDaemon:
                 ),
             }
 
+        # Keyboard input carries no target of its own -- it lands on whatever holds
+        # focus -- so the guard has to resolve the focused window first. Text and a
+        # hotkey are classified separately: typing into a field is a write, while
+        # Enter in a messenger is the send action.
+        fg_pid = await asyncio.to_thread(host_guard.foreground_pid)
+        app = (self.host_tree.names.get(fg_pid, "") if self.host_tree and fg_pid
+               else "")
+        guard = self._host_refusal(fg_pid, False,
+                                   f"активное окно (pid {fg_pid})", "keyboard_action")
+        if guard is not None:
+            return guard
+        if hotkey:
+            level = self._risk_of("hotkey", verb=str(hotkey), app=app)
+        else:
+            # Typing into a field is a write. Its level cannot come from a control
+            # name, because keyboard input names no control -- only the focused
+            # application, which is what makes a critical app matter here.
+            level = self._risk_of("element", verb="set_value", app=app)
+
+        if params.get("dry_run"):
+            return {
+                "status": "ok",
+                "dry_run": True,
+                "_risk": level,
+                "data": {
+                    "resolved_pid": fg_pid, "app": app,
+                    "risk_level": level.level, "risk_reason": level.reason,
+                    "batchable": level.batchable,
+                    "message": (
+                        f"DRY RUN: ввод {'hotkey ' + str(hotkey) if hotkey else 'text'} "
+                        f"в приложение {app or '(не определено)'}; уровень риска "
+                        f"{level.level}. Ничего не отправлено."
+                    ),
+                },
+            }
+
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
 
         if text:
@@ -795,10 +1001,13 @@ class AutopilotDaemon:
         return {
             "status": "ok",
             "state": self.input_ctrl.state.value,
+            "_risk": level,
             "data": {
                 "screenshot": encoded_webp,
                 "scaled_width": w,
                 "scaled_height": h,
+                "risk_level": level.level,
+                "risk_reason": level.reason,
                 "message": f"Keyboard action completed (text={bool(text)}, hotkey={hotkey}).",
             },
         }
@@ -834,6 +1043,22 @@ class AutopilotDaemon:
                     f"(получено {amount}); ничего не выполнено."
                 ),
             }
+
+        # A wheel event goes to whatever is under the cursor, so the guard resolves
+        # the point being scrolled over. Without coordinates that is the cursor's
+        # current position, which is what will actually receive the event.
+        if x is not None and y is not None:
+            probe_x, probe_y = int(x), int(y)
+            left, top, sx, sy = self._update_overlay_target(mon_idx)
+            probe_x = left + int(round(probe_x * sx))
+            probe_y = top + int(round(probe_y * sy))
+        else:
+            probe_x, probe_y = self.input_ctrl.get_cursor_pos()
+        guard = self._host_refusal(
+            await asyncio.to_thread(host_guard.pid_at_point, probe_x, probe_y),
+            False, f"точка прокрутки ({probe_x}, {probe_y})", "scroll_screen")
+        if guard is not None:
+            return guard
 
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
 
@@ -1278,8 +1503,58 @@ class AutopilotDaemon:
                 "message": f"Для действия {kind!r} требуются параметры: "
                            f"{', '.join(missing)}.",
             }
+
+        # Classification reads the element the path resolved to, not the verb the
+        # caller named. That is the whole point: a mis-bind is the likeliest way this
+        # system does damage, and it is invisible to every check that trusts the
+        # request.
+        identity = await asyncio.to_thread(self.uia.node_identity, handle, str(path))
+        control_name = (identity or {}).get("name", "")
+        app = ""
+        pid = (identity or {}).get("pid")
+        if pid is None:
+            pid = await asyncio.to_thread(host_guard.pid_of_window, handle)
+        if self.host_tree is not None and pid:
+            app = self.host_tree.names.get(pid, "")
+        level = self._risk_of("element", verb=str(kind), control_name=control_name,
+                              app=app)
+
+        refusal = self._host_refusal(pid, bool(params.get("allow_host_input")),
+                                     f"узел {path} окна {handle}", "element_action")
+        if refusal is not None:
+            refusal["_risk"] = level
+            return refusal
+
+        if params.get("dry_run"):
+            return {
+                "status": "ok",
+                "dry_run": True,
+                "_risk": level,
+                "data": {
+                    "handle": handle, "resolution": how, "path": str(path),
+                    "resolved_name": control_name,
+                    "resolved_role": (identity or {}).get("role", ""),
+                    "resolved_pid": pid,
+                    "app": app,
+                    "risk_level": level.level,
+                    "risk_reason": level.reason,
+                    "batchable": level.batchable,
+                    "host_pid": pid,
+                    "message": (
+                        f"DRY RUN: действие {kind!r} разрешено на элементе "
+                        f"{control_name!r} ({(identity or {}).get('role', '?')}); "
+                        f"уровень риска {level.level}. Ничего не выполнено."
+                    ),
+                },
+            }
+
         res = await asyncio.to_thread(handler, self.uia, handle, str(path), params)
-        return self._action_envelope(handle, how, res)
+        env = self._action_envelope(handle, how, res)
+        env["_risk"] = level
+        env["data"]["risk_level"] = level.level
+        env["data"]["risk_reason"] = level.reason
+        env["data"]["resolved_name"] = control_name
+        return env
 
     @staticmethod
     def _action_envelope(handle: int, how: str, res: Any) -> dict[str, Any]:
@@ -1336,8 +1611,60 @@ class AutopilotDaemon:
                 "message": f"Для действия {kind!r} требуются параметры: "
                            f"{', '.join(missing)}.",
             }
+
+        info = await asyncio.to_thread(self._safe_target_info, handle)
+        pid = info.get("pid") or await asyncio.to_thread(host_guard.pid_of_window,
+                                                         handle)
+        app = (self.host_tree.names.get(pid, "") if self.host_tree and pid else "")
+        # The window title stands in for a control name: these verbs act on the
+        # window itself, so the title is the only semantics the target carries.
+        level = self._risk_of("element", verb=str(kind),
+                              control_name=str(info.get("title", "")), app=app)
+
+        refusal = self._host_refusal(pid, bool(params.get("allow_host_input")),
+                                     f"окно {handle} {info.get('title', '')!r}",
+                                     "window_action")
+        if refusal is not None:
+            refusal["_risk"] = level
+            return refusal
+
+        if params.get("dry_run"):
+            return {
+                "status": "ok",
+                "dry_run": True,
+                "_risk": level,
+                "data": {
+                    "handle": handle, "resolution": how, "path": f"window:{handle}",
+                    "resolved_name": str(info.get("title", "")),
+                    "resolved_pid": pid, "app": app,
+                    "risk_level": level.level, "risk_reason": level.reason,
+                    "batchable": level.batchable,
+                    "message": (
+                        f"DRY RUN: {kind!r} над окном {info.get('title', '')!r}; "
+                        f"уровень риска {level.level}. Ничего не выполнено."
+                    ),
+                },
+            }
+
         res = await asyncio.to_thread(handler, self.uia, handle, params)
-        return self._action_envelope(handle, how, res)
+        env = self._action_envelope(handle, how, res)
+        env["_risk"] = level
+        env["data"]["risk_level"] = level.level
+        env["data"]["risk_reason"] = level.reason
+        return env
+
+    def _safe_target_info(self, handle: int) -> dict[str, Any]:
+        """target_info that degrades to an empty dict instead of raising.
+
+        A window can close between resolution and the call, and the guard and the
+        classifier both run on every mutation. Losing the title there must not lose
+        the action.
+        """
+        try:
+            return self.uia.target_info(handle) or {}
+        except Exception as exc:
+            logger.debug("target_info(%s) failed: %s", handle, exc)
+            return {}
 
     async def _action_read_terminal(self, params: dict[str, Any]) -> dict[str, Any]:
         """Reads a console buffer through TextPattern and returns a slice of it.
@@ -1421,6 +1748,16 @@ class AutopilotDaemon:
             return {"status": "error", "message": "Не указан text для записи."}
 
         expect = params.get("expect")
+
+        # Guarded like every other mutation. A terminal owned by the host is the
+        # agent's own tool channel: typing into it does not fail visibly, it changes
+        # what the agent's next command does.
+        pid = await asyncio.to_thread(host_guard.pid_of_window, handle)
+        guard = self._host_refusal(pid, bool(params.get("allow_host_input")),
+                                   f"терминал окна {handle}", "write_terminal")
+        if guard is not None:
+            return guard
+
         res = await asyncio.to_thread(
             lambda: self.uia.write_terminal(
                 handle, str(text),

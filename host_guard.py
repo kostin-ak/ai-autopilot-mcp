@@ -252,6 +252,24 @@ def pid_of_window(hwnd: int) -> int | None:
         return None
 
 
+def foreground_pid() -> int | None:
+    """Owning process of the focused window.
+
+    Keyboard input carries no target at all: it goes to whatever holds focus. So the
+    only way to guard typing is to resolve the focused window first, and to treat an
+    unresolvable one as unknown rather than as safe.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        hwnd = user32.GetForegroundWindow()
+        return pid_of_window(int(hwnd)) if hwnd else None
+    except (OSError, ValueError):
+        return None
+
+
 def pid_at_point(x: int, y: int) -> int | None:
     """Owning process of whatever is at a physical screen coordinate.
 

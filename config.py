@@ -142,6 +142,59 @@ CURSOR_COLOR_FILL: tuple[int, int, int] = (255, 0, 50)       # High-contrast Red
 CURSOR_COLOR_OUTLINE: tuple[int, int, int] = (0, 0, 0)       # Black border
 
 
+# ---------------------------------------------------------
+# Safety layer (ADR-0004)
+# ---------------------------------------------------------
+# Protection of the host's own process tree.
+#
+# On by default and not overridable from the gateway for coordinate actions, because
+# a click by coordinate carries no element semantics -- nothing in the request says
+# what it will land on. Tools that address a window explicitly accept
+# allow_host_input, which the operator can pass deliberately; that asymmetry is the
+# point.
+HOST_GUARD_ENABLED: bool = True
+
+# Applications in which a neutral action can still commit something: a message, a
+# mail, a payment. In these, nothing is classified as freely repeatable, and Enter
+# is treated as the send action rather than as navigation.
+#
+# This is a starting list, not a settled one. It is matched as a lowercase substring
+# against both the process image name and the window title, so a client that renames
+# itself per install has to be added here explicitly. Add rather than remove: the
+# cost of an extra entry is a stricter level, the cost of a missing one is a message
+# sent to the wrong recipient.
+CRITICAL_APPS: tuple[str, ...] = (
+    "telegram", "ayugram", "unigram", "whatsapp", "signal", "discord", "slack",
+    "viber", "skype", "teams", "matrix", "element", "thunderbird", "outlook",
+    "thebat", "почта", "телеграм",
+)
+
+# Audit trail.
+#
+# Bounded on purpose: an unbounded log on a machine left running for weeks is a disk
+# fill waiting to happen. 8 MiB times five generations is roughly half a million
+# records, which is far more than any single investigation needs.
+TRACE_ENABLED: bool = True
+TRACE_PATH: Path = Path(__file__).resolve().parent / "logs" / "autopilot_trace.jsonl"
+TRACE_MAX_BYTES: int = 8 * 1024 * 1024
+TRACE_KEEP: int = 5
+
+# Whether to capture a frame *before* a mutating action so the trace carries both
+# hashes. Off by default: the "after" hash is free because mutating actions already
+# capture a frame, while the "before" hash needs a second capture that roughly
+# doubles the cost of every action. Turn it on when investigating a mis-bind, which
+# is exactly the case where seeing what the screen looked like beforehand matters.
+TRACE_CAPTURE_BEFORE: bool = False
+
+# Actions that never need classification because they change nothing.
+READ_ONLY_ACTIONS: frozenset[str] = frozenset({
+    "get_screen_state", "list_windows_and_monitors", "get_ui_elements",
+    "get_snapshot", "probe_target", "resolve_clickable", "read_terminal",
+    "wait_terminal", "read_screen_text", "find_text_on_screen", "wait_for_text",
+    "get_hud_state",
+})
+
+
 def configure_stdio_encoding() -> None:
     """Forces UTF-8 on stdout and stderr with replacement instead of exceptions.
 
