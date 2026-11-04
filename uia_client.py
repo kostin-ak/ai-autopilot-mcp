@@ -1816,6 +1816,124 @@ class UIAClient:
                      f"Ожидался размер {want_w}x{want_h}, прочитано {after}. "
                      f"Допуск {_TRANSFORM_TOLERANCE_PX} px."))
 
+    def activate_window(self, hwnd: int) -> ActionResult:
+        """Brings a window to the foreground from a background process.
+
+        Win32 rather than UIA, because UIA exposes no activation pattern; the same is
+        already true of `window_bounds`.
+
+        Measured (spike S7, 2026-11-04): `SetForegroundWindow` called from a process
+        that is not itself foreground returned false 2 times out of 2 and brought
+        nothing forward. With `AttachThreadInput` first it succeeded 2 out of 2 in
+        about 15 ms. So the attach is not a refinement, it is the whole mechanism, and
+        a code path that omits it silently does nothing.
+
+        Two details the measurement settled. Attach to the *foreground* thread as well
+        as the target's: attaching only to the target is the variant that fails,
+        because the restriction is evaluated against the foreground thread's input
+        state. And verify with `GetForegroundWindow` rather than trusting the return
+        value -- `SetForegroundWindow` returns nonzero when all it did was flash the
+        taskbar button, so the return value is not evidence of anything.
+        """
+        label = self._window_label(hwnd)
+        if not self._is_window(hwnd):
+            return ActionResult(False, "activate_window", label, False,
+                                message="Дескриптор больше не является окном.")
+
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD,
+                                             wintypes.BOOL]
+        user32.AttachThreadInput.restype = wintypes.BOOL
+
+        if self._is_minimized(hwnd):
+            # Activating a minimized window does not restore it, and reporting success
+            # would describe a window that is still an icon. Compose with 'restore'.
+            return ActionResult(
+                False, "activate_window", label, False,
+                message=("Окно свёрнуто; активация не разворачивает его. Сначала "
+                         "window_action 'restore', затем 'activate'."))
+
+        before = self._foreground_window()
+        cur = int(kernel32.GetCurrentThreadId())
+        target_thread = int(user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), None))
+        fg_thread = (int(user32.GetWindowThreadProcessId(wintypes.HWND(before), None))
+                     if before else 0)
+
+        attached_target = False
+        attached_fg = False
+        try:
+            # Attach the foreground thread first: it is the one whose input state the
+            # restriction is checked against.
+            if fg_thread and fg_thread != cur:
+                attached_fg = bool(user32.AttachThreadInput(cur, fg_thread, True))
+            if target_thread and target_thread != cur:
+                attached_target = bool(user32.AttachThreadInput(cur, target_thread, True))
+
+            api_said = bool(user32.SetForegroundWindow(wintypes.HWND(hwnd)))
+
+            def is_foreground():
+                return self._foreground_window() == hwnd
+
+            got, verified = self._read_back(is_foreground, lambda v: v, timeout_s=1.0)
+            after = self._foreground_window()
+            if verified:
+                return ActionResult(True, "activate_window", label, True,
+                                    before=str(before), after=str(after),
+                                    message=f"Окно {label} стало передним (api={api_said}).")
+            return ActionResult(
+                False, "activate_window", label, False, before=str(before),
+                after=str(after),
+                message=(f"Окно не стало передним: GetForegroundWindow вернул {after}. "
+                         f"SetForegroundWindow сказал {api_said}, но его возврат не "
+                         f"является свидетельством -- он ненулевой и когда вызов лишь "
+                         f"подсветил кнопку на панели задач."))
+        finally:
+            # Detach in reverse order, and always: a left attachment binds two
+            # threads' input queues for the lifetime of both, which would outlive this
+            # call and change how the operator's own input behaves.
+            if attached_target and target_thread != cur:
+                user32.AttachThreadInput(cur, target_thread, False)
+            if attached_fg and fg_thread != cur:
+                user32.AttachThreadInput(cur, fg_thread, False)
+
+    def _is_minimized(self, hwnd: int) -> bool:
+        """Whether the window is an icon right now.
+
+        Separate from `set_window_state`, which asks UIA for the visual state: this one
+        answers the Win32 question, so activation can tell "already an icon" from
+        "occluded behind another window" without a UIA round trip.
+        """
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class WINDOWPLACEMENT(ctypes.Structure):
+                _fields_ = [
+                    ("length", wintypes.UINT),
+                    ("flags", wintypes.UINT),
+                    ("showCmd", wintypes.UINT),
+                    ("ptMinPosition", wintypes.POINT),
+                    ("ptMaxPosition", wintypes.POINT),
+                    ("rcNormalPosition", wintypes.RECT),
+                ]
+
+            placement = WINDOWPLACEMENT()
+            placement.length = ctypes.sizeof(placement)
+            if not ctypes.windll.user32.GetWindowPlacement(
+                    wintypes.HWND(hwnd), ctypes.byref(placement)):
+                return False
+            # 6 == SW_SHOWMINIMIZED, 7 == SW_SHOWMINNOACTIVE.
+            return int(placement.showCmd) in (6, 7)
+        except Exception:
+            return False
+
     # ------------------------------------------------------------- terminals
     def terminal_host(self, hwnd: int) -> str:
         """Identifies the console host, which decides where WM_CHAR must go.

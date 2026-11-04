@@ -750,7 +750,7 @@ ELEMENT_ACTIONS = Literal[
     "scroll_into_view", "focus", "set_range_value",
 ]
 WINDOW_ACTIONS = Literal[
-    "close", "minimize", "maximize", "restore", "move", "resize",
+    "close", "minimize", "maximize", "restore", "move", "resize", "activate",
 ]
 
 
@@ -884,6 +884,14 @@ async def window_action(
                     "still open" instead of a false success.
       'move'      - move to screen coordinates. Requires `x` and `y`.
       'resize'    - resize in pixels. Requires `width` and `height`.
+      'activate'  - bring to the foreground. Measured: a background process cannot do
+                    this with SetForegroundWindow alone -- it returned false and brought
+                    nothing forward 2 times out of 2 -- so this attaches the input
+                    threads first and confirms through GetForegroundWindow, because the
+                    API's return value is nonzero even when all it did was flash the
+                    taskbar button. A minimized window is refused with a pointer to
+                    'restore': activation does not un-minimize, and reporting success
+                    would describe a window that is still an icon.
 
     'move' and 'resize' are confirmed against the window rectangle with a few pixels of
     tolerance, because Transform positions the bounding rectangle while some window

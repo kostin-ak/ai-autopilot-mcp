@@ -144,9 +144,10 @@ WINDOW_ACTIONS: dict[str, tuple[Any, tuple[str, ...]]] = {
     "restore": (lambda uia, h, _pr: uia.set_window_state(h, "normal"), ()),
     "move": (lambda uia, h, pr: uia.move_window(h, int(pr["x"]), int(pr["y"])),
              ("x", "y")),
-    "resize": (lambda uia, h, pr: uia.resize_window(h, int(pr["width"]),
-                                                    int(pr["height"])),
+"resize": (lambda uia, h, pr: uia.resize_window(h, int(pr["width"]),
+                                                     int(pr["height"])),
                ("width", "height")),
+    "activate": (lambda uia, h, _pr: uia.activate_window(h), ()),
 }
 
 

@@ -1285,6 +1285,148 @@ class TestTransformWindow:
         assert pat.calls == []
 
 
+class FakeUser32Activation:
+    """Stands in for ctypes.windll.user32 during activate_window.
+
+    Attributes are local functions rather than bound methods, because the production
+    code sets .argtypes and .restype on them and Python does not allow attribute
+    assignment on a bound method.
+    """
+
+    def __init__(self, foreground=999, becomes_foreground=True, raise_on_set=False,
+                 set_result=True, threads=None):
+        self.foreground = foreground
+        self.becomes_foreground = becomes_foreground
+        self.raise_on_set = raise_on_set
+        self.set_result = set_result
+        self.threads = threads or {1: 11, 999: 22}
+        self.attached = []
+        self.detached = []
+        self.set_calls = []
+        outer = self
+
+        def as_int(handle):
+            """The production code wraps handles in wintypes.HWND, so a plain int()
+            would fail on the c_void_p the fake actually receives."""
+            value = getattr(handle, "value", handle)
+            return int(value or 0)
+
+        def GetForegroundWindow():
+            return outer.foreground
+
+        def SetForegroundWindow(h):
+            outer.set_calls.append(as_int(h))
+            if outer.raise_on_set:
+                raise OSError("SetForegroundWindow blocked")
+            if outer.becomes_foreground:
+                outer.foreground = as_int(h)
+            return outer.set_result
+
+        def AttachThreadInput(a, b, attach):
+            (outer.attached if attach else outer.detached).append((int(a), int(b)))
+            return True
+
+        def GetWindowThreadProcessId(h, _pid):
+            return outer.threads.get(as_int(h), 0)
+
+        self.GetForegroundWindow = GetForegroundWindow
+        self.SetForegroundWindow = SetForegroundWindow
+        self.AttachThreadInput = AttachThreadInput
+        self.GetWindowThreadProcessId = GetWindowThreadProcessId
+
+
+class FakeKernel32Activation:
+    def __init__(self, tid=7):
+        outer = self
+
+        def GetCurrentThreadId():
+            return outer.tid
+
+        self.tid = tid
+        self.GetCurrentThreadId = GetCurrentThreadId
+
+
+class ActivateClient(FakeClient):
+    def __init__(self, root, minimized=False):
+        super().__init__(root)
+        self._minimized = minimized
+
+    def _is_minimized(self, hwnd):
+        return self._minimized
+
+
+def _activation_client(monkeypatch, fake_user, minimized=False, alive=True):
+    import ctypes
+
+    monkeypatch.setattr(ctypes.windll, "user32", fake_user, raising=False)
+    monkeypatch.setattr(ctypes.windll, "kernel32", FakeKernel32Activation(),
+                        raising=False)
+    client = ActivateClient(FakeElement("win"), minimized=minimized)
+    client._is_window = lambda h: alive
+    return client
+
+
+class TestActivateWindow:
+    """Foreground activation is Win32-only and measured, so the tests pin the parts a
+    wrong implementation would get wrong silently: the attach discipline, and the fact
+    that the API's return value proves nothing."""
+
+    def test_dead_handle_is_refused_without_touching_win32(self, monkeypatch):
+        fake = FakeUser32Activation()
+        client = _activation_client(monkeypatch, fake, alive=False)
+        r = client.activate_window(1)
+        assert r.ok is False and r.verified is False
+        assert fake.attached == [] and fake.set_calls == []
+
+    def test_minimized_window_points_at_restore(self, monkeypatch):
+        """Activation does not un-minimize, and claiming success would describe a
+        window that is still an icon."""
+        fake = FakeUser32Activation()
+        client = _activation_client(monkeypatch, fake, minimized=True)
+        r = client.activate_window(1)
+        assert r.ok is False
+        assert fake.attached == [] and fake.set_calls == []
+        assert "restore" in r.message
+
+    def test_attaches_both_threads_and_detaches_both(self, monkeypatch):
+        """The foreground thread is the one whose input state the restriction is
+        checked against; attaching only to the target is the variant that fails."""
+        fake = FakeUser32Activation()
+        client = _activation_client(monkeypatch, fake)
+        r = client.activate_window(1)
+        assert r.ok and r.verified is True
+        assert (7, 22) in fake.attached, "foreground thread must be attached"
+        assert (7, 11) in fake.attached, "target thread must be attached"
+        assert sorted(fake.detached) == sorted(fake.attached), \
+            "every attachment must be released"
+
+    def test_detach_happens_even_when_the_call_raises(self, monkeypatch):
+        """A left attachment binds two threads' input queues for the lifetime of both,
+        which outlives this call and changes how the operator's own input behaves."""
+        fake = FakeUser32Activation(raise_on_set=True)
+        client = _activation_client(monkeypatch, fake)
+        with pytest.raises(OSError):
+            client.activate_window(1)
+        assert fake.attached, "the test must have attached something to leak"
+        assert sorted(fake.detached) == sorted(fake.attached)
+
+    def test_api_saying_yes_is_not_treated_as_success(self, monkeypatch):
+        """SetForegroundWindow returns nonzero when it only flashed the taskbar
+        button, so the return value is not evidence of anything."""
+        fake = FakeUser32Activation(becomes_foreground=False, set_result=True)
+        client = _activation_client(monkeypatch, fake)
+        r = client.activate_window(1)
+        assert r.ok is False and r.verified is False
+        assert fake.set_calls == [1]
+        assert "панели задач" in r.message
+
+    def test_before_and_after_report_the_foreground_window(self, monkeypatch):
+        fake = FakeUser32Activation(foreground=999)
+        client = _activation_client(monkeypatch, fake)
+        r = client.activate_window(1)
+        assert r.before == "999" and r.after == "1"
+
+
 class TestReadBack:
     """UIA state is not synchronous with the call that changed it.
 

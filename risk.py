@@ -84,7 +84,7 @@ REVERSIBLE_STEMS = (
 # Verbs whose effect is bounded and undone by doing the opposite.
 REVERSIBLE_VERBS = frozenset({
     "select", "expand", "collapse", "scroll_into_view", "focus",
-    "set_window_state", "move_window", "resize_window",
+    "set_window_state", "move_window", "resize_window", "activate",
 })
 
 # Verbs that write state. Cancelable in principle, not in fact once submitted.
