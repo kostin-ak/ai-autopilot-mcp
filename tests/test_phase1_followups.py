@@ -675,9 +675,93 @@ class TestToolDescriptions:
         "keyboard_action", "scroll_screen", "list_windows_and_monitors",
         "get_ui_elements", "reset_user_override", "get_hud_state",
         "probe_target", "get_snapshot", "resolve_clickable", "act_on_element",
+        "window_action",
         "read_terminal", "write_terminal", "wait_terminal",
         "find_text_on_screen", "read_screen_text", "wait_for_text",
     }
+
+    def test_element_verbs_match_the_daemon_dispatch(self):
+        """The gateway's Literal and the daemon's table must name the same verbs.
+
+        They live in different modules and there is no import linking them, so the
+        only thing preventing drift is this test. A verb the gateway offers but the
+        daemon cannot dispatch returns "Unknown action"; one the daemon accepts but
+        the gateway does not offer is simply unreachable.
+        """
+        import asyncio
+
+        import mcp_server
+        from autopilot_daemon import ELEMENT_ACTIONS
+
+        tools = {t.name: t for t in asyncio.run(mcp_server.mcp.list_tools())}
+        schema_enum = set(
+            tools["act_on_element"].input_schema["properties"]["action"]["enum"]
+        )
+        assert schema_enum == set(ELEMENT_ACTIONS), (
+            f"gateway offers {sorted(schema_enum - set(ELEMENT_ACTIONS))} that the "
+            f"daemon cannot run; daemon accepts "
+            f"{sorted(set(ELEMENT_ACTIONS) - schema_enum)} that is unreachable"
+        )
+
+    def test_window_verbs_match_the_daemon_dispatch(self):
+        import asyncio
+
+        import mcp_server
+        from autopilot_daemon import WINDOW_ACTIONS
+
+        tools = {t.name: t for t in asyncio.run(mcp_server.mcp.list_tools())}
+        schema_enum = set(
+            tools["window_action"].input_schema["properties"]["action"]["enum"]
+        )
+        assert schema_enum == set(WINDOW_ACTIONS)
+
+    def test_class_b_mutations_are_gated_during_a_pause(self):
+        """Both mutating verb sets stay blocked while a human holds the machine."""
+        import autopilot_daemon as daemon
+
+        for action in ("element_action", "window_action", "write_terminal"):
+            assert action not in daemon.NON_INPUT_ACTIONS, (
+                f"{action} changes application state and must not run during "
+                "USER_OVERRIDE"
+            )
+
+    def test_verbs_with_required_params_are_guarded_before_the_handler(self):
+        """A required param must be checked by the daemon, not left to a KeyError.
+
+        The handler receives the raw params dict, so a verb whose required list is
+        empty while its body indexes a key would raise KeyError and surface as a
+        generic error. Exercising the real dispatch with a stub client proves the
+        guard fires first, for every verb that declares a requirement.
+        """
+        import asyncio
+
+        from autopilot_daemon import ELEMENT_ACTIONS, WINDOW_ACTIONS, AutopilotDaemon
+
+        class FakeUIA:
+            def __getattr__(self, _name):
+                def _fail(*_a, **_k):
+                    raise AssertionError("handler ran despite a missing param")
+                return _fail
+
+        async def resolve_ok(_params):
+            """Stands in for target resolution: the guard is what is under test."""
+            return 1, "hwnd"
+
+        stub = AutopilotDaemon.__new__(AutopilotDaemon)
+        stub.uia = FakeUIA()
+        stub._resolve_target = resolve_ok
+
+        for table, dispatch in ((ELEMENT_ACTIONS, "_action_element_action"),
+                                (WINDOW_ACTIONS, "_action_window_action")):
+            for name, (_handler, required) in table.items():
+                if not required:
+                    continue
+                params = {"action": name, "path": "1.0", "hwnd": 1}
+                resp = asyncio.run(getattr(stub, dispatch)(params))
+                assert resp["status"] == "error", f"{name} ran without {required}"
+                for key in required:
+                    assert key in resp["message"], f"{name} must name {key!r}"
+
 
     def test_every_tool_has_a_non_empty_english_description(self):
         import asyncio

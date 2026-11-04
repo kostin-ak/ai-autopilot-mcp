@@ -714,11 +714,21 @@ async def resolve_clickable(
     )
 
 
+ELEMENT_ACTIONS = Literal[
+    "invoke", "set_value", "toggle", "select", "expand", "collapse",
+    "scroll_into_view", "focus", "set_range_value",
+]
+WINDOW_ACTIONS = Literal[
+    "close", "minimize", "maximize", "restore", "move", "resize",
+]
+
+
 @mcp.tool()
 async def act_on_element(
-    action: Literal["invoke", "set_value", "toggle", "select", "expand", "collapse"],
+    action: ELEMENT_ACTIONS,
     path: str,
     text: str | None = None,
+    value: float | None = None,
     hwnd: int | None = None,
     window_title: str | None = None,
     class_name: str | None = None,
@@ -739,29 +749,103 @@ async def act_on_element(
     nothing at all.
 
     Actions:
-      'invoke'     - press a button or menu item. Not verifiable; confirm the effect
-                     by observing afterwards.
-      'set_value'  - write text into an edit or value field. Requires `text`.
-      'toggle'     - flip a checkbox or toggle button; before/after states returned.
-      'select'     - select a list, tree or tab item.
-      'expand'     - open a combo box or tree node.
-      'collapse'   - close one.
+      'invoke'           - press a button or menu item. Not verifiable; confirm the
+                           effect by observing afterwards.
+      'set_value'        - write text into an edit or value field. Requires `text`.
+      'toggle'           - flip a checkbox or toggle button; before/after returned.
+      'select'           - select a list, tree or tab item.
+      'expand'           - open a combo box or tree node.
+      'collapse'         - close one.
+      'scroll_into_view' - scroll a node marked off-screen into view, then re-read its
+                           coordinates. Verified through IsOffscreen.
+      'focus'            - give a node the keyboard focus without moving the mouse, so
+                           typed text lands there. Verified through HasKeyboardFocus.
+      'set_range_value'  - set a slider or spinner. Requires `value`, a number inside
+                           the element's own range; an out-of-range value is refused
+                           rather than clamped.
 
     Args:
-        action: One of the six above.
+        action: One of the nine above.
         path: The node's path from a get_snapshot result, e.g. '1.0.2'.
         text: The value to write, for 'set_value' only.
+        value: The number to set, for 'set_range_value' only.
         hwnd: Exact handle of the window the snapshot came from.
         window_title: Substring of the window title.
         class_name: Win32 window class.
     """
     resp = await _send_daemon_request("element_action", {
-        "action": action, "path": path, "text": text,
+        "action": action, "path": path, "text": text, "value": value,
         "hwnd": hwnd, "window_title": window_title, "class_name": class_name,
     })
     if resp.get("status") != "ok":
         return f"Действие не выполнено: {resp.get('message', 'Неизвестная ошибка')}"
 
+    return _format_class_b_result(resp, target="узле")
+
+
+@mcp.tool()
+async def window_action(
+    action: WINDOW_ACTIONS,
+    hwnd: int | None = None,
+    window_title: str | None = None,
+    class_name: str | None = None,
+    x: int | None = None,
+    y: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+) -> str:
+    """
+    Acts on a whole window through UIA, without using the cursor or taking focus.
+
+    Class B throughout, so this runs against an inactive or occluded window and does
+    not disturb the human. Two of these are prerequisites for observation rather than
+    conveniences: a minimized window captures as a black frame that looks exactly like
+    an empty one, so restore it before any screenshot, and a window left open by a
+    failed close usually has a modal dialog on it that has to be answered first.
+
+    Actions:
+      'restore'   - bring a minimized or maximized window back to normal.
+      'minimize'  - minimize it.
+      'maximize'  - maximize it.
+      'close'     - request a close. Verified by the handle ceasing to exist, so an
+                    application that answers with an unsaved-changes dialog reports
+                    "still open" instead of a false success.
+      'move'      - move to screen coordinates. Requires `x` and `y`.
+      'resize'    - resize in pixels. Requires `width` and `height`.
+
+    'move' and 'resize' are confirmed against the window rectangle with a few pixels of
+    tolerance, because Transform positions the bounding rectangle while some window
+    managers place the client area a border-width away. A window reporting CanMove=0 or
+    CanResize=0 refuses the call rather than reporting a change that did not happen.
+
+    Args:
+        action: One of the six above.
+        hwnd: Exact handle from list_windows_and_monitors. Takes priority.
+        window_title: Substring of the window title.
+        class_name: Win32 window class, narrows a title search.
+        x: Target left edge in physical screen pixels, for 'move'.
+        y: Target top edge in physical screen pixels, for 'move'.
+        width: Target width in pixels, for 'resize'.
+        height: Target height in pixels, for 'resize'.
+    """
+    resp = await _send_daemon_request("window_action", {
+        "action": action, "hwnd": hwnd, "window_title": window_title,
+        "class_name": class_name, "x": x, "y": y, "width": width, "height": height,
+    })
+    if resp.get("status") != "ok":
+        return f"Действие не выполнено: {resp.get('message', 'Неизвестная ошибка')}"
+
+    return _format_class_b_result(resp, target="окне")
+
+
+def _format_class_b_result(resp: dict[str, Any], target: str) -> str:
+    """Renders one Class B ActionResult into the four statuses the model needs.
+
+    Shared by element and window verbs so both report verification the same way. The
+    distinction that matters is the middle one: `verified: None` means the action has
+    no readable state, so success is only "the call was accepted" -- a materially
+    weaker claim that must not read like confirmation.
+    """
     d = resp.get("data", {})
     ok = d.get("ok")
     verified = d.get("verified")
@@ -774,7 +858,7 @@ async def act_on_element(
     else:
         status = "ОТКАЗ"
 
-    lines = [f"{status}: {d.get('action')} на узле {d.get('path')}"]
+    lines = [f"{status}: {d.get('action')} на {target} {d.get('path')}"]
     if d.get("before") is not None or d.get("after") is not None:
         lines.append(f"  было: {d.get('before')!r}  стало: {d.get('after')!r}")
     lines.append(f"  {d.get('message')}")
@@ -785,8 +869,8 @@ async def act_on_element(
         )
     if not ok:
         lines.append(
-            "  Повторять вслепую нельзя. Сделайте новый снимок: путь мог устареть "
-            "или элемент не поддерживает этот паттерн."
+            "  Повторять вслепую нельзя. Перечитайте цель: путь мог устареть, окно "
+            "могло закрыться, или элемент не поддерживает этот паттерн."
         )
     return "\n".join(lines)
 

@@ -30,6 +30,7 @@ from input_controller import InputController, InterruptedByUserError
 from ocr_engine import OcrReader
 from overlay_ui import HUDOverlayWindow
 from uia_client import (
+    ACTIONABLE_PATTERNS,
     DEFAULT_MAX_DEPTH,
     DEFAULT_MAX_NODES,
     DEFAULT_TIME_BUDGET_S,
@@ -76,6 +77,63 @@ NON_INPUT_ACTIONS: frozenset[str] = frozenset({
     "release_control",
     "hud_state",
 })
+
+# Returned verbatim to the model whenever an action is refused because a human
+# took the machine. This is agent-facing instruction, not a log line, so it has
+# to describe how the pause actually ends.
+#
+# It used to say "ask the user in chat for permission to continue", which stopped
+# being true once the daemon began releasing the pause on its own after
+# config.IDLE_RESUME_SECONDS of stillness. Leaving the stale wording in place
+# meant the model was told to stall on a conversation turn for a pause that had
+# already cleared. One constant, referenced by both paths that can raise it,
+# because a message duplicated in two places drifts -- and this one did.
+# Class B element verbs: name -> (handler, required params).
+#
+# A table rather than an if/elif chain so that the set of accepted names and the
+# set of handlers are the same object. The mouse_action chain kept them apart and
+# grew a hole: an unrecognized action matched no branch, did nothing, and returned
+# status "ok".
+#
+# Each handler takes (uia, handle, path, params) and returns an ActionResult, whose
+# tri-state `verified` is what tells the caller whether the effect was read back or
+# merely accepted.
+ELEMENT_ACTIONS: dict[str, tuple[Any, tuple[str, ...]]] = {
+    "invoke": (lambda uia, h, p, _pr: uia.invoke(h, p), ()),
+    "set_value": (lambda uia, h, p, pr: uia.set_value(h, p, str(pr["text"])), ("text",)),
+    "toggle": (lambda uia, h, p, _pr: uia.toggle(h, p), ()),
+    "select": (lambda uia, h, p, _pr: uia.select_item(h, p), ()),
+    "expand": (lambda uia, h, p, _pr: uia.expand_collapse(h, p, True), ()),
+    "collapse": (lambda uia, h, p, _pr: uia.expand_collapse(h, p, False), ()),
+    # Added by the Class B verb work. ScrollItem and RangeValue were already
+    # published per node as actionable with no verb behind them, so an off-screen
+    # element could only be reached by escalating to Class A and scrolling pixels.
+    "scroll_into_view": (lambda uia, h, p, _pr: uia.scroll_into_view(h, p), ()),
+    "focus": (lambda uia, h, p, _pr: uia.focus_element(h, p), ()),
+    "set_range_value": (
+        lambda uia, h, p, pr: uia.set_range_value(h, p, float(pr["value"])),
+        ("value",),
+    ),
+}
+
+
+# Window-level Class B verbs: name -> (handler, required params).
+#
+# Separate from ELEMENT_ACTIONS because the target is the window itself, addressed
+# by handle, not a node inside it addressed by snapshot path. WindowPattern and
+# TransformPattern both live on the window's root element.
+WINDOW_ACTIONS: dict[str, tuple[Any, tuple[str, ...]]] = {
+    "close": (lambda uia, h, _pr: uia.close_window(h), ()),
+    "minimize": (lambda uia, h, _pr: uia.set_window_state(h, "minimize"), ()),
+    "maximize": (lambda uia, h, _pr: uia.set_window_state(h, "maximize"), ()),
+    "restore": (lambda uia, h, _pr: uia.set_window_state(h, "normal"), ()),
+    "move": (lambda uia, h, pr: uia.move_window(h, int(pr["x"]), int(pr["y"])),
+             ("x", "y")),
+    "resize": (lambda uia, h, pr: uia.resize_window(h, int(pr["width"]),
+                                                    int(pr["height"])),
+               ("width", "height")),
+}
+
 
 
 class AutopilotDaemon:
@@ -324,6 +382,8 @@ class AutopilotDaemon:
                 return await self._action_resolve_clickable(params)
             elif action == "element_action":
                 return await self._action_element_action(params)
+            elif action == "window_action":
+                return await self._action_window_action(params)
             elif action == "read_terminal":
                 return await self._action_read_terminal(params)
             elif action == "write_terminal":
@@ -938,12 +998,10 @@ class AutopilotDaemon:
                 return None
             return self._frame_point(bbox, point[0], point[1])
 
-        actionable_patterns = {"Invoke", "Value", "Toggle", "SelectionItem",
-                               "ExpandCollapse", "RangeValue"}
         nodes = []
         for n in snap.nodes:
             fp = to_frame(n.clickable)
-            if not (fp or (set(n.patterns) & actionable_patterns)):
+            if not (fp or (set(n.patterns) & ACTIONABLE_PATTERNS)):
                 continue
             nodes.append({
                 "path": n.path,
@@ -1037,6 +1095,11 @@ class AutopilotDaemon:
         mutate application state, so they take the input lock (serializing against
         any in-flight input) and they stay blocked during USER_OVERRIDE: a human who
         has taken over is also manipulating that application.
+
+        Dispatch goes through ELEMENT_ACTIONS rather than an if/elif chain, because
+        a chain needs a separate list of accepted names and the two drift. The
+        mouse_action chain had exactly that gap: an unrecognized action fell through
+        every branch and reported success.
         """
         handle, how = await self._resolve_target(params)
         if handle is None:
@@ -1046,31 +1109,33 @@ class AutopilotDaemon:
         if not path:
             return {"status": "error", "message": "Не указан path узла из снимка."}
 
-        if kind == "invoke":
-            res = await asyncio.to_thread(self.uia.invoke, handle, str(path))
-        elif kind == "set_value":
-            text = params.get("text")
-            if text is None:
-                return {"status": "error",
-                        "message": "Для действия set_value требуется параметр text."}
-            res = await asyncio.to_thread(
-                self.uia.set_value, handle, str(path), str(text)
-            )
-        elif kind == "toggle":
-            res = await asyncio.to_thread(self.uia.toggle, handle, str(path))
-        elif kind == "select":
-            res = await asyncio.to_thread(self.uia.select_item, handle, str(path))
-        elif kind in ("expand", "collapse"):
-            res = await asyncio.to_thread(
-                self.uia.expand_collapse, handle, str(path), kind == "expand"
-            )
-        else:
+        entry = ELEMENT_ACTIONS.get(kind)
+        if entry is None:
             return {
                 "status": "error",
-                "message": f"Неизвестное действие {kind!r}. Допустимо: invoke, "
-                           "set_value, toggle, select, expand, collapse.",
+                "message": f"Неизвестное действие {kind!r}. Допустимо: "
+                           f"{', '.join(sorted(ELEMENT_ACTIONS))}.",
             }
+        handler, required = entry
+        missing = [name for name in required if params.get(name) is None]
+        if missing:
+            return {
+                "status": "error",
+                "message": f"Для действия {kind!r} требуются параметры: "
+                           f"{', '.join(missing)}.",
+            }
+        res = await asyncio.to_thread(handler, self.uia, handle, str(path), params)
+        return self._action_envelope(handle, how, res)
 
+    @staticmethod
+    def _action_envelope(handle: int, how: str, res: Any) -> dict[str, Any]:
+        """One response shape for every Class B action.
+
+        Shared between element and window verbs so the two cannot drift in what they
+        report. `verified` is passed through as the tri-state it is: None means the
+        action has no readable state and success is only "the call was accepted",
+        which the gateway renders as a distinctly weaker claim.
+        """
         return {
             "status": "ok",
             "data": {
@@ -1085,6 +1150,40 @@ class AutopilotDaemon:
                 "message": res.message,
             },
         }
+
+    async def _action_window_action(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Performs one window-level Class B verb and reports whether it verified.
+
+        Same gating as element actions: these change application state, so they take
+        the input lock and stay blocked during USER_OVERRIDE. A human who just took
+        the machine may be arranging those windows.
+
+        Closing and minimizing are the two that matter most for observation: a
+        minimized window captures as a black frame, and a window left open by a
+        failed close usually has a modal on it that the agent has to answer.
+        """
+        handle, how = await self._resolve_target(params)
+        if handle is None:
+            return {"status": "error", "message": how}
+        kind = params.get("action")
+
+        entry = WINDOW_ACTIONS.get(kind)
+        if entry is None:
+            return {
+                "status": "error",
+                "message": f"Неизвестное действие окна {kind!r}. Допустимо: "
+                           f"{', '.join(sorted(WINDOW_ACTIONS))}.",
+            }
+        handler, required = entry
+        missing = [name for name in required if params.get(name) is None]
+        if missing:
+            return {
+                "status": "error",
+                "message": f"Для действия {kind!r} требуются параметры: "
+                           f"{', '.join(missing)}.",
+            }
+        res = await asyncio.to_thread(handler, self.uia, handle, params)
+        return self._action_envelope(handle, how, res)
 
     async def _action_read_terminal(self, params: dict[str, Any]) -> dict[str, Any]:
         """Reads a console buffer through TextPattern and returns a slice of it.

@@ -60,6 +60,33 @@ SINGLE_QUERY_LIMIT_S = 1.0
 
 # WindowVisualState
 _WINDOW_NORMAL = 0
+_WINDOW_MAXIMIZED = 1
+_WINDOW_MINIMIZED = 2
+_WINDOW_STATES: dict[str, int] = {
+    "normal": _WINDOW_NORMAL,
+    "maximize": _WINDOW_MAXIMIZED,
+    "maximized": _WINDOW_MAXIMIZED,
+    "minimize": _WINDOW_MINIMIZED,
+    "minimized": _WINDOW_MINIMIZED,
+    "restore": _WINDOW_NORMAL,
+}
+_WINDOW_STATE_NAMES = {
+    _WINDOW_NORMAL: "Normal",
+    _WINDOW_MAXIMIZED: "Maximized",
+    _WINDOW_MINIMIZED: "Minimized",
+}
+
+# A minimized window's rectangle sits at roughly (-32000, -32000), so any
+# before/after comparison of its geometry is meaningless. Window-level actions
+# refuse rather than report a change measured against a sentinel.
+#
+# How close a read-back has to be to count as confirmed. Transform.Move and
+# Resize round to whole pixels and some window managers adjust by the border
+# width, so exact equality would report failure for a move that succeeded.
+_TRANSFORM_TOLERANCE_PX = 4
+# Floating-point read-back of a range value. A slider that reports 33.0 for a
+# request of 33.0 is exact, but one that reports 32.999999 is not a failure.
+_RANGE_TOLERANCE = 1e-6
 
 # Availability flags for patterns that carry text.
 _PATTERN_FLAGS = {
@@ -100,7 +127,17 @@ _ACTIONABLE_ROLES = frozenset({
 })
 
 # Patterns that mean an element can be acted on without the cursor.
-_ACTIONABLE_PATTERNS = frozenset({
+#
+# Public because the daemon filters its published node list with the same set. It
+# used to be spelled out a second time as a literal there, which is how two
+# definitions of one rule start to disagree.
+#
+# Every member has a verb behind it: Invoke, Value, Toggle, SelectionItem and
+# ExpandCollapse from the start, ScrollItem and RangeValue added by the Class B
+# verb work. ScrollItem was the one that mattered most -- snapshots already marked
+# nodes off-screen, so before its verb existed the only way to reach one was to
+# escalate to Class A and scroll pixels.
+ACTIONABLE_PATTERNS = frozenset({
     "Invoke", "Value", "Toggle", "SelectionItem", "ExpandCollapse", "RangeValue",
 })
 
@@ -569,7 +606,7 @@ class UIAClient:
         tree_sample = len(sample.nodes)
         useful = sum(
             1 for n in sample.nodes
-            if n.text_usable or (set(n.patterns) & _ACTIONABLE_PATTERNS)
+            if n.text_usable or (set(n.patterns) & ACTIONABLE_PATTERNS)
         )
         if tree_sample:
             us_per_node = sample.elapsed_ms * 1000.0 / tree_sample
@@ -1385,6 +1422,368 @@ class UIAClient:
             verified, "expand_collapse", path, verified, before=before, after=after,
             message=(f"Состояние: {before} -> {after}." if verified else
                      f"Ожидалось {want}, получено {after!r}."))
+
+    # ------------------------------------------------- remaining Class B verbs
+    #
+    # These seven close the gap between what a snapshot advertises and what an
+    # action can do. Before them, a node reporting ScrollItem or RangeValue was
+    # published as actionable and then had no verb behind it, so the only way to
+    # reach an off-screen element was to escalate to Class A and scroll by pixels.
+
+    def scroll_into_view(self, hwnd: int, path: str) -> ActionResult:
+        """Brings an element into its container's visible area, without the cursor.
+
+        Verified through IsOffscreen rather than through a bounding rectangle: the
+        rectangle of an element inside a virtualised list can stay nonsensical while
+        the container has not scrolled, and IsOffscreen is the property the snapshot
+        already publishes as "outside the visible area", so the action and the
+        observation use one definition.
+        """
+        el = self._element_at_path(hwnd, path)
+        if el is None:
+            return ActionResult(False, "scroll_into_view", path, None,
+                                message="Путь не разрешается: дерево изменилось. "
+                                        "Сделайте новый снимок.")
+        pat = self._pattern_on(el, "ScrollItem", "IUIAutomationScrollItemPattern")
+        if pat is None:
+            return ActionResult(False, "scroll_into_view", path, None,
+                                message="Элемент не поддерживает ScrollItemPattern. "
+                                        "Прокрутка доступна только Классом A.")
+
+        def offscreen():
+            try:
+                return bool(el.CurrentIsOffscreen)
+            except COMError:
+                return None
+
+        before = offscreen()
+        if before is False:
+            return ActionResult(True, "scroll_into_view", path, True,
+                                before="on-screen", after="on-screen",
+                                message="Элемент уже в видимой области; прокрутка не "
+                                        "нужна и не выполнена.")
+        try:
+            self._retry(pat.ScrollIntoView)
+        except COMError as exc:
+            return ActionResult(False, "scroll_into_view", path, None, before=str(before),
+                                message=f"ScrollIntoView отказал: {self._hresult(exc)}")
+        after, verified = self._read_back(offscreen, lambda v: v is False, timeout_s=2.0)
+        return ActionResult(
+            verified, "scroll_into_view", path, verified,
+            before=str(before), after=("on-screen" if verified else str(after)),
+            message=("Элемент в видимой области; координаты теперь настоящие. "
+                     "Перечитайте их снимком." if verified else
+                     "IsOffscreen остался истинным. Возможная причина: контейнер сам "
+                     "не прокручиваем, или элемент в виртуализированном списке, "
+                     "который ещё не материализовал узел."))
+
+    def set_range_value(self, hwnd: int, path: str, value: float) -> ActionResult:
+        """Sets a slider or spinner through RangeValuePattern and confirms it.
+
+        A value outside the element's own range is refused rather than clamped. The
+        provider would silently write the nearest bound and read back that bound, so
+        the read-back would confirm a number the caller never asked for -- the same
+        silent substitution already removed from the input layer.
+        """
+        el = self._element_at_path(hwnd, path)
+        if el is None:
+            return ActionResult(False, "set_range_value", path, False,
+                                message="Путь не разрешается: дерево изменилось.")
+        pat = self._pattern_on(el, "RangeValue", "IUIAutomationRangeValuePattern")
+        if pat is None:
+            return ActionResult(False, "set_range_value", path, False,
+                                message="Элемент не поддерживает RangeValuePattern.")
+        try:
+            if bool(pat.CurrentIsReadOnly):
+                return ActionResult(False, "set_range_value", path, False,
+                                    message="Диапазон только для чтения "
+                                            "(IsReadOnly=1); значение не изменено.")
+            lo, hi = float(pat.CurrentMinimum), float(pat.CurrentMaximum)
+            before = float(pat.CurrentValue)
+        except (COMError, ValueError, TypeError) as exc:
+            return ActionResult(False, "set_range_value", path, False,
+                                message=f"Не прочитаны границы диапазона: {exc}")
+
+        want = float(value)
+        if not (lo <= want <= hi):
+            return ActionResult(
+                False, "set_range_value", path, False, before=str(before),
+                message=f"Значение {want!r} вне диапазона [{lo:g}, {hi:g}]; ничего не "
+                        "изменено. Обрезание дало бы подтверждённое перечитыванием "
+                        "число, которого вызывающая сторона не запрашивала.")
+        try:
+            self._retry(lambda: pat.SetValue(want))
+        except COMError as exc:
+            return ActionResult(False, "set_range_value", path, False, before=str(before),
+                                message=f"SetValue отказал: {self._hresult(exc)}")
+
+        def current():
+            try:
+                return float(pat.CurrentValue)
+            except (COMError, ValueError, TypeError):
+                return None
+
+        after, verified = self._read_back(
+            current, lambda v: v is not None and abs(v - want) <= _RANGE_TOLERANCE)
+        return ActionResult(
+            verified, "set_range_value", path, verified, before=str(before),
+            after=(f"{after:g}" if isinstance(after, float) else str(after)),
+            message=(f"Значение подтверждено перечитыванием: {before:g} -> {after:g}."
+                     if verified else
+                     f"Значение НЕ подтверждено: ожидалось {want:g}, прочитано "
+                     f"{after!r}. Диапазон [{lo:g}, {hi:g}]; многие ползунки "
+                     "квантуют шаг, поэтому близкое значение может быть настоящим "
+                     "пределом точности элемента."))
+
+    def focus_element(self, hwnd: int, path: str) -> ActionResult:
+        """Moves keyboard focus to an element without touching the mouse.
+
+        Class B, so it does not consume the session cursor. Confirmed through
+        HasKeyboardFocus, which is the property that actually decides where typed
+        text lands -- the caret position a caller usually cares about.
+        """
+        el = self._element_at_path(hwnd, path)
+        if el is None:
+            return ActionResult(False, "focus_element", path, None,
+                                message="Путь не разрешается: дерево изменилось.")
+
+        def focused():
+            try:
+                return bool(el.CurrentHasKeyboardFocus)
+            except COMError:
+                return None
+
+        before = focused()
+        if not bool(getattr(el, "CurrentIsEnabled", True)):
+            return ActionResult(False, "focus_element", path, None, before=str(before),
+                                message="Элемент отключён (IsEnabled=0); фокус не "
+                                        "установлен.")
+        try:
+            self._retry(el.SetFocus)
+        except COMError as exc:
+            return ActionResult(False, "focus_element", path, None, before=str(before),
+                                message=f"SetFocus отказал: {self._hresult(exc)}")
+        after, verified = self._read_back(focused, lambda v: v is True, timeout_s=2.0)
+        return ActionResult(
+            verified, "focus_element", path, verified, before=str(before),
+            after=str(after),
+            message=("Фокус клавиатуры подтверждён." if verified else
+                     "HasKeyboardFocus остался ложным. Обычная причина: приложение "
+                     "не даёт фокус элементу, который его объявляет, или окно не "
+                     "активно и фокус остался у прежнего элемента."))
+
+    # Window-level verbs. These take a handle rather than a node path: the target
+    # is the window itself, and WindowPattern and TransformPattern live on its root
+    # element.
+
+    def _window_pattern(self, hwnd: int):
+        """WindowPattern on a top-level window, or None."""
+        try:
+            el = self.element_from_handle(hwnd)
+            return self._pattern_on(el, "Window", "IUIAutomationWindowPattern")
+        except (COMError, AttributeError):
+            return None
+
+    @staticmethod
+    def _window_label(hwnd: int) -> str:
+        """Stands in for a node path in ActionResult, which requires one."""
+        return f"window:{hwnd}"
+
+    def close_window(self, hwnd: int) -> ActionResult:
+        """Requests a window close through WindowPattern.
+
+        Verified by the handle ceasing to be a window, not by the call returning:
+        Close asks the application to close, and an application with unsaved changes
+        will put a dialog up instead and stay open. Reporting success on the call
+        alone would tell the agent the window is gone while a modal is on screen
+        waiting for an answer.
+        """
+        label = self._window_label(hwnd)
+        if not self._is_window(hwnd):
+            return ActionResult(False, "close_window", label, False,
+                                message=f"Окно {hwnd} уже не существует.")
+        pat = self._window_pattern(hwnd)
+        if pat is None:
+            return ActionResult(False, "close_window", label, False,
+                                message="Окно не поддерживает WindowPattern.")
+        try:
+            self._retry(pat.Close)
+        except COMError as exc:
+            return ActionResult(False, "close_window", label, False,
+                                message=f"Close отказал: {self._hresult(exc)}")
+        gone, verified = self._read_back(
+            lambda: not self._is_window(hwnd), lambda v: v is True, timeout_s=3.0)
+        return ActionResult(
+            verified, "close_window", label, verified,
+            before="open", after=("closed" if verified else "still open"),
+            message=("Окно закрыто: дескриптор больше не действителен." if verified else
+                     "Окно осталось открытым после Close. Обычная причина: приложение "
+                     "показало диалог несохранённых изменений или подтверждение. "
+                     "Снимите окно и посмотрите, что на нём появилось."))
+
+    def set_window_state(self, hwnd: int, state: str) -> ActionResult:
+        """Sets a window to normal, maximized or minimized, and confirms it.
+
+        Class B: restoring and minimizing never touch the cursor, which is what
+        makes an occluded or minimized target observable before a capture.
+        """
+        label = self._window_label(hwnd)
+        key = (state or "").strip().lower()
+        if key not in _WINDOW_STATES:
+            return ActionResult(
+                False, "set_window_state", label, False,
+                message=f"Неизвестное состояние окна {state!r}; ничего не изменено. "
+                        f"Допустимые значения: "
+                        f"{', '.join(sorted(set(_WINDOW_STATES)))}.")
+        if not self._is_window(hwnd):
+            return ActionResult(False, "set_window_state", label, False,
+                                message=f"Окно {hwnd} не существует.")
+        pat = self._window_pattern(hwnd)
+        if pat is None:
+            return ActionResult(False, "set_window_state", label, False,
+                                message="Окно не поддерживает WindowPattern.")
+
+        def visual():
+            try:
+                raw = int(pat.CurrentWindowVisualState)
+                return _WINDOW_STATE_NAMES.get(raw, str(raw))
+            except (COMError, ValueError, TypeError):
+                return None
+
+        before = visual()
+        want = _WINDOW_STATES[key]
+        try:
+            self._retry(lambda: pat.SetWindowVisualState(want))
+        except COMError as exc:
+            return ActionResult(False, "set_window_state", label, False, before=before,
+                                message=f"SetWindowVisualState отказал: "
+                                        f"{self._hresult(exc)}")
+        target_name = _WINDOW_STATE_NAMES[want]
+        after, verified = self._read_back(visual, lambda v: v == target_name,
+                                          timeout_s=2.0)
+        return ActionResult(
+            verified, "set_window_state", label, verified, before=before, after=after,
+            message=(f"Состояние окна: {before} -> {after}." if verified else
+                     f"Ожидалось {target_name}, получено {after!r}. Геометрия "
+                     "свёрнутого окна — сентинель около (-32000, -32000), поэтому "
+                     "координаты и кадр до разворачивания недостоверны."))
+
+    def _transform_pattern(self, hwnd: int):
+        try:
+            el = self.element_from_handle(hwnd)
+            return self._pattern_on(el, "Transform", "IUIAutomationTransformPattern")
+        except (COMError, AttributeError):
+            return None
+
+    def _rect_of(self, hwnd: int):
+        """(left, top, width, height) of a window, or None when unreadable."""
+        bounds = self.window_bounds(hwnd)
+        if bounds is None:
+            return None
+        left, top, right, bottom = bounds
+        return left, top, right - left, bottom - top
+
+    def move_window(self, hwnd: int, x: int, y: int) -> ActionResult:
+        """Moves a window through TransformPattern, confirmed by its rectangle.
+
+        Verified with a tolerance rather than by exact equality: Transform.Move is
+        given the position of the element's bounding rectangle, while some window
+        managers place the client area and let the invisible border land a few
+        pixels off. Exact comparison would report failure for a move that plainly
+        happened, which is the same false negative that the Firefox address-bar
+        measurement produced for set_value.
+        """
+        label = self._window_label(hwnd)
+        if not self._is_window(hwnd):
+            return ActionResult(False, "move_window", label, False,
+                                message=f"Окно {hwnd} не существует.")
+        if self.is_minimized(hwnd):
+            return ActionResult(False, "move_window", label, False,
+                                message="Окно свёрнуто: его прямоугольник — сентинель, "
+                                        "поэтому сравнение геометрии бессмысленно. "
+                                        "Сначала set_window_state('normal').")
+        pat = self._transform_pattern(hwnd)
+        if pat is None:
+            return ActionResult(False, "move_window", label, False,
+                                message="Окно не поддерживает TransformPattern.")
+        try:
+            if not bool(pat.CurrentCanMove):
+                return ActionResult(False, "move_window", label, False,
+                                    message="Окно сообщает CanMove=0; перемещение не "
+                                            "выполнено.")
+        except COMError:
+            pass
+        before = self._rect_of(hwnd)
+        try:
+            self._retry(lambda: pat.Move(int(x), int(y)))
+        except COMError as exc:
+            return ActionResult(False, "move_window", label, False,
+                                before=str(before),
+                                message=f"Move отказал: {self._hresult(exc)}")
+
+        def close_enough(rect):
+            return (rect is not None
+                    and abs(rect[0] - int(x)) <= _TRANSFORM_TOLERANCE_PX
+                    and abs(rect[1] - int(y)) <= _TRANSFORM_TOLERANCE_PX)
+
+        after, verified = self._read_back(lambda: self._rect_of(hwnd), close_enough,
+                                          timeout_s=2.0)
+        return ActionResult(
+            verified, "move_window", label, verified, before=str(before), after=str(after),
+            message=(f"Окно перемещено в ({x}, {y}); подтверждено прямоугольником."
+                     if verified else
+                     f"Ожидалась позиция ({x}, {y}), прочитано {after}. "
+                     f"Допуск {_TRANSFORM_TOLERANCE_PX} px: расхождение больше "
+                     "означает, что менеджер окон скорректировал позицию."))
+
+    def resize_window(self, hwnd: int, width: int, height: int) -> ActionResult:
+        """Resizes a window through TransformPattern, confirmed by its rectangle."""
+        label = self._window_label(hwnd)
+        if width <= 0 or height <= 0:
+            return ActionResult(
+                False, "resize_window", label, False,
+                message=f"Размер должен быть положительным (получено {width}x{height}); "
+                        "ничего не изменено.")
+        if not self._is_window(hwnd):
+            return ActionResult(False, "resize_window", label, False,
+                                message=f"Окно {hwnd} не существует.")
+        if self.is_minimized(hwnd):
+            return ActionResult(False, "resize_window", label, False,
+                                message="Окно свёрнуто: геометрия — сентинель. Сначала "
+                                        "set_window_state('normal').")
+        pat = self._transform_pattern(hwnd)
+        if pat is None:
+            return ActionResult(False, "resize_window", label, False,
+                                message="Окно не поддерживает TransformPattern.")
+        try:
+            if not bool(pat.CurrentCanResize):
+                return ActionResult(
+                    False, "resize_window", label, False,
+                    message="Окно сообщает CanResize=0; размер не изменён. Развёрнутое "
+                            "на весь экран окно обычно отвечает именно так.")
+        except COMError:
+            pass
+        before = self._rect_of(hwnd)
+        want_w, want_h = int(width), int(height)
+        try:
+            self._retry(lambda: pat.Resize(want_w, want_h))
+        except COMError as exc:
+            return ActionResult(False, "resize_window", label, False, before=str(before),
+                                message=f"Resize отказал: {self._hresult(exc)}")
+
+        def close_enough(rect):
+            return (rect is not None
+                    and abs(rect[2] - want_w) <= _TRANSFORM_TOLERANCE_PX
+                    and abs(rect[3] - want_h) <= _TRANSFORM_TOLERANCE_PX)
+
+        after, verified = self._read_back(lambda: self._rect_of(hwnd), close_enough,
+                                          timeout_s=2.0)
+        return ActionResult(
+            verified, "resize_window", label, verified, before=str(before), after=str(after),
+            message=(f"Размер окна {before[2]}x{before[3]} -> {after[2]}x{after[3]}."
+                     if verified and before and after else
+                     f"Ожидался размер {want_w}x{want_h}, прочитано {after}. "
+                     f"Допуск {_TRANSFORM_TOLERANCE_PX} px."))
 
     # ------------------------------------------------------------- terminals
     def terminal_host(self, hwnd: int) -> str:

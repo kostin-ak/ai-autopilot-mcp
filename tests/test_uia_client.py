@@ -61,9 +61,16 @@ class FakeElement:
         self.CurrentProcessId = pid
         self.CurrentBoundingRectangle = _Rect(*bounds)
         self.CurrentIsOffscreen = offscreen
+        self.CurrentHasKeyboardFocus = has_focus
+        self.CurrentIsEnabled = enabled
         self._children = list(children)
         self._delay = delay
         self._patterns = dict(pattern_objs or {})
+        self.focus_calls = 0
+
+    def SetFocus(self):
+        self.focus_calls += 1
+        self.CurrentHasKeyboardFocus = True
 
     def FindAllBuildCache(self, scope, cond, req):
         if self._delay:
@@ -141,9 +148,92 @@ class FakeInvokePattern:
         self.calls += 1
 
 
+class FakeScrollItemPattern:
+    """Flips the owning element's CurrentIsOffscreen, which is what the verb verifies."""
+
+    def __init__(self, element, ignore_calls=False):
+        self._element = element
+        self._ignore = ignore_calls
+        self.calls = 0
+
+    def ScrollIntoView(self):
+        self.calls += 1
+        if not self._ignore:
+            self._element.CurrentIsOffscreen = False
+
+
+class FakeRangeValuePattern:
+    def __init__(self, value=0.0, lo=0.0, hi=100.0, read_only=False,
+                 ignore_writes=False, quantize=None):
+        self.CurrentValue = float(value)
+        self.CurrentMinimum = float(lo)
+        self.CurrentMaximum = float(hi)
+        self.CurrentIsReadOnly = read_only
+        self._ignore = ignore_writes
+        self._quantize = quantize
+        self.calls = []
+
+    def SetValue(self, value):
+        self.calls.append(float(value))
+        if self._ignore:
+            return
+        # Models a slider that snaps to a step, so the read-back lands near the
+        # request rather than exactly on it.
+        written = float(value)
+        if self._quantize:
+            written = round(written / self._quantize) * self._quantize
+        self.CurrentValue = written
+
+
+class FakeWindowPattern:
+    def __init__(self, state=0, ignore_calls=False, on_close=None):
+        self.CurrentWindowVisualState = state
+        self._ignore = ignore_calls
+        self._on_close = on_close
+        self.calls = []
+
+    def SetWindowVisualState(self, state):
+        self.calls.append(state)
+        if not self._ignore:
+            self.CurrentWindowVisualState = state
+
+    def Close(self):
+        self.calls.append("close")
+        # Models the two outcomes that matter: an application that closes, and one
+        # that answers with a dialog and stays open.
+        if self._on_close is not None and not self._ignore:
+            self._on_close()
+
+
+class FakeTransformPattern:
+    def __init__(self, rect, can_move=True, can_resize=True, ignore_calls=False):
+        self._rect = list(rect)
+        self.CurrentCanMove = can_move
+        self.CurrentCanResize = can_resize
+        self._ignore = ignore_calls
+        self.calls = []
+
+    @property
+    def rect(self):
+        return tuple(self._rect)
+
+    def Move(self, x, y):
+        self.calls.append(("move", x, y))
+        if not self._ignore:
+            w, h = self._rect[2], self._rect[3]
+            self._rect = [x, y, w, h]
+
+    def Resize(self, w, h):
+        self.calls.append(("resize", w, h))
+        if not self._ignore:
+            self._rect = [self._rect[0], self._rect[1], w, h]
+
+
 PATTERN_IDS = {
     "Invoke": 10000, "Value": 10002, "Toggle": 10015,
     "SelectionItem": 10010, "ExpandCollapse": 10005,
+    "ScrollItem": 10017, "RangeValue": 10003,
+    "Window": 10009, "Transform": 10016,
 }
 
 
@@ -168,6 +258,9 @@ class _FakeTypelib:
     IUIAutomationSelectionItemPattern = "IID_SELITEM"
     IUIAutomationExpandCollapsePattern = "IID_EXPCOLL"
     IUIAutomationWindowPattern = "IID_WINDOW"
+    IUIAutomationScrollItemPattern = "IID_SCROLLITEM"
+    IUIAutomationRangeValuePattern = "IID_RANGEVALUE"
+    IUIAutomationTransformPattern = "IID_TRANSFORM"
 
 
 class FakeClient(uc.UIAClient):
@@ -887,6 +980,9 @@ class TestPatternActions:
         ("toggle", ("0.9",)),
         ("select_item", ("0.9",)),
         ("expand_collapse", ("0.9", True)),
+        ("scroll_into_view", ("0.9",)),
+        ("focus_element", ("0.9",)),
+        ("set_range_value", ("0.9", 50.0)),
     ])
     def test_stale_path_is_refused(self, method, args):
         """Acting on a path the tree no longer has must fail rather than land on
@@ -896,6 +992,297 @@ class TestPatternActions:
         r = getattr(FakeClient(root), method)(1, *args)
         assert r.ok is False, f"{method} acted on a stale path"
         assert "разрешается" in r.message
+
+
+# ------------------------------------------------- remaining Class B verbs
+class TestScrollIntoView:
+    """Without this verb an off-screen node could only be reached by escalating to
+    Class A and scrolling pixels -- even though the snapshot already publishes the
+    ScrollItem flag and already marks the node off-screen."""
+
+    def _client(self, offscreen=True, ignore=False):
+        el = FakeElement("target", offscreen=offscreen, bounds=(0, 500, 10, 510))
+        # The pattern holds a reference to the element it flips, so it is attached
+        # after construction rather than passed in.
+        pat = FakeScrollItemPattern(el, ignore_calls=ignore)
+        el._patterns[PATTERN_IDS["ScrollItem"]] = pat
+        root = FakeElement("root", children=[el], bounds=(0, 0, 100, 100))
+        return FakeClient(root), pat, el
+
+    def test_scrolls_and_confirms_through_isoffscreen(self):
+        client, pat, el = self._client()
+        r = client.scroll_into_view(1, "0")
+        assert r.ok and r.verified is True
+        assert pat.calls == 1
+        assert el.CurrentIsOffscreen is False
+        assert (r.before, r.after) == ("True", "on-screen")
+
+    def test_already_visible_is_a_noop_and_says_so(self):
+        """Scrolling a visible element can move it out of view, so the verb must
+        not touch it and must not claim it did."""
+        client, pat, _el = self._client(offscreen=False)
+        r = client.scroll_into_view(1, "0")
+        assert r.ok and r.verified is True
+        assert pat.calls == 0, "a visible element must not be scrolled"
+        assert "уже в видимой области" in r.message
+
+    def test_scroll_that_changes_nothing_is_reported_not_confirmed(self):
+        client, _pat, el = self._client(ignore=True)
+        r = client.scroll_into_view(1, "0")
+        assert r.ok is False and r.verified is False
+        assert el.CurrentIsOffscreen is True
+
+    def test_missing_pattern_names_the_only_alternative(self):
+        el = FakeElement("target", offscreen=True)
+        root = FakeElement("root", children=[el], bounds=(0, 0, 100, 100))
+        r = FakeClient(root).scroll_into_view(1, "0")
+        assert r.ok is False
+        assert "ScrollItemPattern" in r.message
+        assert "Классом A" in r.message
+
+
+class TestSetRangeValue:
+    def _client(self, **kwargs):
+        pat = FakeRangeValuePattern(**kwargs)
+        el = FakeElement("slider", pattern_objs={PATTERN_IDS["RangeValue"]: pat})
+        root = FakeElement("root", children=[el], bounds=(0, 0, 100, 100))
+        return FakeClient(root), pat
+
+    def test_sets_and_confirms_by_readback(self):
+        client, pat = self._client(value=10.0, lo=0.0, hi=100.0)
+        r = client.set_range_value(1, "0", 42.0)
+        assert r.ok and r.verified is True
+        assert (r.before, r.after) == ("10.0", "42")
+        assert pat.CurrentValue == 42.0
+
+    def test_out_of_range_is_refused_not_clamped(self):
+        """The provider would write the nearest bound and read it back, so the
+        read-back would confirm a number the caller never asked for. That is the
+        silent-substitution defect the input layer already had to be fixed for."""
+        client, pat = self._client(value=10.0, lo=0.0, hi=100.0)
+        for requested in (-1.0, 101.0):
+            r = client.set_range_value(1, "0", requested)
+            assert r.ok is False and r.verified is False
+            assert pat.calls == [], "nothing may be written for an out-of-range value"
+            assert "вне диапазона" in r.message
+        assert pat.CurrentValue == 10.0
+
+    def test_read_only_range_is_refused(self):
+        client, pat = self._client(value=5.0, read_only=True)
+        r = client.set_range_value(1, "0", 50.0)
+        assert r.ok is False
+        assert pat.calls == []
+        assert "только для чтения" in r.message
+
+    def test_quantized_slider_reports_near_but_not_exact(self):
+        """A real slider snaps to a step. The action must say the write was not
+        confirmed and show what came back, rather than either lying about success or
+        hiding the number that explains it."""
+        client, pat = self._client(value=0.0, lo=0.0, hi=100.0, quantize=10.0)
+        r = client.set_range_value(1, "0", 33.0)
+        assert r.ok is False and r.verified is False
+        assert pat.CurrentValue == 30.0
+        assert "квантуют" in r.message
+
+    def test_write_that_changes_nothing_is_detected(self):
+        client, _pat = self._client(value=7.0, ignore_writes=True)
+        r = client.set_range_value(1, "0", 50.0)
+        assert r.ok is False and r.verified is False
+        assert "НЕ подтверждено" in r.message
+
+    def test_missing_pattern_is_reported(self):
+        el = FakeElement("plain")
+        root = FakeElement("root", children=[el], bounds=(0, 0, 10, 10))
+        r = FakeClient(root).set_range_value(1, "0", 1.0)
+        assert r.ok is False
+        assert "RangeValuePattern" in r.message
+
+
+class TestFocusElement:
+    def _client(self, has_focus=False, enabled=True):
+        el = FakeElement("field", has_focus=has_focus, enabled=enabled,
+                         bounds=(0, 0, 10, 10))
+        root = FakeElement("root", children=[el], bounds=(0, 0, 100, 100))
+        return FakeClient(root), el
+
+    def test_focus_is_confirmed_by_haskeyboardfocus(self):
+        client, el = self._client()
+        r = client.focus_element(1, "0")
+        assert r.ok and r.verified is True
+        assert el.focus_calls == 1
+        assert el.CurrentHasKeyboardFocus is True
+
+    def test_disabled_element_is_refused_before_the_call(self):
+        client, el = self._client(enabled=False)
+        r = client.focus_element(1, "0")
+        assert r.ok is False
+        assert el.focus_calls == 0
+        assert "отключён" in r.message
+
+    def test_focus_that_does_not_take_is_reported(self):
+        """An element can accept SetFocus and still not hold it; that is a real
+        outcome on windows that are not active."""
+        client, el = self._client()
+        el.SetFocus = lambda: setattr(el, "CurrentHasKeyboardFocus", False)
+        r = client.focus_element(1, "0")
+        assert r.ok is False and r.verified is False
+
+
+class WindowClient(FakeClient):
+    """FakeClient with the Win32 window predicates driven by the fixture."""
+
+    def __init__(self, root, transform=None, minimized=False, alive=True,
+                 rect=(0, 0, 100, 50)):
+        super().__init__(root, minimized=minimized)
+        self._transform = transform
+        self.alive = alive
+        self._rect = list(rect)
+
+    def _is_window(self, hwnd):
+        return self.alive
+
+    def window_bounds(self, hwnd):
+        if not self.alive:
+            return None
+        rect = self._transform.rect if self._transform else tuple(self._rect)
+        left, top, w, h = rect
+        return (left, top, left + w, top + h)
+
+
+class TestSetWindowState:
+    def _client(self, pat, **kwargs):
+        el = FakeElement("win", pattern_objs={PATTERN_IDS["Window"]: pat})
+        return WindowClient(el, **kwargs)
+
+    def test_restore_confirms_through_the_visual_state(self):
+        pat = FakeWindowPattern(state=uc._WINDOW_MINIMIZED)
+        client = self._client(pat, minimized=True)
+        r = client.set_window_state(1, "normal")
+        assert r.ok and r.verified is True
+        assert (r.before, r.after) == ("Minimized", "Normal")
+
+    @pytest.mark.parametrize("verb,state", [
+        ("maximize", "Maximized"), ("minimize", "Minimized"), ("restore", "Normal"),
+    ])
+    def test_each_verb_reaches_its_own_state(self, verb, state):
+        pat = FakeWindowPattern(state=uc._WINDOW_NORMAL)
+        r = self._client(pat).set_window_state(1, verb)
+        assert r.after == state
+
+    def test_unknown_state_is_refused_and_names_the_accepted_values(self):
+        pat = FakeWindowPattern()
+        r = self._client(pat).set_window_state(1, "sideways")
+        assert r.ok is False and pat.calls == []
+        for accepted in ("normal", "maximize", "minimize"):
+            assert accepted in r.message
+
+    def test_state_that_does_not_change_is_reported(self):
+        pat = FakeWindowPattern(state=uc._WINDOW_NORMAL, ignore_calls=True)
+        r = self._client(pat).set_window_state(1, "maximize")
+        assert r.ok is False and r.verified is False
+        assert r.after == "Normal"
+
+    def test_dead_handle_is_refused(self):
+        pat = FakeWindowPattern()
+        r = self._client(pat, alive=False).set_window_state(1, "normal")
+        assert r.ok is False and pat.calls == []
+
+
+class TestCloseWindow:
+    def test_close_is_confirmed_by_the_handle_dying(self):
+        el = FakeElement("win")
+        client = WindowClient(el)
+        pat = FakeWindowPattern(on_close=lambda: setattr(client, "alive", False))
+        el._patterns[PATTERN_IDS["Window"]] = pat
+        r = client.close_window(1)
+        assert r.ok and r.verified is True
+        assert (r.before, r.after) == ("open", "closed")
+
+    def test_window_that_stays_open_is_not_reported_as_closed(self):
+        """The common real outcome: Close asks, the application answers with an
+        unsaved-changes dialog, and the window is still there. Reporting success on
+        the call would tell the agent to move on past a modal blocking it."""
+        pat = FakeWindowPattern(on_close=lambda: None)
+        el = FakeElement("win", pattern_objs={PATTERN_IDS["Window"]: pat})
+        client = WindowClient(el)
+        r = client.close_window(1)
+        assert r.ok is False and r.verified is False
+        assert r.after == "still open"
+        assert "диалог" in r.message
+
+    def test_already_gone_window_is_refused_without_a_call(self):
+        pat = FakeWindowPattern()
+        el = FakeElement("win", pattern_objs={PATTERN_IDS["Window"]: pat})
+        r = WindowClient(el, alive=False).close_window(1)
+        assert r.ok is False and pat.calls == []
+
+
+class TestTransformWindow:
+    def _client(self, rect=(0, 0, 100, 50), minimized=False, **pat_kwargs):
+        """`minimized` belongs to the client, everything else to the pattern."""
+        pat = FakeTransformPattern(rect, **pat_kwargs)
+        el = FakeElement("win", pattern_objs={PATTERN_IDS["Transform"]: pat})
+        return WindowClient(el, transform=pat, minimized=minimized), pat
+
+    def test_move_is_confirmed_by_the_rectangle(self):
+        client, pat = self._client()
+        r = client.move_window(1, 200, 300)
+        assert r.ok and r.verified is True
+        assert pat.calls == [("move", 200, 300)]
+        assert pat.rect[:2] == (200, 300)
+
+    def test_move_within_tolerance_is_still_confirmed(self):
+        """Transform positions the bounding rectangle while some window managers
+        place the client area a border width away. Exact equality would report
+        failure for a move that plainly happened."""
+        pat = FakeTransformPattern((0, 0, 100, 50))
+        el = FakeElement("win", pattern_objs={PATTERN_IDS["Transform"]: pat})
+        client = WindowClient(el, transform=pat)
+        # The provider lands three pixels off the request, inside the tolerance.
+        pat.Move = lambda x, y: setattr(pat, "_rect", [x + 3, y - 2, 100, 50])
+        r = client.move_window(1, 200, 300)
+        assert r.ok and r.verified is True
+
+    def test_move_beyond_tolerance_is_not_confirmed(self):
+        pat = FakeTransformPattern((0, 0, 100, 50))
+        el = FakeElement("win", pattern_objs={PATTERN_IDS["Transform"]: pat})
+        client = WindowClient(el, transform=pat)
+        pat.Move = lambda x, y: setattr(pat, "_rect", [x + 400, y, 100, 50])
+        r = client.move_window(1, 200, 300)
+        assert r.ok is False and r.verified is False
+
+    def test_cannot_move_is_refused_not_silently_skipped(self):
+        client, pat = self._client(can_move=False)
+        r = client.move_window(1, 10, 10)
+        assert r.ok is False and pat.calls == []
+        assert "CanMove=0" in r.message
+
+    def test_resize_is_confirmed_by_the_rectangle(self):
+        client, pat = self._client()
+        r = client.resize_window(1, 800, 600)
+        assert r.ok and r.verified is True
+        assert pat.rect[2:] == (800, 600)
+
+    def test_cannot_resize_is_refused(self):
+        client, pat = self._client(can_resize=False)
+        r = client.resize_window(1, 800, 600)
+        assert r.ok is False and pat.calls == []
+        assert "CanResize=0" in r.message
+
+    @pytest.mark.parametrize("w,h", [(0, 100), (100, 0), (-5, 100)])
+    def test_non_positive_size_is_refused(self, w, h):
+        client, pat = self._client()
+        r = client.resize_window(1, w, h)
+        assert r.ok is False and pat.calls == []
+        assert "положительным" in r.message
+
+    def test_minimized_window_refuses_both_transforms(self):
+        """A minimized window's rectangle is the (-32000, -32000) sentinel, so a
+        before/after comparison against it is meaningless rather than merely wrong."""
+        client, pat = self._client(minimized=True)
+        assert client.move_window(1, 10, 10).ok is False
+        assert client.resize_window(1, 10, 10).ok is False
+        assert pat.calls == []
 
 
 class TestReadBack:
