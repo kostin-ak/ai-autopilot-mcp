@@ -753,12 +753,28 @@ class TestSuiteIntegrity:
         assert self._orphans(str(sample)), "the guard missed a nested test function"
 
     def test_every_test_file_is_actually_inspected(self):
-        """Four files ship; a glob that silently matches fewer is a false green."""
-        names = [p.replace("\\", "/").rsplit("/", 1)[-1] for p in self._test_files()]
-        assert set(names) == {
-            "test_ocr_engine.py", "test_phase1.py",
-            "test_phase1_followups.py", "test_uia_client.py",
-        }, names
+        """A glob that silently matches fewer files is a false green.
+
+        Compared against an independently computed listing rather than a hard-coded
+        set of names, so adding a file does not require editing this test -- but a
+        floor is asserted too, and it must be raised deliberately. The floor is what
+        catches a glob that quietly stops matching, which is the failure this exists
+        for; the independent listing is what catches a file added without being
+        inspected.
+        """
+        import glob
+        import os
+
+        expected = {
+            os.path.basename(p)
+            for p in glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            "test_*.py"))
+        }
+        names = {p.replace("\\", "/").rsplit("/", 1)[-1] for p in self._test_files()}
+        assert names == expected, f"inspected {sorted(names)}, found {sorted(expected)}"
+        # Bump this when a test file is added. Deliberate friction: it is the only
+        # thing that notices if both globs above break the same way.
+        assert len(names) >= 5, sorted(names)
 
 
 class TestToolDescriptions:
