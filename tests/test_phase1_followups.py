@@ -152,11 +152,27 @@ class TestEscapeHatch:
     def test_reset_override_is_reachable_during_override(self):
         assert "reset_override" in daemon.NON_INPUT_ACTIONS
 
-    def test_take_control_is_still_gated(self):
-        assert "take_control" not in daemon.NON_INPUT_ACTIONS
+    def test_take_control_is_reachable_during_override(self):
+        """Reverses the earlier decision that gated take_control.
+
+        Gating it turned a pause into a dead end: the agent could observe but never
+        act again without a human telling it to reset. take_control touches no input
+        queue -- it sets state and captures once -- and the human keeps the interrupt,
+        since the next physical movement pauses the agent again immediately. A live
+        run hit exactly this, where one incidental mouse movement blocked a Class B
+        terminal write that never needed the cursor at all.
+        """
+        assert "take_control" in daemon.NON_INPUT_ACTIONS
 
     @pytest.mark.parametrize("action", ["mouse_action", "keyboard_action", "scroll_screen"])
     def test_input_actions_are_gated(self, action):
+        assert action not in daemon.NON_INPUT_ACTIONS
+
+    @pytest.mark.parametrize("action", ["act_on_element", "write_terminal"])
+    def test_class_b_mutations_stay_gated(self, action):
+        """Deliberate: these change application state, and a human who just grabbed
+        the machine may be typing into the same window. They resume through
+        take_control or the idle auto-release, not by weakening this gate."""
         assert action not in daemon.NON_INPUT_ACTIONS
 
     @pytest.mark.parametrize(

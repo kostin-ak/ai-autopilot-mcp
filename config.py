@@ -91,6 +91,23 @@ VK_MENU: int = 0x12  # Alt key
 VK_SPACE: int = 0x20
 
 # ---------------------------------------------------------
+# USER_OVERRIDE auto-release
+# ---------------------------------------------------------
+# Without this, a pause was a dead end in practice: interrupting the agent took one
+# physical mouse movement, but resuming took a conversation turn, because policy
+# forbade calling reset_user_override without explicit human consent. The asymmetry
+# had no safety benefit, since the interrupt trigger stays armed either way -- the
+# human can always retake the machine instantly by touching the mouse.
+#
+# So USER_OVERRIDE is a pause, not a lock. After this many seconds without physical
+# input the daemon returns the session to IDLE on its own and the agent may act again.
+# Set to 0 to keep the old behaviour, where only an explicit reset resumes.
+IDLE_RESUME_SECONDS: float = 5.0
+# How often the daemon checks for idleness. Half a second keeps the resume latency
+# close to the threshold without polling in a tight loop.
+IDLE_RESUME_POLL_SECONDS: float = 0.5
+
+# ---------------------------------------------------------
 # Vision and Screenshot Settings
 # ---------------------------------------------------------
 TARGET_IMAGE_WIDTH: int = 1280

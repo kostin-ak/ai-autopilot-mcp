@@ -112,6 +112,13 @@ if sys.platform == "win32":
     WH_KEYBOARD_LL: int = 13
     WH_MOUSE_LL: int = 14
 
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+    ctypes.windll.user32.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
+    ctypes.windll.user32.GetLastInputInfo.restype = wintypes.BOOL
+    ctypes.windll.kernel32.GetTickCount.restype = wintypes.DWORD
+
     INPUT_MOUSE: int = 0
     INPUT_KEYBOARD: int = 1
 
@@ -177,6 +184,31 @@ if sys.platform == "win32":
     }
 
 
+def seconds_since_physical_input() -> float | None:
+    """Seconds since the session last saw physical input, or None if unavailable.
+
+    Defined outside the win32 block on purpose: placing it inside would end that block
+    early and silently turn every constant below it into a local of this function.
+
+    Counts mouse movement as well as clicks and keys, which is what makes it usable as
+    a stillness test: a person reading the screen without touching anything is idle,
+    while one moving the pointer while thinking is not.
+
+    Injected input also lands in the session queue and would reset this clock, but the
+    only caller is the USER_OVERRIDE release path, where the daemon injects nothing by
+    definition.
+    """
+    if sys.platform != "win32":
+        return None
+    info = LASTINPUTINFO()
+    info.cbSize = ctypes.sizeof(info)
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+        return None
+    now = ctypes.windll.kernel32.GetTickCount()
+    # GetTickCount wraps after about 49.7 days; the unsigned difference survives it.
+    return ((now - info.dwTime) & 0xFFFFFFFF) / 1000.0
+
+
 class InputController:
     """Manages low-level user input hooks, override state, and hardware input injection."""
 
@@ -236,6 +268,40 @@ class InputController:
             self._last_phys_x = None
             self._last_phys_y = None
             self.set_state(AutopilotState.IDLE)
+
+    def maybe_auto_resume(self) -> bool:
+        """Releases USER_OVERRIDE on its own once the human stops touching input.
+
+        Returns True when the state was actually released, so the caller can update
+        the overlay.
+
+        This makes the pause symmetric with the interrupt. Interrupting the agent has
+        always taken a single physical mouse movement; resuming used to take a
+        conversation turn, because policy forbade an unprompted reset_user_override.
+        That asymmetry bought no safety: the interrupt trigger stays armed after an
+        auto-release, so the human retakes the machine instantly by touching the
+        mouse. What it did buy was a stall on every incidental movement.
+
+        Idleness is measured with GetLastInputInfo, which counts any physical input in
+        the session, including mouse movement -- so a human holding a key or moving
+        while reading keeps the pause latched. Only genuine stillness releases it.
+        """
+        if self.state != AutopilotState.USER_OVERRIDE:
+            return False
+        threshold = config.IDLE_RESUME_SECONDS
+        if threshold <= 0:
+            return False
+        idle = seconds_since_physical_input()
+        if idle is None or idle < threshold:
+            return False
+        logger.info(
+            f"USER_OVERRIDE auto-released after {idle:.1f} s without physical input "
+            f"(threshold {threshold:g} s)."
+        )
+        # Delegates so the stale physical position is dropped too: leaving it makes
+        # the next movement compute a huge delta and re-trigger immediately.
+        self.reset_override()
+        return True
 
     @contextlib.contextmanager
     def _injecting(self):

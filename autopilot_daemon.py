@@ -76,6 +76,13 @@ NON_INPUT_ACTIONS: frozenset[str] = frozenset({
     "reset_override",
     "release_control",
     "hud_state",
+    # Re-acquiring control has to be possible from a pause, or the pause is a dead
+    # end: the agent could observe but never act again without a human telling it to
+    # reset. take_control touches no input queue -- it sets state and captures once --
+    # and the human keeps the interrupt, since the next physical movement pauses it
+    # again immediately. The response says control was re-taken, and the HUD changes
+    # colour, so this is visible rather than silent.
+    "take_control",
 })
 
 # Returned verbatim to the model whenever an action is refused because a human
@@ -134,6 +141,37 @@ WINDOW_ACTIONS: dict[str, tuple[Any, tuple[str, ...]]] = {
                ("width", "height")),
 }
 
+
+def pause_message() -> str:
+    """Text handed to the model when an action is refused by an active pause.
+
+    Reads the threshold at call time rather than at import, so the message and the
+    policy cannot disagree: a monkeypatched or reconfigured IDLE_RESUME_SECONDS is
+    reflected in what the agent is told, and a disabled auto-release says so
+    instead of promising a resume that will never come.
+    """
+    head = "PAUSE: Пользователь перехватил управление мышью/клавиатурой. Действие не исполнено. "
+    tail = (
+        " Наблюдательные инструменты доступны и во время паузы. Для немедленного "
+        "возврата управления вызовите take_control или reset_user_override."
+    )
+    if config.IDLE_RESUME_SECONDS > 0:
+        return (
+            head
+            + f"Пауза снимется сама, как только пользователь не будет трогать ввод "
+              f"{config.IDLE_RESUME_SECONDS:g} с подряд: повторите вызов, если задача "
+                "всё ещё актуальна."
+            + " Любое новое физическое движение мыши или нажатие клавиши снова "
+              "приостановит агента."
+            + tail
+        )
+    return (
+        head
+        + "Авто-снятие отключено (IDLE_RESUME_SECONDS=0): управление возвращается "
+          "только через take_control, reset_user_override или Ctrl+Alt+Space "
+          "со стороны пользователя."
+        + tail
+    )
 
 
 class AutopilotDaemon:
@@ -351,10 +389,7 @@ class AutopilotDaemon:
             return {
                 "status": "interrupted",
                 "state": current_state.value,
-                "message": (
-                    "PAUSE: Пользователь перехватил управление мышью/клавиатурой. "
-                    "Спроси у пользователя в чате разрешения продолжить или уточни дальнейшие действия."
-                ),
+                "message": pause_message(),
             }
 
         try:
@@ -409,10 +444,7 @@ class AutopilotDaemon:
             return {
                 "status": "interrupted",
                 "state": AutopilotState.USER_OVERRIDE.value,
-                "message": (
-                    "PAUSE: Пользователь перехватил управление мышью/клавиатурой. "
-                    "Спроси у пользователя в чате разрешения продолжить или уточни дальнейшие действия."
-                ),
+                "message": pause_message(),
             }
         except ScreenCaptureError as exc:
             return {"status": "error", "message": str(exc)}
@@ -420,11 +452,47 @@ class AutopilotDaemon:
             logger.error(f"Error while dispatching action {action}: {exc}", exc_info=True)
             return {"status": "error", "message": str(exc)}
 
+    async def idle_resume_loop(self) -> None:
+        """Polls for user stillness and releases USER_OVERRIDE on its own.
+
+        Runs for the daemon's lifetime. The check is cheap -- one GetLastInputInfo
+        call -- and only acts while paused, so the steady-state cost is a timer tick
+        every half second.
+
+        Released here rather than inside the hook callback, because the hook only
+        fires on input: a human who stops touching the machine produces no event at
+        all, so nothing inside the hook could ever notice the stillness.
+        """
+        if config.IDLE_RESUME_SECONDS <= 0:
+            logger.info("USER_OVERRIDE auto-release disabled (IDLE_RESUME_SECONDS=0); "
+                        "only an explicit reset or Ctrl+Alt+Space resumes.")
+            return
+        logger.info(
+            f"USER_OVERRIDE auto-release armed at {config.IDLE_RESUME_SECONDS:g} s "
+            f"of user inactivity (poll every {config.IDLE_RESUME_POLL_SECONDS:g} s)."
+        )
+        while True:
+            await asyncio.sleep(config.IDLE_RESUME_POLL_SECONDS)
+            try:
+                # No manual overlay or tray update here: set_state invokes the
+                # _on_input_state_changed callback, which already synchronizes both.
+                await asyncio.to_thread(self.input_ctrl.maybe_auto_resume)
+            except Exception as exc:  # a failed poll must not kill the loop
+                logger.debug(f"idle-resume poll failed: {exc}")
+                continue
+
     async def _action_take_control(self, params: dict[str, Any]) -> dict[str, Any]:
         """Locks session control to AI, activates persistent HUD neon frame, and returns initial screenshot."""
         mon_idx = params.get("monitor_index")
         show_grid = params.get("show_grid", False)
+        # Record whether this re-acquires control from a pause, so the response says
+        # so. Taking control back after a human intervened is visible by design --
+        # the HUD changes colour and the caller is told -- rather than happening
+        # silently under an ordinary "control acquired" message.
+        was_paused = self.input_ctrl.state == AutopilotState.USER_OVERRIDE
         self._update_overlay_target(mon_idx)
+        # set_state drives the overlay and tray through _on_input_state_changed, so
+        # no separate emit is needed here.
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
 
         cursor_abs = self.input_ctrl.get_cursor_pos()
@@ -449,7 +517,15 @@ class AutopilotDaemon:
                 "scale_y": sy,
                 "cursor": cursor_frame,
                 "cursor_desktop": list(cursor_abs),
-                "message": f"Управление захвачено. Рамка HUD активна на мониторе {mon.index} ('{mon.name}').",
+                "message": (
+                    "Управление возвращено агенту после перехвата пользователем. "
+                    f"Рамка HUD снова активна на мониторе {mon.index} ('{mon.name}'). "
+                    "Любое физическое движение мыши или нажатие клавиши снова "
+                    "приостановит агента."
+                    if was_paused else
+                    f"Управление захвачено. Рамка HUD активна на мониторе "
+                    f"{mon.index} ('{mon.name}')."
+                ),
             },
         }
 
@@ -1541,6 +1617,7 @@ def main() -> None:
         await server.wait_closed()
 
     loop.create_task(run_server())
+    loop.create_task(daemon.idle_resume_loop())
 
     try:
         loop.run_forever()
