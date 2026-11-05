@@ -29,6 +29,7 @@ import event_waiter
 import host_guard
 import risk
 import session_state
+import single_instance
 from config import AutopilotState
 from input_controller import (
     MOUSE_SUB_ACTIONS,
@@ -2446,8 +2447,25 @@ class AutopilotDaemon:
         self.app.quit()
 
 
-def main() -> None:
+def main() -> int:
     import concurrent.futures
+
+    # Acquired before QApplication, before the HUD overlay and before any hook is
+    # installed. Checking afterwards would mean two processes briefly both owned a HUD
+    # frame and a set of low-level input hooks, which is the exact state the guard
+    # exists to prevent.
+    guard = single_instance.InstanceGuard(config.INSTANCE_MUTEX_NAME)
+    if not guard.acquire():
+        print(
+            "Демон Desktop Autopilot уже запущен.\n"
+            f"  мьютекс: {config.INSTANCE_MUTEX_NAME}\n"
+            "  порт:   ws://{}:{}".format(config.WS_HOST, config.WS_PORT),
+            file=sys.stderr,
+        )
+        logger.error("another instance holds %s; refusing to start a second set of "
+                     "input hooks", config.INSTANCE_MUTEX_NAME)
+        return config.EXIT_ALREADY_RUNNING
+
     config.ensure_interactive_desktop()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -2476,8 +2494,13 @@ def main() -> None:
         loop.run_forever()
     finally:
         daemon.shutdown()
+        # Not strictly required -- the kernel closes the handle on exit, which is why a
+        # crash leaves nothing behind -- but releasing here makes the intent explicit and
+        # keeps the guard testable in-process.
+        guard.release()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 

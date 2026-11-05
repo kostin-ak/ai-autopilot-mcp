@@ -24,6 +24,15 @@ class RGBAColor(NamedTuple):
 # ---------------------------------------------------------
 WS_HOST: str = "127.0.0.1"
 WS_PORT: int = 8765
+
+# Named mutex for the single-instance guard. The "Local\" prefix scopes it to the
+# terminal-server session rather than the whole machine, which is what a desktop
+# automation daemon wants: two users in separate sessions are not two instances
+# fighting over one cursor, and "Global\" would wrongly refuse the second of them.
+INSTANCE_MUTEX_NAME: str = r"Local\ai_autopilot_daemon"
+# Exit code when another instance already holds it. Distinct from a crash so a launcher
+# script can tell "already running" from "failed to start".
+EXIT_ALREADY_RUNNING: int = 3
 TOKEN_FILE_PATH: Path = Path(__file__).resolve().parent / ".autopilot_token"
 WS_HEARTBEAT_INTERVAL: float = 20.0
 WS_OPEN_TIMEOUT: float = 5.0
