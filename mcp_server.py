@@ -1517,5 +1517,114 @@ async def wait_for_event(
     return "\n".join(lines)
 
 
+@mcp.tool()
+async def execute_batch(
+    steps: list[dict],
+    hwnd: int | None = None,
+    window_title: str | None = None,
+    class_name: str | None = None,
+    stop_on: Literal["failure", "high_risk", "both"] = "both",
+    observe_at_end: bool = True,
+    monitor_index: int | None = None,
+) -> list[ContentBlock]:
+    """
+    Runs a sequence of Class B steps in one call and returns one observation at the end.
+
+    Each step is an act_on_element or window_action verb, addressed by `path` against the
+    window the batch resolved. One frame for the whole batch instead of one per step is
+    the point: eight steps cost one capture, not eight.
+
+    Only Class B steps are accepted. Class A steps (mouse_action, keyboard_action,
+    scroll_screen) are refused rather than run one at a time, because batching them
+    properly needs a single input-channel acquisition for the whole batch, and that
+    mechanism is unavailable from a non-elevated process. Running them per step inside
+    something called a batch would be slower than calling them directly and would claim
+    an atomicity it does not have.
+
+    `stop_on` decides where the batch stops:
+      'failure'   -- a step that did not verify
+      'high_risk' -- a step classified as not batchable, stopped BEFORE it runs
+      'both'      -- either (default)
+
+    There is no 'never'. It would execute an irreversible step inside a batch with no
+    chance to stop, which is the one thing the risk classification exists to prevent.
+
+    A pre-flight check on a step reads the real target state before the step runs and
+    compares it with what was declared:
+
+        {"action": "invoke", "path": "3.1",
+         "assert": {"path": "0.5", "name_contains": "Alice"}}
+
+    A mismatch aborts the batch and returns both the declared and the actual value, so a
+    stale path is distinguishable from a genuinely wrong recipient.
+
+    Steps run through the same code path as single actions, so every step gets the same
+    host-process guard, the same risk level and the same dry_run classification. The
+    result reports the level each step resolved to, which is how a mis-bind becomes
+    visible: a path that landed on Send instead of Cancel is reported as irreversible.
+
+    Args:
+        steps: Ordered list of steps. Each has `kind` ('element' or 'window'), the verb
+            in `action`, a `path`, and any verb arguments (`text`, `value`, `x`, `y`).
+        hwnd: Window the batch acts on. Takes priority over a title search.
+        window_title: Substring of the window title.
+        class_name: Win32 window class, narrows a title search.
+        stop_on: Where to stop. Default 'both'.
+        observe_at_end: Capture one frame after the batch (default True).
+        monitor_index: Which monitor the final frame comes from.
+    """
+    resp = await _send_daemon_request(
+        "execute_batch",
+        {
+            "steps": steps, "hwnd": hwnd, "window_title": window_title,
+            "class_name": class_name, "stop_on": stop_on,
+            "observe_at_end": observe_at_end, "monitor_index": monitor_index,
+        },
+    )
+    if resp.get("status") != "ok":
+        return [_text(f"ОШИБКА: {resp.get('message', 'Неизвестная ошибка')}")]
+
+    d = resp.get("data", {})
+    blocks: list[ContentBlock] = []
+    shot = d.get("screenshot")
+    if shot:
+        blocks.append(ImageContent(type="image", data=shot, mime_type="image/webp"))
+
+    lines = [d.get("message", ""),
+             f"  исполнено {d.get('executed')} из {d.get('steps_total')}, "
+             f"подтверждено {d.get('succeeded')}, "
+             f"цель: handle={d.get('handle')} ({d.get('resolution')})"]
+    if d.get("stabilization"):
+        lines.append(f"  стабилизация: {d.get('stabilization')} "
+                     f"за {d.get('stabilization_ms')} мс")
+    if d.get("observation_error"):
+        lines.append(f"  ВНИМАНИЕ: кадр после пакета не получен: "
+                     f"{d.get('observation_error')}")
+
+    for r in d.get("results", []):
+        mark = {"ok": "+", "stopped_before": "!", "refused": "X",
+                "preflight_mismatch": "?"}.get(r.get("status"),
+                                              "-" if r.get("ok") else "x")
+        if r.get("status") == "ok":
+            mark = "+" if r.get("verified") else ("=" if r.get("verified") is None
+                                                   else "x")
+        detail = f"{r.get('index')}. [{mark}] {r.get('action')} -> {r.get('path')}"
+        if r.get("resolved_name"):
+            detail += f"  ({r.get('resolved_name')!r})"
+        if r.get("risk_level"):
+            detail += f"  риск={r.get('risk_level')}"
+        lines.append(f"  {detail}")
+        if r.get("message") and r.get("status") != "ok":
+            lines.append(f"      {r.get('message')}")
+        if r.get("actual") is not None or r.get("expected_contains") is not None:
+            lines.append(f"      объявлено: {r.get('expected_equals') or r.get('expected_contains')!r}"
+                         f"  прочитано: {r.get('actual')!r}")
+
+    if d.get("stop_reason"):
+        lines.append(f"  причина остановки: {d.get('stop_reason')}")
+    blocks.append(_text("\n".join(lines)))
+    return blocks
+
+
 if __name__ == "__main__":
     main()

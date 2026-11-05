@@ -567,6 +567,14 @@ class EventWatcher:
         newest_tick = since_tick
         cursor = self._appended  # entries at or before this have been scanned
         while True:
+            # Sampled BEFORE the scan, not after. Sampling afterwards would let an event
+            # that arrives during the scan go uncounted this pass while "now" has already
+            # moved past it, overstating how quiet the stream is. Sampling first makes the
+            # error conservative: such an event carries a tick at or after the sample, so
+            # it is picked up on the next pass and pushes the quiet window back out. A
+            # wait that occasionally takes one extra 20 ms pass is fine; one that reports
+            # a settled interface while it is still changing is not.
+            now_tick = tick_now()
             # Only entries appended since the last pass. Rescanning the whole buffer
             # would multiply `seen` by the number of polls, and that count is what a
             # caller reads to tell "the UI kept changing" from "it changed once".
@@ -586,7 +594,7 @@ class EventWatcher:
                 seen += 1
                 if ticks_between(newest_tick, rec.tick) > 0:
                     newest_tick = rec.tick
-            quiet_for = ticks_between(newest_tick, tick_now())
+            quiet_for = ticks_between(newest_tick, now_tick)
             if quiet_for >= quiet_ms:
                 self.stats.matches += 1
                 return WaitResult(True, None, (time.monotonic() - started) * 1000.0,

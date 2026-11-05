@@ -185,6 +185,14 @@ class TestWaitForQuiescence:
         assert r.quiescent_ms is not None and r.quiescent_ms < 300
 
     def test_it_settles_once_the_stream_stops(self):
+        """Anchored at "now", not in the past.
+
+        The first version anchored 100 ms back with quiet_ms=120, which left the window
+        100 ms satisfied on entry: the wait needed only 20 more ms and could return
+        before the churn thread had been scheduled once, failing the assertion that it
+        had seen events. It passed in isolation and failed under full-suite load, which
+        is what a test that does not measure its own premise looks like.
+        """
         w = make_watcher()
         stop = threading.Event()
 
@@ -196,12 +204,15 @@ class TestWaitForQuiescence:
 
         t = threading.Thread(target=churn, daemon=True)
         t.start()
-        r = w.wait_for_quiescence(since_tick=ew.tick_now() - 100, quiet_ms=120,
-                                  timeout_s=3.0)
+        # Give the churn thread a chance to be scheduled before anchoring, so the
+        # assertion below is about the wait's behaviour rather than about scheduling.
+        time.sleep(0.05)
+        r = w.wait_for_quiescence(since_tick=ew.tick_now(), quiet_ms=120, timeout_s=3.0)
         stop.set()
         t.join(timeout=2.0)
         assert r.ok, r.error
         assert r.waited_events > 0
+        assert r.elapsed_ms >= 110, f"returned before the quiet window: {r.elapsed_ms}"
 
     def test_stale_events_do_not_hold_the_window_open(self):
         """A backlog must not look like an unsettled UI."""

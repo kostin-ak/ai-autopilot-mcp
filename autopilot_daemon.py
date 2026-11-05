@@ -155,6 +155,26 @@ WINDOW_ACTIONS: dict[str, tuple[Any, tuple[str, ...]]] = {
     "activate": (lambda uia, h, _pr: uia.activate_window(h), ()),
 }
 
+# Batch step kinds. Only Class B verbs are batchable.
+#
+# Class A steps need one input-channel acquisition for the whole batch rather than one
+# per step (PLAN 4.1), and that transaction rests on the input-channel policy, which
+# rests on BlockInput. S9 measured BlockInput as unavailable from a non-elevated
+# process, so there is no transaction to build. Batching Class A steps without it would
+# mean re-acquiring the cursor per step, which is exactly what batching exists to avoid,
+# while still calling it a batch.
+BATCH_STEP_KINDS: frozenset[str] = frozenset({"element", "window"})
+
+# When a batch stops.
+#   failure    -- a step did not verify
+#   high_risk  -- a step classified as not batchable, stopped BEFORE it runs
+#   both       -- either (default)
+# "never" is deliberately absent: it would execute an irreversible step inside a batch
+# with no chance to stop, which is the one thing the risk table exists to prevent.
+BATCH_STOP_MODES: frozenset[str] = frozenset({"failure", "high_risk", "both"})
+
+MAX_BATCH_STEPS = 64
+
 
 def pause_message() -> str:
     """Text handed to the model when an action is refused by an active pause.
@@ -573,6 +593,255 @@ class AutopilotDaemon:
         # treat an ordinary "nothing happened" as a broken tool.
         return {"status": "ok", "data": data}
 
+    # ------------------------------------------------------------- batching
+    async def _action_execute_batch(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Runs a sequence of Class B steps and returns one observation at the end.
+
+        Steps go through `_action_element_action` and `_action_window_action` rather than
+        through the verb tables directly, so every step gets the same host guard, the
+        same risk classification and the same dry_run path a single action would. A
+        batch that re-implemented any of those would be a second, weaker copy of the
+        safety layer, and the gap between the two is where the harm in ADR-0004 lives.
+
+        Classification happens *before* execution when the stop mode allows stopping on
+        risk. That costs a second path walk per step, which is why it is skipped when
+        the caller only asked to stop on failure: reading the level off the result is
+        free, but by then the step has already run.
+
+        Returns the full state either way -- which steps ran, which stopped the batch,
+        what each element resolved to -- because a batch that only reports the failure
+        leaves the caller unable to tell how far it got.
+        """
+        steps = params.get("steps")
+        if not isinstance(steps, list) or not steps:
+            return {"status": "error",
+                    "message": "Пустой или некорректный steps: нужен непустой список."}
+        if len(steps) > MAX_BATCH_STEPS:
+            return {
+                "status": "error",
+                "message": (f"Пакет из {len(steps)} шагов превышает предел "
+                            f"{MAX_BATCH_STEPS}. Разбейте на несколько вызовов."),
+            }
+        stop_on = str(params.get("stop_on") or "both")
+        if stop_on not in BATCH_STOP_MODES:
+            return {
+                "status": "error",
+                "message": (f"Неизвестный stop_on {stop_on!r}. Допустимо: "
+                            f"{', '.join(sorted(BATCH_STOP_MODES))}. Значения 'never' "
+                            f"нет намеренно: оно исполнило бы необратимый шаг внутри "
+                            f"пакета без возможности остановиться."),
+            }
+
+        handle, how = await self._resolve_target(params)
+        if handle is None:
+            return {"status": "error", "message": how}
+
+        stop_on_failure = stop_on in ("failure", "both")
+        stop_on_risk = stop_on in ("high_risk", "both")
+        # Tick before the first step, so the single observation at the end stabilises
+        # against changes the batch caused rather than against whatever was already
+        # happening when the frame was captured.
+        since_tick = event_waiter.tick_now()
+
+        results: list[dict[str, Any]] = []
+        stopped_at: int | None = None
+        stop_reason = ""
+        # Counted separately from len(results): a step that ran and failed to verify is
+        # still a step that ran, and a step stopped before execution is not. One counter
+        # for both would make "executed" ambiguous in exactly the case the caller needs
+        # to reason about -- how much of the batch actually happened.
+        dispatched = 0
+        succeeded = 0
+
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                stopped_at, stop_reason = index, f"шаг {index} не является объектом"
+                break
+            kind = str(step.get("kind") or "element")
+            if kind not in BATCH_STEP_KINDS:
+                stopped_at = index
+                stop_reason = (
+                    f"шаг {index}: kind {kind!r} не пакетируется. Допустимо "
+                    f"{', '.join(sorted(BATCH_STEP_KINDS))}. Действия Класса A "
+                    f"(mouse_action, keyboard_action, scroll_screen) требуют одной "
+                    f"транзакции захвата канала ввода на пакет, а она опирается на "
+                    f"BlockInput, который по замеру S9 недоступен из неповышенного "
+                    f"процесса.")
+                break
+
+            # --- pre-flight assertion (PLAN 4.2)
+            check = step.get("assert")
+            if check is not None:
+                bad = await self._batch_preflight(handle, check, index)
+                if bad is not None:
+                    results.append(bad)
+                    stopped_at = index
+                    stop_reason = (f"шаг {index}: предполётная проверка не совпала с "
+                                   f"объявленным; пакет прерван до исполнения")
+                    break
+
+            base = {"hwnd": handle, "window_title": None, "class_name": None,
+                    "allow_host_input": bool(step.get("allow_host_input", False))}
+
+            # --- classify before executing, but only when it can still stop the batch
+            level = None
+            if stop_on_risk:
+                dry = await self._run_batch_step(kind, step, base, dry_run=True)
+                level = dry.get("_risk")
+                if dry.get("status") == "refused":
+                    results.append({"index": index, "kind": kind, "status": "refused",
+                                    "message": dry.get("message", "")})
+                    stopped_at = index
+                    stop_reason = f"шаг {index}: отказ слоя безопасности"
+                    break
+                if level is not None and not level.batchable:
+                    results.append({
+                        "index": index, "kind": kind, "status": "stopped_before",
+                        "risk_level": level.level, "risk_reason": level.reason,
+                        "resolved_name": (dry.get("data") or {}).get("resolved_name", ""),
+                        "message": (f"шаг не исполнен: уровень {level.level} "
+                                    f"({level.reason}) не пакетируется"),
+                    })
+                    stopped_at = index
+                    stop_reason = (f"шаг {index}: уровень риска {level.level} "
+                                   f"остановил пакет до исполнения")
+                    break
+
+            res = await self._run_batch_step(kind, step, base, dry_run=False)
+            dispatched += 1
+            if level is None:
+                level = res.pop("_risk", None)
+            data = res.get("data") or {}
+            ok = bool(data.get("ok"))
+            verified = data.get("verified")
+            entry = {
+                "index": index, "kind": kind,
+                "action": data.get("action") or step.get("action"),
+                "path": data.get("path") or step.get("path"),
+                "status": res.get("status"),
+                "ok": ok,
+                "verified": verified,
+                "risk_level": getattr(level, "level", ""),
+                "resolved_name": data.get("resolved_name", ""),
+                "message": res.get("message") or data.get("message", ""),
+            }
+            if res.get("status") == "refused":
+                entry["status"] = "refused"
+                entry["guard"] = res.get("guard", "")
+            results.append(entry)
+            if ok and verified is not False and res.get("status") != "refused":
+                succeeded += 1
+
+            if res.get("status") == "refused":
+                stopped_at = index
+                stop_reason = f"шаг {index}: отказ слоя безопасности"
+                break
+            if stop_on_failure and (not ok or verified is False):
+                stopped_at = index
+                stop_reason = (f"шаг {index} не подтверждён"
+                               if verified is False else
+                               f"шаг {index} не выполнен")
+                break
+
+        out: dict[str, Any] = {
+            "status": "ok",
+            "data": {
+                "steps_total": len(steps),
+                "steps_reported": len(results),
+                "executed": dispatched,
+                "succeeded": succeeded,
+                "stopped_at": stopped_at,
+                "stop_reason": stop_reason,
+                "complete": stopped_at is None,
+                "handle": handle,
+                "resolution": how,
+                "stop_on": stop_on,
+                "results": results,
+                "message": (
+                    f"Пакет исполнен полностью: {dispatched} из {len(steps)} шагов, "
+                    f"подтверждено {succeeded}."
+                    if stopped_at is None else
+                    f"Пакет остановлен на шаге {stopped_at} из {len(steps)}: "
+                    f"{stop_reason}. Исполнено {dispatched}, подтверждено {succeeded}."),
+            },
+        }
+        if params.get("observe_at_end", True):
+            frame = await self._batch_observation(params, since_tick)
+            out["data"].update(frame)
+        return out
+
+    async def _run_batch_step(self, kind: str, step: dict[str, Any],
+                              base: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+        """Dispatches one step through the same handler a single action would use."""
+        payload = {**base, **{k: v for k, v in step.items()
+                              if k not in ("kind", "assert")}, "dry_run": dry_run}
+        if kind == "window":
+            return await self._action_window_action(payload)
+        return await self._action_element_action(payload)
+
+    async def _batch_preflight(self, handle: int, check: Any,
+                               index: int) -> dict[str, Any] | None:
+        """Reads the actual target state and compares it with what was declared.
+
+        Returns a result entry when the check fails, None when it passes. Both the
+        declared and the actual value come back, because "the assertion failed" without
+        the two strings leaves the caller unable to tell a stale path from a genuinely
+        wrong recipient -- and those need opposite responses.
+        """
+        if not isinstance(check, dict):
+            return {"index": index, "status": "preflight_error", "ok": False,
+                    "message": "assert должен быть объектом с path и ожиданием"}
+        path = check.get("path")
+        if not path:
+            return {"index": index, "status": "preflight_error", "ok": False,
+                    "message": "assert.path обязателен: сверять нечего без адреса"}
+        identity = await asyncio.to_thread(self.uia.node_identity, handle, str(path))
+        actual = str((identity or {}).get("name", ""))
+        role = str((identity or {}).get("role", ""))
+        expected = check.get("name_contains")
+        want_exact = check.get("name_equals")
+        want_role = check.get("role")
+        failures = []
+        if expected is not None and str(expected).lower() not in actual.lower():
+            failures.append(f"имя не содержит {expected!r}")
+        if want_exact is not None and actual != str(want_exact):
+            failures.append(f"имя не равно {want_exact!r}")
+        if want_role and str(want_role).lower() not in role.lower():
+            failures.append(f"роль не содержит {want_role!r}")
+        if not failures:
+            return None
+        return {
+            "index": index, "status": "preflight_mismatch", "ok": False, "verified": False,
+            "path": str(path), "actual": actual,
+            "expected_contains": expected, "expected_equals": want_exact,
+            "role": role,
+            "message": (f"Предполётная проверка: {'; '.join(failures)}. "
+                        f"Прочитано имя {actual!r}, роль {role or '?'}. Шаг не исполнен."),
+        }
+
+    async def _batch_observation(self, params: dict[str, Any],
+                                 since_tick: int) -> dict[str, Any]:
+        """One frame for the whole batch, not one per step."""
+        try:
+            cursor_abs = self.input_ctrl.get_cursor_pos()
+            encoded, w, h, sx, sy, mon = await asyncio.to_thread(
+                self.vision.capture_screen,
+                monitor_index=params.get("monitor_index"),
+                cursor_pos=cursor_abs,
+                wait_stabilization=True,
+                since_tick=since_tick,
+            )
+            return {"screenshot": encoded, "scaled_width": w, "scaled_height": h,
+                    "scale_x": sx, "scale_y": sy,
+                    "stabilization": self.vision.last_stabilization,
+                    "stabilization_ms": round(self.vision.last_stabilization_ms, 1)}
+        except Exception as exc:
+            # A failed observation must not erase the record of what the batch did. The
+            # steps already ran; losing their outcomes would be worse than losing a
+            # frame, and the caller can re-observe.
+            logger.warning("batch observation failed: %s", exc)
+            return {"screenshot": None, "observation_error": str(exc)}
+
     # ------------------------------------------------------ safety layer
     # ADR-0004. Three things that must happen around every mutating action:
     # refuse input into the host's own process tree, classify the resolved target
@@ -754,6 +1023,11 @@ class AutopilotDaemon:
                 return await self._action_wait_for_text(params)
             elif action == "wait_for_event":
                 return await self._action_wait_for_event(params)
+            elif action == "execute_batch":
+                # Mutates application state, so it is deliberately absent from
+                # NON_INPUT_ACTIONS: it takes the input lock and stays blocked during
+                # USER_OVERRIDE, exactly like the single-step verbs it batches.
+                return await self._action_execute_batch(params)
             elif action == "hud_state":
                 return await self._action_hud_state()
             elif action == "reset_override":
