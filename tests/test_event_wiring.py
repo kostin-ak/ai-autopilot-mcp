@@ -269,6 +269,59 @@ class TestStabilisationSelection:
         assert v.last_stabilization == "frames"
 
 
+class TestChangeSignal:
+    """PLAN 3.6: the perceptual difference was already computed on every stabilisation
+    pass and then thrown away. Publishing it is the cheapest available evidence about
+    whether an action landed."""
+
+    def test_the_event_path_reports_a_count_and_no_diff(self):
+        """The two paths report differently and both say which they are. Publishing one
+        shape with the other's field silently null would hide which measurement the
+        caller is looking at."""
+        monkey_v = VisionEngine(quiescence=lambda *a: FakeWaitResult(waited_events=4))
+        monkey_v._capture_stabilized_frame(FakeSct(), BBOX, since_tick=1)
+        sig = {
+            "changed": monkey_v.last_changed,
+            "source": monkey_v.last_change_source,
+            "diff": monkey_v.last_diff,
+            "events": monkey_v.last_events_seen,
+        }
+        assert sig == {"changed": True, "source": "events", "diff": None, "events": 4}
+
+    def test_no_events_means_not_changed(self):
+        v = VisionEngine(quiescence=lambda *a: FakeWaitResult(waited_events=0))
+        v._capture_stabilized_frame(FakeSct(), BBOX, since_tick=1)
+        assert v.last_changed is False
+        assert v.last_events_seen == 0
+
+    def test_the_frame_path_reports_a_difference(self, monkeypatch):
+        monkeypatch.setattr(config, "STABILIZATION_MODE", "frames")
+        v = VisionEngine()
+        v._capture_stabilized_frame(FakeSct(), BBOX, since_tick=1)
+        assert v.last_change_source == "frames"
+        assert v.last_events_seen is None
+        assert v.last_diff is not None
+        assert v.last_changed is not None
+
+    def test_a_missing_engine_does_not_break_the_response(self):
+        """The action already happened and its own result is the important part; losing
+        a diagnostic to an AttributeError would be the worse failure."""
+        d = AutopilotDaemon.__new__(AutopilotDaemon)
+        sig = d._change_signal()
+        assert sig["source"] == "unavailable"
+        assert sig["changed"] is None
+
+    def test_the_signal_is_attached_to_actions_that_captured_a_frame(self):
+        from autopilot_daemon import FRAME_CHANGE_ACTIONS
+
+        assert {"mouse_action", "keyboard_action", "scroll_screen"} <= set(
+            FRAME_CHANGE_ACTIONS)
+        # Pure observations already return a frame as their whole answer; annotating
+        # them would suggest the frame was the result of a change.
+        assert "get_snapshot" not in FRAME_CHANGE_ACTIONS
+        assert "read_terminal" not in FRAME_CHANGE_ACTIONS
+
+
 class TestDaemonQuiescenceBridge:
     def test_disabled_watcher_returns_none(self, monkeypatch):
         monkeypatch.setattr(config, "EVENT_WATCHER_ENABLED", False)

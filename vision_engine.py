@@ -204,6 +204,16 @@ class VisionEngine:
         # the two have very different cost and very different failure modes.
         self.last_stabilization: str = "none"
         self.last_stabilization_ms: float = 0.0
+        # PLAN 3.6: whether the screen changed, and by how much. The perceptual
+        # difference was already computed on every stabilisation pass and then thrown
+        # away, so the cheapest possible evidence about an action is available for free.
+        # For the model it is the difference between "I clicked and something happened"
+        # and "I clicked and the pixels are identical", which is what a dead click
+        # looks like.
+        self.last_changed: bool | None = None
+        self.last_diff: float | None = None
+        self.last_events_seen: int | None = None
+        self.last_change_source: str = ""
 
     def list_monitors(self) -> list[MonitorInfo]:
         """Enumerates connected monitors through mss and platform metrics."""
@@ -414,6 +424,14 @@ class VisionEngine:
                 if res is not None and not getattr(res, "error", ""):
                     self.last_stabilization = "events"
                     self.last_stabilization_ms = waited
+                    # The event count IS the change signal on this path, and it is
+                    # cheaper than a pixel diff: no second capture, no downscale, no
+                    # array arithmetic. It also reports changes a diff cannot see.
+                    seen = int(getattr(res, "waited_events", 0) or 0)
+                    self.last_events_seen = seen
+                    self.last_changed = seen > 0
+                    self.last_diff = None
+                    self.last_change_source = "events"
                     raw = sct.grab(bbox)
                     return Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
                 logger.debug("event stabilisation unavailable (%s); falling back to "
@@ -442,6 +460,7 @@ class VisionEngine:
 
         prev_thumb: np.ndarray | None = None
         final_image: Image.Image | None = None
+        max_diff: float | None = None
 
         for _iteration in range(config.STABILIZATION_MAX_ITERATIONS):
             raw = sct.grab(bbox)
@@ -456,14 +475,32 @@ class VisionEngine:
 
             if prev_thumb is not None:
                 diff = float(np.mean(np.abs(curr_thumb - prev_thumb)))
+                max_diff = diff if max_diff is None else max(max_diff, diff)
                 if diff < config.STABILIZATION_DIFF_THRESHOLD:
+                    self._record_frame_change(max_diff)
                     return current_image
 
             prev_thumb = curr_thumb
             final_image = current_image
             time.sleep(config.STABILIZATION_INTERVAL_SEC)
 
+        self._record_frame_change(max_diff)
         return final_image or Image.new("RGB", (bbox["width"], bbox["height"]))
+
+    def _record_frame_change(self, max_diff: float | None) -> None:
+        """Publishes the difference that stabilisation already computed.
+
+        ``changed`` means "some pair of consecutive frames differed by at least the
+        perceptual threshold", not "the screen differs from before the action". The
+        first frame is taken one polling interval after the action, so a change that
+        completed inside that interval is invisible here -- a limitation of frame
+        differencing that the event path does not have, and one reason to prefer it.
+        """
+        self.last_diff = None if max_diff is None else round(max_diff, 4)
+        self.last_changed = None if max_diff is None else (
+            max_diff >= config.STABILIZATION_DIFF_THRESHOLD)
+        self.last_events_seen = None
+        self.last_change_source = "frames"
 
     def _draw_cursor_pointer(self, image: Image.Image, x: int, y: int) -> None:
         """Draws an unmistakable high-contrast pointer arrow directly on the scaled image."""

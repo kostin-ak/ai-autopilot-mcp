@@ -67,6 +67,13 @@ logger = logging.getLogger("AutopilotDaemon")
 # USER_OVERRIDE was a dead end: the override gate stopped the only action that
 # clears the HUD frame, so a pause left the neon border lit with no way out
 # except reset_override or killing the daemon.
+# Actions that capture a frame in order to report on what they did. Each of them gets a
+# screen_change block saying whether the screen actually moved, which is the cheapest
+# available evidence about whether an action landed at all.
+FRAME_CHANGE_ACTIONS: frozenset[str] = frozenset({
+    "mouse_action", "keyboard_action", "scroll_screen", "take_control",
+})
+
 NON_INPUT_ACTIONS: frozenset[str] = frozenset({
     "get_screen_state",
     "list_windows_and_monitors",
@@ -419,12 +426,45 @@ class AutopilotDaemon:
             async with self._input_lock:
                 resp = await self._dispatch(action, params)
         level = resp.pop("_risk", None) if isinstance(resp, dict) else None
+        # PLAN 3.6: whether the screen changed, attached to every action that captured a
+        # frame in order to report on one. Added here rather than in three response
+        # builders so the three cannot drift apart, which is how a field ends up present
+        # in one action's answer and missing from the other two.
+        if action in FRAME_CHANGE_ACTIONS and isinstance(resp, dict) \
+                and resp.get("status") == "ok":
+            resp.setdefault("data", {})["screen_change"] = self._change_signal()
         resp = self._annotate_session(resp)
         try:
             self._record_trace(action, params, resp, time.monotonic() - started, level)
         except Exception as exc:  # pragma: no cover - tracing must never break an action
             logger.debug("trace record failed: %s", exc)
         return resp
+
+    def _change_signal(self) -> dict[str, Any]:
+        """Whether the screen changed, from whichever stabilisation path ran.
+
+        The two paths report differently and both are honest about it. The event path
+        counts content changes and has no pixel figure; the frame path has a perceptual
+        difference and no event count. Publishing one shape with the other's field
+        silently null would hide which measurement the caller is actually looking at.
+
+        ``changed=None`` means the screen was not compared at all, which is a different
+        claim from ``changed=False``.
+        """
+        v = getattr(self, "vision", None)
+        if v is None:
+            # A missing field must not break the response it decorates. The action
+            # already happened and its own result is the important part; losing a
+            # diagnostic to an AttributeError would be the worse failure.
+            return {"changed": None, "source": "unavailable", "diff": None,
+                    "events": None, "stabilization_ms": 0.0}
+        return {
+            "changed": v.last_changed,
+            "source": v.last_change_source or v.last_stabilization,
+            "diff": v.last_diff,
+            "events": v.last_events_seen,
+            "stabilization_ms": round(v.last_stabilization_ms, 1),
+        }
 
     @staticmethod
     def _annotate_session(resp: dict[str, Any]) -> dict[str, Any]:
