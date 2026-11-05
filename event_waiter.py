@@ -119,6 +119,38 @@ INGEST_EVENTS: frozenset[int] = frozenset().union(*CONDITIONS.values()) | {
 DEFAULT_EVENT_MIN = min(INGEST_EVENTS)
 DEFAULT_EVENT_MAX = max(INGEST_EVENTS)
 
+# Events that mean "the interface changed", for quiescence only.
+#
+# LOCATIONCHANGE is deliberately excluded, and the exclusion is measured rather than
+# aesthetic: it fires on essentially every pointer move over a new element, so a
+# quiescence criterion that counts it never sees silence on a live desktop. Sweep of
+# quiet windows against a working desktop, 2026-11-05:
+#
+#   quiet_ms   stabilisation time, all ingested events counted
+#         40   0 ms      (a 40 ms gap happened to exist)
+#         80   94 ms
+#        120   282 ms
+#        200   2359 ms   -- effectively the timeout
+#
+# For comparison the frame-difference path returned in 406 ms on the same screen,
+# because a pixel diff only cares about what is *visible*: a caret blinking or a
+# pointer crossing widgets does not move it. Counting pointer-tracking events made the
+# event path stricter than the thing it was meant to replace, which inverts the entire
+# argument for it.
+QUIESCENT_EVENTS: frozenset[int] = frozenset({
+    EVENT_OBJECT_NAMECHANGE,
+    EVENT_OBJECT_VALUECHANGE,
+    EVENT_OBJECT_TEXTSELECTIONCHANGED,
+    EVENT_OBJECT_CREATE,
+    EVENT_OBJECT_DESTROY,
+    EVENT_OBJECT_SHOW,
+    EVENT_OBJECT_HIDE,
+    EVENT_OBJECT_REORDER,
+    EVENT_OBJECT_STATECHANGE,
+    EVENT_OBJECT_SELECTION,
+    EVENT_SYSTEM_FOREGROUND,
+})
+
 WinEventProc = ctypes.WINFUNCTYPE(
     None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND, wintypes.LONG,
     wintypes.LONG, wintypes.DWORD, wintypes.DWORD)
@@ -504,13 +536,15 @@ class EventWatcher:
 
     def wait_for_quiescence(self, since_tick: int, hwnd: int = 0,
                             quiet_ms: float = 250.0,
-                            timeout_s: float = 30.0) -> WaitResult:
+                            timeout_s: float = 30.0,
+                            events: frozenset[int] | None = None) -> WaitResult:
         """Waits until no matching event has arrived for ``quiet_ms``.
 
-        This is the replacement for frame-difference stabilisation, and it is strictly
-        better on both axes: no capture per iteration, and it detects changes the pixel
-        diff cannot see (a value that changed to the same length of text, a tree that
-        reordered visually identical rows).
+        ``events`` defaults to every ingested kind, which on a live desktop includes
+        LOCATIONCHANGE -- pointer-tracking noise that never lets the stream go quiet.
+        Callers asking "has the interface finished changing" should pass
+        QUIESCENT_EVENTS; callers asking "has anything at all stopped happening" can
+        leave it out.
 
         Returns as soon as a quiet window has elapsed. ``quiescent_ms`` reports how long
         the stream was actually quiet, so a caller can tell a UI that settled instantly
@@ -544,6 +578,8 @@ class EventWatcher:
             # thread needs this lock to deliver anything at all.
             for rec in fresh:
                 if ticks_between(since_tick, rec.tick) < 0:
+                    continue
+                if events is not None and rec.event not in events:
                     continue
                 if root and rec.hwnd and root_window(rec.hwnd) != root:
                     continue

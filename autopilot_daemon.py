@@ -25,6 +25,7 @@ from websockets.asyncio.server import ServerConnection
 
 import audit
 import config
+import event_waiter
 import host_guard
 import risk
 import session_state
@@ -81,6 +82,10 @@ NON_INPUT_ACTIONS: frozenset[str] = frozenset({
     "read_screen_text",
     "find_text_on_screen",
     "wait_for_text",
+    # Waiting on the UI's own event stream touches nothing and holds no input. It is
+    # the cheapest observation in the set -- no capture, no tree walk -- so blocking it
+    # behind the input lock would serialise waiting against acting for no reason.
+    "wait_for_event",
     "reset_override",
     "release_control",
     "hud_state",
@@ -190,7 +195,7 @@ class AutopilotDaemon:
         self.app = app
         self.auth_token = self._init_auth_token()
 
-        self.vision = VisionEngine()
+        self.vision = VisionEngine(quiescence=self._event_quiescence)
         # The UIA-first path from ADR-0007. Kept separate from VisionEngine so the
         # snapshot layer stays free of pywinauto, which ADR-0007 rules out of the
         # hot path.
@@ -426,6 +431,148 @@ class AutopilotDaemon:
             data["session_warning"] = note
         return resp
 
+    # ------------------------------------------------------ event waiting
+    def _event_quiescence(self, since_tick: int, quiet_ms: float,
+                          timeout_s: float) -> Any:
+        """Blocks until the UI's event stream has been quiet, for capture_screen.
+
+        Called from a worker thread inside ``asyncio.to_thread``, so blocking here does
+        not stall the event loop. Starts the watcher lazily: importing this module must
+        not spawn a thread, and a daemon that only ever reads the tree should not pay
+        for a system-wide hook.
+
+        Returns None when the watcher cannot be used. VisionEngine treats that as
+        "fall back to frame differencing", which is the required behaviour: a silent
+        event stream must degrade to the path that was working, not to a frame captured
+        mid-animation.
+        """
+        if not config.EVENT_WATCHER_ENABLED:
+            return None
+        w = event_waiter.watcher()
+        if not w.running:
+            err = w.start()
+            if err:
+                logger.warning("event watcher unavailable (%s); stabilising by frames",
+                               err)
+                return None
+        try:
+            # QUIESCENT_EVENTS rather than every ingested kind: LOCATIONCHANGE fires on
+            # pointer movement, so counting it means a live desktop is never quiet and
+            # the wait runs to its timeout. Measured at 2359 ms for quiet_ms=200 against
+            # 406 ms for frame differencing on the same screen.
+            return w.wait_for_quiescence(since_tick=since_tick, quiet_ms=quiet_ms,
+                                         timeout_s=timeout_s,
+                                         events=event_waiter.QUIESCENT_EVENTS)
+        except Exception as exc:
+            logger.warning("event quiescence failed (%s); stabilising by frames", exc)
+            return None
+
+    async def _action_wait_for_event(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Waits for a UI event instead of polling frames or sleeping.
+
+        Two modes, and they answer different questions. ``condition`` or ``events``
+        waits for something to happen; ``quiet_ms`` waits for the interface to stop
+        changing. Asking for the wrong one is a design error rather than a runtime one,
+        so both are reported distinctly.
+
+        The wait is anchored to a tick, not to "now". Defaulting to the current time
+        would make every call return immediately on whatever is already buffered, which
+        is the stale-backlog failure the watcher exists to prevent.
+        """
+        timeout_s = float(params.get("timeout_s") or 30.0)
+        quiet_ms = params.get("quiet_ms")
+        handle = params.get("hwnd")
+        if not handle and (params.get("window_title") or params.get("class_name")):
+            handle, _how = await self._resolve_target(params)
+            if handle is None:
+                return {"status": "error",
+                        "message": "Цель для wait_for_event не разрешилась."}
+
+        if not config.EVENT_WATCHER_ENABLED:
+            return {
+                "status": "error",
+                "message": ("Наблюдатель событий отключён (EVENT_WATCHER_ENABLED). "
+                            "Ожидание по событию недоступно; используйте wait_for_text "
+                            "или повторное наблюдение."),
+            }
+        w = event_waiter.watcher()
+        if not w.running:
+            err = w.start()
+            if err:
+                return {"status": "error",
+                        "message": f"Наблюдатель событий не запустился: {err}"}
+
+        # Anchor: an explicit tick, or "just before this call". Both are chosen by the
+        # caller or by this function; neither reaches into the buffer unfiltered.
+        since = params.get("since_tick")
+        since = int(since) if since is not None else event_waiter.tick_now()
+
+        events: frozenset[int] | None = None
+        condition = params.get("condition")
+        if condition:
+            if condition not in event_waiter.CONDITIONS:
+                return {
+                    "status": "error",
+                    "message": (f"Неизвестное условие {condition!r}. Допустимо: "
+                                f"{', '.join(sorted(event_waiter.CONDITIONS))}."),
+                }
+            events = event_waiter.CONDITIONS[condition]
+        elif params.get("events"):
+            events = frozenset(int(e) for e in params["events"])
+
+        if quiet_ms is not None:
+            mode = "quiescence"
+            waiter = w.wait_for_quiescence
+            args = (since, handle or 0, float(quiet_ms), timeout_s)
+        else:
+            mode = "event"
+            waiter = w.wait_for_event
+            args = (since, handle or 0, events, timeout_s)
+
+        try:
+            res = await asyncio.to_thread(waiter, *args)
+        except Exception as exc:
+            # A broken pump must not take the action down with it. The caller asked to
+            # wait, not to have the daemon fail, and "the watcher died" is a different
+            # thing to report from "the condition was not met".
+            logger.warning("wait_for_event failed: %s", exc)
+            return {
+                "status": "error",
+                "message": (f"Наблюдатель событий не смог выполнить ожидание: {exc}. "
+                            "Повторите как wait_for_text или повторное наблюдение."),
+            }
+
+        stats = w.snapshot_stats()
+        data = {
+            "mode": mode,
+            "matched": res.matched,
+            "elapsed_ms": round(res.elapsed_ms, 1),
+            "events_seen": res.waited_events,
+            "discarded_stale": res.discarded_stale,
+            "quiescent_ms": res.quiescent_ms,
+            "since_tick": since,
+            "watcher": {"delivered": stats.delivered, "buffer": stats.buffer_len,
+                        "hook": stats.hook},
+        }
+        if res.event is not None:
+            data["event"] = {"kind": res.event.name, "code": res.event.event,
+                             "hwnd": res.event.hwnd, "tick": res.event.tick}
+        if res.matched:
+            data["message"] = (
+                f"Событие наступило через {res.elapsed_ms:.0f} мс"
+                if mode == "event" else
+                f"Интерфейс успокоился через {res.elapsed_ms:.0f} мс "
+                f"(тишина {res.quiescent_ms:.0f} мс)")
+            return {"status": "ok", "data": data}
+
+        data["message"] = res.error or (
+            f"Событие не наступило за {timeout_s:.1f} с; "
+            f"увидено {res.waited_events}, отброшено устаревших {res.discarded_stale}")
+        # A timeout is a normal outcome of waiting, not a daemon fault, so it stays
+        # status "ok" with matched=false. Returning "error" would push the caller to
+        # treat an ordinary "nothing happened" as a broken tool.
+        return {"status": "ok", "data": data}
+
     # ------------------------------------------------------ safety layer
     # ADR-0004. Three things that must happen around every mutating action:
     # refuse input into the host's own process tree, classify the resolved target
@@ -605,6 +752,8 @@ class AutopilotDaemon:
                 return await self._action_find_text_on_screen(params)
             elif action == "wait_for_text":
                 return await self._action_wait_for_text(params)
+            elif action == "wait_for_event":
+                return await self._action_wait_for_event(params)
             elif action == "hud_state":
                 return await self._action_hud_state()
             elif action == "reset_override":
@@ -842,6 +991,11 @@ class AutopilotDaemon:
         if guard is not None:
             return guard
 
+        # Tick taken before anything happens, so the event path can tell a change
+        # caused by this action from one that was already in flight. Taken after the
+        # guard: a refused action must not produce a frame at all.
+        since_tick = event_waiter.tick_now()
+
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
 
         # Trigger 250ms predictive ripple at target location
@@ -887,6 +1041,7 @@ class AutopilotDaemon:
             cursor_pos=cursor_abs,
             wait_stabilization=True,
             show_grid=show_grid,
+            since_tick=since_tick,
         )
 
         # Report where the cursor actually ended up, not where the caller asked it to
@@ -965,6 +1120,9 @@ class AutopilotDaemon:
             # application, which is what makes a critical app matter here.
             level = self._risk_of("element", verb="set_value", app=app)
 
+        # Tick before any input is sent, for the same reason as in mouse_action.
+        since_tick = event_waiter.tick_now()
+
         if params.get("dry_run"):
             return {
                 "status": "ok",
@@ -997,6 +1155,7 @@ class AutopilotDaemon:
             cursor_pos=cursor_abs,
             wait_stabilization=True,
             show_grid=show_grid,
+            since_tick=since_tick,
         )
 
         return {
@@ -1061,6 +1220,9 @@ class AutopilotDaemon:
         if guard is not None:
             return guard
 
+        # Tick before the wheel event, for the same reason as in mouse_action.
+        since_tick = event_waiter.tick_now()
+
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
 
         if x is not None and y is not None:
@@ -1078,6 +1240,7 @@ class AutopilotDaemon:
             cursor_pos=cursor_abs,
             wait_stabilization=True,
             show_grid=show_grid,
+            since_tick=since_tick,
         )
 
         return {

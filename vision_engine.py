@@ -188,8 +188,22 @@ def _distance_to_rect(x: int, y: int, mon: MonitorInfo) -> float:
 class VisionEngine:
     """Handles multi-monitor frame acquisition, stabilization, and accessibility inspection."""
 
-    def __init__(self) -> None:
-        pass
+    def __init__(self, quiescence: Any = None) -> None:
+        """``quiescence`` is an optional injected callable.
+
+        Signature: ``quiescence(since_tick, quiet_ms, timeout_s) -> WaitResult``. It is
+        injected rather than imported so this module stays free of the Win32 hook and
+        so the event path can be tested against a stand-in. When it is absent, or when
+        it reports failure, stabilisation falls back to the frame-difference loop --
+        a silent event stream must degrade to the path that was working, not to a frame
+        captured mid-animation.
+        """
+        self._quiescence = quiescence
+        # Last stabilisation actually used, for observability. A caller cannot tell
+        # from the returned frame whether it waited on events or on pixel diffs, and
+        # the two have very different cost and very different failure modes.
+        self.last_stabilization: str = "none"
+        self.last_stabilization_ms: float = 0.0
 
     def list_monitors(self) -> list[MonitorInfo]:
         """Enumerates connected monitors through mss and platform metrics."""
@@ -251,9 +265,15 @@ class VisionEngine:
         cursor_pos: tuple[int, int] | None = None,
         wait_stabilization: bool = False,
         show_grid: bool = False,
+        since_tick: int | None = None,
     ) -> tuple[str, int, int, float, float, MonitorInfo]:
         """
         Captures target display, waits for animations to finish, overlays cursor, and compresses to WebP.
+
+        ``since_tick`` is the GetTickCount value taken before the action that this frame
+        is meant to observe. Without it the event path cannot tell a change caused by
+        the action from one that was already in flight, so stabilisation falls back to
+        frame differencing.
 
         Returns:
             base64_webp (str): Base64 encoded WebP image
@@ -270,10 +290,12 @@ class VisionEngine:
         try:
             with mss.MSS() as sct:
                 if wait_stabilization:
-                    pil_image = self._capture_stabilized_frame(sct, bbox)
+                    pil_image = self._capture_stabilized_frame(sct, bbox, since_tick)
                 else:
                     raw_frame = sct.grab(bbox)
                     pil_image = Image.frombytes("RGB", raw_frame.size, raw_frame.bgra, "raw", "BGRX")
+                    self.last_stabilization = "none"
+                    self.last_stabilization_ms = 0.0
         except Exception as exc:
             msg = f"Screen capture failed. Windows UAC or secure desktop may be active: {exc}"
             logger.error(msg)
@@ -369,7 +391,52 @@ class VisionEngine:
 
         return Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
 
-    def _capture_stabilized_frame(self, sct: Any, bbox: dict[str, int]) -> Image.Image:
+    def _capture_stabilized_frame(self, sct: Any, bbox: dict[str, int],
+                                  since_tick: int | None = None) -> Image.Image:
+        """Returns one frame that is settled, by events when possible and by pixels otherwise.
+
+        The event path waits for the UI's own change notifications to go quiet and then
+        captures exactly once. It is strictly better on both axes when it works: no
+        capture per iteration, and it sees changes the pixel diff cannot -- a value
+        replaced by text of the same length, a tree that reordered visually identical
+        rows. Measured delivery is about a millisecond against a 100 ms polling floor.
+
+        Every condition that makes it unavailable falls through to the frame loop
+        rather than raising: no injected callable, mode set to frames, no tick to
+        measure from, watcher not running, or the wait itself erroring.
+        """
+        started = time.monotonic()
+        if self._can_use_events(since_tick):
+            try:
+                res = self._quiescence(since_tick, config.EVENT_QUIET_MS,
+                                       config.EVENT_QUIET_TIMEOUT_S)
+                waited = (time.monotonic() - started) * 1000.0
+                if res is not None and not getattr(res, "error", ""):
+                    self.last_stabilization = "events"
+                    self.last_stabilization_ms = waited
+                    raw = sct.grab(bbox)
+                    return Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+                logger.debug("event stabilisation unavailable (%s); falling back to "
+                             "frame differencing", getattr(res, "error", "no result"))
+            except Exception as exc:
+                logger.debug("event stabilisation failed (%s); falling back to frame "
+                             "differencing", exc)
+
+        self.last_stabilization = "frames"
+        image = self._stabilize_by_frames(sct, bbox)
+        self.last_stabilization_ms = (time.monotonic() - started) * 1000.0
+        return image
+
+    def _can_use_events(self, since_tick: int | None) -> bool:
+        if self._quiescence is None:
+            return False
+        if config.STABILIZATION_MODE == "frames":
+            return False
+        # Without a tick there is no way to separate a change caused by the action from
+        # one already in flight, and guessing would return frames captured mid-animation.
+        return since_tick is not None
+
+    def _stabilize_by_frames(self, sct: Any, bbox: dict[str, int]) -> Image.Image:
         """Samples frames until consecutive pixel changes fall below the perceptual threshold."""
         time.sleep(config.STABILIZATION_INTERVAL_SEC)
 

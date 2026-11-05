@@ -132,6 +132,31 @@ STABILIZATION_MAX_ITERATIONS: int = 10
 STABILIZATION_INTERVAL_SEC: float = 0.10
 STABILIZATION_RESIZE_DIMS: tuple[int, int] = (64, 64)
 
+# Stabilisation strategy. "frames" is the original behaviour: capture repeatedly until
+# the perceptual difference between consecutive frames settles, up to
+# STABILIZATION_MAX_ITERATIONS captures at ~100 ms each. "events" waits for the UI's
+# own event stream to go quiet and then captures once, which measured at about a
+# millisecond of delivery instead of a 100 ms polling floor.
+#
+# "events" falls back to "frames" automatically whenever it cannot be used: the
+# watcher failed to start, or no action supplied a tick to measure from. That fallback
+# is the reason this is a mode and not a replacement -- an event stream that silently
+# stops must degrade to the path that was working, not to a frame captured mid-animation.
+STABILIZATION_MODE: str = "events"
+
+# How long the UI's event stream must be silent before a frame is considered settled.
+# Shorter than one frame-polling interval, which is the point: the old path could not
+# answer faster than STABILIZATION_INTERVAL_SEC no matter how idle the UI was.
+EVENT_QUIET_MS: float = 120.0
+
+# Upper bound on an event wait. A UI that never settles (an animation, a spinner, a
+# blinking caret) must still return a frame rather than hang the action.
+EVENT_QUIET_TIMEOUT_S: float = 3.0
+
+# The watcher is one dedicated thread with a system-wide hook. Disabling it returns
+# the daemon to frame-difference stabilisation everywhere with no other change.
+EVENT_WATCHER_ENABLED: bool = True
+
 # Cursor Overlay Appearance on Screenshot
 #
 # The arrow's geometry lives in vision_engine._draw_cursor_pointer, whose vertices

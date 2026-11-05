@@ -752,6 +752,13 @@ ELEMENT_ACTIONS = Literal[
 WINDOW_ACTIONS = Literal[
     "close", "minimize", "maximize", "restore", "move", "resize", "activate",
 ]
+# Named event sets for wait_for_event. Kept in step with event_waiter.CONDITIONS by a
+# test, because the two live in different modules with no import linking them: a name
+# the gateway offers but the daemon does not know returns "unknown condition", and one
+# the daemon accepts but the gateway does not offer is simply unreachable.
+EVENT_CONDITIONS = Literal[
+    "opened", "closed", "focused", "value_changed", "tree_changed", "appeared",
+]
 
 
 @mcp.tool()
@@ -1426,6 +1433,88 @@ async def get_hud_state() -> str:
         f"Рамка рисуется в точке:    {d.get('painted_at_global')}",
         f"Размещение корректно:      {d.get('placement_correct')}",
     ])
+
+
+@mcp.tool()
+async def wait_for_event(
+    condition: EVENT_CONDITIONS | None = None,
+    quiet_ms: float | None = None,
+    hwnd: int | None = None,
+    window_title: str | None = None,
+    timeout_s: float = 30.0,
+    since_tick: int | None = None,
+    events: list[int] | None = None,
+) -> str:
+    """
+    Waits for the UI's own change notifications instead of polling frames or sleeping.
+
+    Delivery measured at about a millisecond against the 100 ms floor of frame polling,
+    and it costs no capture per iteration. It also sees changes a pixel diff cannot: a
+    value replaced by text of the same length, or a tree that reordered rows which look
+    identical.
+
+    Two modes, answering different questions. Give `condition` to wait for something to
+    happen; give `quiet_ms` to wait for the interface to stop changing. `quiet_ms` is the
+    better default after an action, because it does not require guessing which event a
+    particular control emits.
+
+    Conditions: 'opened', 'closed', 'focused', 'value_changed', 'tree_changed',
+    'appeared'. Pass raw event codes through `events` only when a condition does not
+    cover what you need.
+
+    The wait is anchored to a tick. Omit `since_tick` to anchor at the moment of the
+    call, which is what you want after performing an action in a previous turn. Passing
+    an older tick deliberately re-reads history, and events older than the anchor are
+    discarded and reported as `discarded_stale` rather than matched -- a backlog
+    delivered late must not read as "the UI just changed".
+
+    A timeout is a normal outcome of waiting, not a tool failure, so it comes back as a
+    report rather than an error.
+
+    Args:
+        condition: Named event set to wait for.
+        quiet_ms: Instead of a condition, wait for this many milliseconds of silence.
+        hwnd: Restrict to one window. Events on its controls carry the control's handle,
+            so this matches the whole top-level window, not just the frame.
+        window_title: Substring of the window title, when no handle is known.
+        timeout_s: How long to wait before reporting that nothing happened (default 30).
+        since_tick: Anchor tick from an earlier response. Defaults to now.
+        events: Raw WinEvent codes, for cases no named condition covers.
+    """
+    resp = await _send_daemon_request(
+        "wait_for_event",
+        {
+            "condition": condition, "quiet_ms": quiet_ms, "hwnd": hwnd,
+            "window_title": window_title, "timeout_s": timeout_s,
+            "since_tick": since_tick, "events": events,
+        },
+        timeout=config.ws_timeout_for_wait(timeout_s),
+    )
+    if resp.get("status") != "ok":
+        return f"Ожидание не выполнено: {resp.get('message', 'Неизвестная ошибка')}"
+
+    d = resp.get("data", {})
+    mode = d.get("mode")
+    if d.get("matched"):
+        if mode == "quiescence":
+            head = (f"УСПОКОИЛОСЬ через {d.get('elapsed_ms')} мс "
+                    f"(тишина {d.get('quiescent_ms')} мс).")
+        else:
+            ev = d.get("event") or {}
+            head = (f"ДОЖДАЛИСЬ: {ev.get('kind')} через {d.get('elapsed_ms')} мс "
+                    f"(hwnd={ev.get('hwnd')}).")
+    else:
+        head = f"НЕ ДОЖДАЛИСЬ за {timeout_s:.0f} с. {d.get('message', '')}"
+    lines = [head,
+             f"  увидено событий: {d.get('events_seen')}, "
+             f"отброшено устаревших: {d.get('discarded_stale')}"]
+    w = d.get("watcher") or {}
+    lines.append(f"  наблюдатель: доставлено {w.get('delivered')}, "
+                 f"в буфере {w.get('buffer')}, хук {w.get('hook')}")
+    if d.get("since_tick") is not None:
+        lines.append(f"  метка since_tick={d.get('since_tick')} — "
+                     f"передайте её следующему ожиданию, чтобы не потерять события")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

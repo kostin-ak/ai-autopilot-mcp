@@ -790,6 +790,7 @@ class TestToolDescriptions:
         "window_action",
         "read_terminal", "write_terminal", "wait_terminal",
         "find_text_on_screen", "read_screen_text", "wait_for_text",
+        "wait_for_event",
     }
 
     def test_element_verbs_match_the_daemon_dispatch(self):
@@ -826,6 +827,53 @@ class TestToolDescriptions:
             tools["window_action"].input_schema["properties"]["action"]["enum"]
         )
         assert schema_enum == set(WINDOW_ACTIONS)
+
+    def test_event_conditions_match_the_waiter(self):
+        """The gateway's Literal and event_waiter.CONDITIONS must name the same sets.
+
+        Different modules, no import linking them. A condition the gateway offers but
+        the waiter does not know returns "unknown condition"; one the waiter accepts
+        but the gateway does not offer is unreachable, and the agent falls back to
+        polling frames without knowing a cheaper wait existed.
+        """
+        import asyncio
+
+        import event_waiter
+        import mcp_server
+
+        tools = {t.name: t for t in asyncio.run(mcp_server.mcp.list_tools())}
+        prop = tools["wait_for_event"].input_schema["properties"]["condition"]
+        # An optional Literal serialises as anyOf[enum-branch, null-branch] rather than
+        # a bare enum, so the names have to be pulled out of whichever branch has them.
+        branches = prop.get("anyOf") or [prop]
+        schema_enum = {v for b in branches for v in (b.get("enum") or [])}
+        assert schema_enum, f"no enum found in the condition schema: {prop}"
+        assert schema_enum == set(event_waiter.CONDITIONS), (
+            f"gateway offers {sorted(schema_enum - set(event_waiter.CONDITIONS))}; "
+            f"waiter accepts "
+            f"{sorted(set(event_waiter.CONDITIONS) - schema_enum)} that is unreachable"
+        )
+
+    def test_wait_for_event_does_not_take_the_input_lock(self):
+        """Waiting touches nothing and holds no input, so serialising it against acting
+        would make the cheapest observation in the set wait behind the most expensive."""
+        import autopilot_daemon as daemon
+
+        assert "wait_for_event" in daemon.NON_INPUT_ACTIONS
+
+    def test_wait_for_event_uses_the_derived_transport_timeout(self):
+        """A 30 s default wait against a 30 s transport deadline is a race, and losing
+        it reports "the daemon did not answer" instead of "nothing happened"."""
+        import asyncio
+        import inspect
+
+        import config
+        import mcp_server
+
+        src = inspect.getsource(mcp_server.wait_for_event)
+        assert "ws_timeout_for_wait" in src, src
+        assert config.ws_timeout_for_wait(30.0) > 30.0
+        asyncio.run(mcp_server.mcp.list_tools())
 
     def test_class_b_mutations_are_gated_during_a_pause(self):
         """Both mutating verb sets stay blocked while a human holds the machine."""

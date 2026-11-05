@@ -244,6 +244,77 @@ class TestBuffering:
 
 
 # ---------------------------------------------------------------- live thread
+class TestQuiescentEventSet:
+    def test_location_change_is_excluded(self):
+        """Pointer-tracking noise, not a change to the interface.
+
+        Counting it made the event path stricter than the frame diff it replaces:
+        measured at 2359 ms for quiet_ms=200 against 406 ms for frame differencing on
+        the same screen, because a live desktop never stops moving the pointer.
+        """
+        assert ew.EVENT_OBJECT_LOCATIONCHANGE not in ew.QUIESCENT_EVENTS
+        assert ew.EVENT_SYSTEM_MOVESIZEEND not in ew.QUIESCENT_EVENTS
+
+    def test_every_quiescent_event_is_actually_ingested(self):
+        """A filter naming an event the hook never buffers would match nothing, and
+        quiescence would then return instantly on every call -- a silent no-op that
+        looks exactly like a very settled interface."""
+        missing = ew.QUIESCENT_EVENTS - ew.INGEST_EVENTS
+        assert not missing, f"not ingested: {sorted(missing)}"
+
+    def test_the_meaningful_change_events_are_present(self):
+        for needed in (ew.EVENT_OBJECT_NAMECHANGE, ew.EVENT_OBJECT_VALUECHANGE,
+                       ew.EVENT_OBJECT_SHOW, ew.EVENT_OBJECT_CREATE):
+            assert needed in ew.QUIESCENT_EVENTS, needed
+
+    def test_the_filter_makes_a_noisy_stream_look_quiet(self):
+        """LOCATIONCHANGE churn alone must not hold the quiet window open.
+
+        The anchor is "now", not a tick in the past: anchoring behind by more than
+        quiet_ms satisfies the window at entry and the assertion passes without waiting
+        for anything, which is what the first version of this test did.
+        """
+        w = make_watcher()
+        stop = threading.Event()
+
+        def churn():
+            while not stop.is_set():
+                push(w, ew.tick_now(), ew.EVENT_OBJECT_LOCATIONCHANGE)
+                time.sleep(0.02)
+
+        t = threading.Thread(target=churn, daemon=True)
+        t.start()
+        try:
+            r = w.wait_for_quiescence(since_tick=ew.tick_now(), quiet_ms=100,
+                                      timeout_s=2.0, events=ew.QUIESCENT_EVENTS)
+        finally:
+            stop.set()
+            t.join(timeout=2.0)
+        assert r.ok, r.error
+        assert r.waited_events == 0
+        assert r.elapsed_ms >= 90, f"returned before the quiet window: {r.elapsed_ms}"
+
+    def test_without_the_filter_the_same_stream_is_never_quiet(self):
+        w = make_watcher()
+        stop = threading.Event()
+
+        def churn():
+            while not stop.is_set():
+                push(w, ew.tick_now(), ew.EVENT_OBJECT_LOCATIONCHANGE)
+                time.sleep(0.02)
+
+        t = threading.Thread(target=churn, daemon=True)
+        t.start()
+        try:
+            r = w.wait_for_quiescence(since_tick=ew.tick_now(), quiet_ms=100,
+                                      timeout_s=0.4)
+        finally:
+            stop.set()
+            t.join(timeout=2.0)
+        assert r.matched is False
+        assert r.waited_events > 0
+
+
 class TestWatcherThread:
     def test_a_dedicated_thread_can_register_a_system_wide_hook(self):
         """The one assumption the whole design rests on, checked against the real API.
