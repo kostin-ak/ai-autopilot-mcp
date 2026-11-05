@@ -18,6 +18,13 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QMainWindow, QWidget
 
+try:
+    # Always present under PyQt6. Imported defensively so a stand-in screen object in a
+    # test -- which is not a Qt wrapper at all -- does not make the module unimportable.
+    from PyQt6 import sip as _sip
+except ImportError:  # pragma: no cover - not reachable under PyQt6
+    _sip = None
+
 import config
 
 logger = logging.getLogger(__name__)
@@ -77,6 +84,8 @@ class HUDOverlayWindow(QMainWindow):
         Idempotent: safe to call again when a screen is added, so the new
         screen's own geometryChanged signal gets tracked too.
         """
+        self._prune_dead_screens()
+
         # screenAdded / screenRemoved are static signals: in PyQt6 they are
         # connectable only through the application instance, not the class.
         app = QGuiApplication.instance()
@@ -90,6 +99,30 @@ class HUDOverlayWindow(QMainWindow):
                 continue
             screen.geometryChanged.connect(self._on_screen_topology_changed)
             self._tracked_screens.append(screen)
+
+    def _prune_dead_screens(self) -> None:
+        """Drops tracked screens whose C++ object Qt has already deleted.
+
+        This is not tidiness. When a monitor is unplugged Qt destroys the QScreen, but
+        the Python wrapper stays in the list, and the next `screen in self._tracked_screens`
+        comparison touches the deleted object and raises "Internal C++ object already
+        deleted". The crash lands in the handler for screenRemoved -- so the feature
+        fails in exactly the scenario it was written for, and it fails on the second
+        topology change rather than the first, which is what makes it look intermittent.
+        """
+        alive = []
+        for screen in self._tracked_screens:
+            try:
+                if _sip.isdeleted(screen):
+                    continue
+            except (AttributeError, NameError, RuntimeError, TypeError):
+                # sip is always present under PyQt6, but a stand-in object in a test is
+                # not a Qt wrapper at all. Treating an unknown object as alive is the
+                # safe direction: keeping a live screen tracked matters more than
+                # pruning a dead one, and a stale entry costs a redundant signal.
+                pass
+            alive.append(screen)
+        self._tracked_screens = alive
 
     @pyqtSlot()
     def _on_screen_topology_changed(self, *_args) -> None:
