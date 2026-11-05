@@ -1,12 +1,16 @@
 """Autopilot Daemon: Combines PyQt6 HUD overlay, low-level hooks, and asyncio WebSocket server."""
 
-import contextlib
 import sys
 
 if sys.platform == "win32":
-    import ctypes
-    with contextlib.suppress(Exception):
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    # Before PyQt6 is imported. Awareness can be set once per process and Qt sets its
+    # own when it finds none, so doing this later would leave the process at whatever Qt
+    # chose. The previous code called the V1 API directly here, which permanently blocked
+    # the V2 upgrade the documentation promised -- measured 2026-11-06, the later V2 call
+    # returned ok=False with GetLastError=5.
+    import config as _dpi_config
+
+    _dpi_config.set_process_dpi_awareness()
 
 import asyncio
 import contextlib

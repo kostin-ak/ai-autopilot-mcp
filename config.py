@@ -1,9 +1,87 @@
 """Configuration settings for AI Desktop Autopilot (Overlay Daemon and MCP Gateway)."""
 
 import contextlib
+import logging
 from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
+
+logger = logging.getLogger("config")
+
+# DPI awareness actually in force, set by set_process_dpi_awareness(). Read it rather
+# than assuming: "we asked for V2" is not the same as "we have V2", and the previous
+# code wrapped the call in contextlib.suppress(Exception), which is how the
+# documentation came to promise Per-Monitor V2 while the process ran V1.
+DPI_MODE: str = "unset"
+
+
+def set_process_dpi_awareness() -> str:
+    """Sets process DPI awareness, best available first, and reports what took effect.
+
+    Order matters and is not a preference. Measured 2026-11-06:
+
+      SetProcessDpiAwareness(2) first           succeeds, value becomes 2
+      SetProcessDpiAwarenessContext(-4) after   ok=False, GetLastError=5 (ACCESS_DENIED)
+      SetProcessDpiAwarenessContext(-4) first   ok=True
+      SetProcessDpiAwareness(2) after           hr=0x80070005 (E_ACCESSDENIED)
+
+    Awareness can be set once per process; the first call wins and every later call is
+    refused. The daemon used to call the V1 API at import time, which permanently
+    blocked the V2 upgrade the rest of the code and the documentation assumed. V2 must
+    therefore be attempted first.
+
+    Qt does not override awareness that is already set: with V2 established before
+    QApplication, the reported value was unchanged afterwards. Qt sets its own
+    awareness only when it finds none, so calling this before importing PyQt6 is what
+    makes the process V2 rather than whatever Qt prefers.
+
+    GetProcessDpiAwareness cannot confirm V2, because it predates V2 and reports 2 for
+    both per-monitor levels. The evidence that V2 took is that the context call returned
+    True and the subsequent V1 call was denied -- the denial proves awareness was already
+    locked to whatever the first call set.
+    """
+    global DPI_MODE
+    import ctypes
+    from ctypes import wintypes
+
+    if DPI_MODE != "unset":
+        return DPI_MODE
+
+    user32 = ctypes.windll.user32
+    shcore = ctypes.windll.shcore
+
+    # Per-Monitor V2, Windows 10 1703+.
+    with contextlib.suppress(Exception):
+        user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+        user32.SetProcessDpiAwarenessContext.argtypes = [wintypes.HANDLE]
+        if user32.SetProcessDpiAwarenessContext(wintypes.HANDLE(-4)):
+            DPI_MODE = "per-monitor-v2"
+            return DPI_MODE
+
+    # Per-Monitor V1, Windows 8.1+.
+    with contextlib.suppress(Exception):
+        shcore.SetProcessDpiAwareness.restype = ctypes.c_long
+        if shcore.SetProcessDpiAwareness(2) == 0:
+            DPI_MODE = "per-monitor-v1"
+            logger.warning("Per-Monitor DPI V2 unavailable; running V1. Window "
+                           "non-client areas and dialogs will not rescale on a DPI "
+                           "change, so coordinates read across such a change can be "
+                           "stale.")
+            return DPI_MODE
+
+    # System aware, Vista+. Better than unaware: unaware processes get bitmap-scaled
+    # screenshots, which is what makes OCR unreliable.
+    with contextlib.suppress(Exception):
+        if user32.SetProcessDPIAware():
+            DPI_MODE = "system"
+            logger.warning("only system DPI awareness available; per-monitor scaling "
+                           "will be wrong on a mixed-DPI setup")
+            return DPI_MODE
+
+    DPI_MODE = "unavailable"
+    logger.error("could not set any DPI awareness; screenshots will be bitmap-scaled "
+                 "and every coordinate derived from them is suspect")
+    return DPI_MODE
 
 
 class AutopilotState(StrEnum):
