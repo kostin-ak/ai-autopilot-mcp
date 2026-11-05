@@ -38,6 +38,11 @@ WS_EX_TOOLWINDOW: int = 0x00000080
 WS_EX_NOACTIVATE: int = 0x08000000
 WDA_EXCLUDEFROMCAPTURE: int = 0x00000011
 
+# Extra margin around the ripple's maximum radius when computing the dirty rectangle.
+# Covers pen width and antialiasing bleed; being generous costs a few pixels of repaint,
+# while being short leaves a permanent artefact that cannot be seen in any screenshot.
+_RIPPLE_DIRTY_MARGIN_PX: int = 8
+
 
 class HUDOverlayWindow(QMainWindow):
     """Full-screen pass-through overlay that is invisible to OS screenshot capture."""
@@ -59,6 +64,9 @@ class HUDOverlayWindow(QMainWindow):
 
         # Predictive ripple animation state
         self._ripple_pos: QPoint | None = None
+        # Previous ripple position, so a new ripple starting elsewhere still clears the
+        # region the last one painted. Without it the tail of a faded marker survives.
+        self._last_ripple_pos: QPoint | None = None
         self._ripple_start_time: float = 0.0
         self._ripple_active: bool = False
         self._ripple_timer: QTimer = QTimer(self)
@@ -336,7 +344,45 @@ class HUDOverlayWindow(QMainWindow):
             self._ripple_active = False
             self._ripple_timer.stop()
 
-        self.update()
+        # Repaint only the ripple's neighbourhood rather than the whole window.
+        #
+        # The timer ticks every TARGET_RIPPLE_TICK_MS (~15 ms), and self.update() with no
+        # argument marks the entire overlay dirty -- and the overlay spans the whole
+        # virtual desktop, 4480x1440 on this machine. Each such repaint re-ran the neon
+        # border loop, which builds a fresh QLinearGradient per step for width+glow
+        # steps, so one ripple animation cost hundreds of gradient constructions to
+        # redraw a border that had not changed.
+        #
+        # This is safe because the ripple does not move: _ripple_pos is fixed for the
+        # whole animation and only the radius grows, from 0 to TARGET_RIPPLE_MAX_RADIUS.
+        # A square of that radius around the position therefore bounds every frame the
+        # animation can draw, and the union with the previous position covers a second
+        # ripple starting elsewhere while an earlier one is still on screen.
+        self.update(self._ripple_dirty_rect())
+
+    def _ripple_dirty_rect(self) -> QRect:
+        """Widget-local region the ripple can have painted, this tick or the last.
+
+        Deliberately generous. An undersized rect leaves the tail of a faded marker on
+        screen as a permanent artefact, while an oversized one costs a few extra pixels
+        of repaint. Note this cannot be checked by looking at a screenshot: the overlay
+        carries WDA_EXCLUDEFROMCAPTURE, so it appears in no capture at all.
+        """
+        margin = config.TARGET_RIPPLE_MAX_RADIUS + _RIPPLE_DIRTY_MARGIN_PX
+        rects = []
+        for pos in (self._ripple_pos, self._last_ripple_pos):
+            if pos is None:
+                continue
+            local = self._global_to_local_point(pos)
+            rects.append(QRect(local.x() - margin, local.y() - margin,
+                               margin * 2, margin * 2))
+        self._last_ripple_pos = self._ripple_pos
+        if not rects:
+            return QRect()
+        region = rects[0]
+        for r in rects[1:]:
+            region = region.united(r)
+        return region
 
     def paintEvent(self, event: QPaintEvent) -> None:
         """Renders glowing HUD border and active target ripple.
