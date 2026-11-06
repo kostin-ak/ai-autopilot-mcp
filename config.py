@@ -166,9 +166,26 @@ COLOR_AI_ACTIVE_SECONDARY: RGBAColor = RGBAColor(123, 44, 191, 230)  # Violet / 
 COLOR_USER_OVERRIDE: RGBAColor = RGBAColor(255, 183, 3, 235)         # Vivid Amber / Yellow
 
 # Predictive Ripple Marker Settings
-TARGET_RIPPLE_DURATION_MS: int = 250
-TARGET_RIPPLE_MAX_RADIUS: int = 36
-TARGET_RIPPLE_TICK_MS: int = 15
+#
+# These were 250 / 36 / 15 and the marker was effectively invisible: a ring 72 px across
+# on a 2560x1440 desktop, for a quarter of a second, with its alpha ramping to 12 of 240
+# by the time it reached full size. The operator watching the screen during a live check
+# on 2026-11-06 saw nothing and asked whether it ran at all. It did -- offscreen rendering
+# against a blank surface showed 124 to 944 changed pixels across the animation -- which
+# is the point: it was correct and unusable, and nothing in the tool's own output could
+# have said so, because the overlay carries WDA_EXCLUDEFROMCAPTURE and appears in no
+# screenshot.
+#
+# DURATION is not free: mouse_action sleeps for exactly this long between emitting the
+# ripple and moving the cursor, so it is added to the latency of every mouse action.
+TARGET_RIPPLE_DURATION_MS: int = 380
+TARGET_RIPPLE_MAX_RADIUS: int = 84
+TARGET_RIPPLE_TICK_MS: int = 12
+# Fraction of the animation over which the marker fades out. The rest plays at full
+# alpha. A linear ramp to zero -- what the code did before -- makes the largest and
+# therefore most visible frames the faintest ones, which wastes exactly the part of the
+# animation that could be seen.
+TARGET_RIPPLE_FADE_FRACTION: float = 0.35
 
 # ---------------------------------------------------------
 # Input and Interruption Settings

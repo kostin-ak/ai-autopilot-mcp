@@ -11,6 +11,7 @@ available, and it has to be a comparison rather than an assertion that a pixmap 
 from __future__ import annotations
 
 import os
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -46,6 +47,9 @@ def overlay(app):
     # the first run of this file did. Everything the code under test reaches into on the
     # widget has to be stubbed.
     win.devicePixelRatioF = lambda: 1.0
+    # Coordinate conversion reads self.geometry(), which needs a constructed widget.
+    win._global_to_local_point = lambda q: QPoint(q.x(), q.y())
+    win._global_to_local_rect = lambda r: QRect(r)
     return win
 
 
@@ -178,6 +182,70 @@ class TestCacheBehaviour:
         overlay._draw_neon_border(_NullPainter(), tiny, config.AutopilotState.AI_ACTIVE)
         assert overlay._border_cache is not None
         assert overlay._border_cache[1].width() > 0
+
+
+class TestRippleMarker:
+    """The marker had no rendering test, and that is why a NameError shipped.
+
+    Replacing the body of _draw_ripple_marker left a trailing crosshair block referring
+    to a variable that no longer existed. Every test passed, because none of them ever
+    drew the marker -- the defect was only reachable by rendering it, which is also the
+    only way to know the marker is visible at all.
+    """
+
+    def _render(self, overlay, progress):
+        img = QImage(RECT.width(), RECT.height(),
+                     QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(0)
+        overlay._ripple_start_time = time.monotonic() - (
+            progress * config.TARGET_RIPPLE_DURATION_MS / 1000.0)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        overlay._draw_ripple_marker(p, QPoint(200, 120))
+        p.end()
+        return img
+
+    @pytest.mark.parametrize("progress", [0.0, 0.2, 0.5, 0.8, 1.0])
+    def test_it_renders_at_every_point_in_the_animation(self, overlay, progress):
+        """Covers the whole progress range, so a branch that only runs late in the
+        animation cannot hide a name error the way the crosshair did."""
+        img = self._render(overlay, progress)
+        assert img is not None
+
+    def test_it_draws_ink_over_a_blank_surface(self, overlay):
+        blank = QImage(RECT.width(), RECT.height(),
+                       QImage.Format.Format_ARGB32_Premultiplied)
+        blank.fill(0)
+        img = self._render(overlay, 0.5)
+        changed = sum(1 for y in range(0, blank.height(), 4)
+                      for x in range(0, blank.width(), 4)
+                      if img.pixel(x, y) != blank.pixel(x, y))
+        assert changed > 50, "the marker drew nothing at mid-animation"
+
+    def test_the_late_frames_are_not_the_faintest(self, overlay):
+        """The original defect in one assertion: alpha ramped linearly to 12 of 240, so
+        the largest and most visible frames were the least visible. Ink at 80% of the
+        animation must exceed ink at the start."""
+        early = self._render(overlay, 0.05)
+        late = self._render(overlay, 0.8)
+        early_ink = sum(1 for y in range(0, early.height(), 4)
+                        for x in range(0, early.width(), 4)
+                        if early.pixel(x, y) != 0)
+        late_ink = sum(1 for y in range(0, late.height(), 4)
+                       for x in range(0, late.width(), 4)
+                       if late.pixel(x, y) != 0)
+        assert late_ink > early_ink, (
+            f"marker shrinks in presence as it grows: {early_ink} px early vs "
+            f"{late_ink} px late")
+
+    def test_the_dirty_rect_covers_the_enlarged_marker(self, overlay):
+        """The radius grew from 36 to 84; a margin sized for the old one would clip the
+        ring and leave it half-drawn."""
+        overlay._ripple_pos = QPoint(200, 120)
+        overlay._last_ripple_pos = None
+        r = overlay._ripple_dirty_rect()
+        reach = config.TARGET_RIPPLE_MAX_RADIUS
+        assert r.contains(QRect(200 - reach, 120 - reach, reach * 2, reach * 2))
 
 
 class _NullPainter:

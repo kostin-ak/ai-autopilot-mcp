@@ -528,38 +528,70 @@ class HUDOverlayWindow(QMainWindow):
         self._border_cache = None
 
     def _draw_ripple_marker(self, painter: QPainter, pos: QPoint) -> None:
-        """Renders dynamic reticle with expanding circles at point pos."""
+        """Renders the predictive target marker at pos.
+
+        Three changes from the original, all because the marker was correct and
+        unseeable. Measured live 2026-11-06: a 36 px radius ring over 250 ms, with alpha
+        ramping linearly to 12 of 240 at full size, so the largest frames were the
+        faintest. The operator watching the screen saw nothing.
+
+        - Alpha holds at full for the first part of the animation and fades only over the
+          last TARGET_RIPPLE_FADE_FRACTION. Growing while bright is what makes an
+          expanding ring readable as motion.
+        - A translucent filled disc, not only stroked rings. A 3 px line at 84 px radius
+          is about 500 pixels of ink; the disc gives it area, which is what the eye
+          actually catches in a quarter of a second.
+        - Thicker strokes and a larger centre dot, because at desktop scale the originals
+          were sub-pixel on a non-primary monitor.
+        """
         elapsed_ms = (time.monotonic() - self._ripple_start_time) * 1000.0
         progress = min(1.0, max(0.0, elapsed_ms / config.TARGET_RIPPLE_DURATION_MS))
-        alpha = int(240 * (1.0 - progress))
+
+        fade_from = max(0.0, 1.0 - config.TARGET_RIPPLE_FADE_FRACTION)
+        if progress <= fade_from:
+            fade = 1.0
+        else:
+            fade = 1.0 - (progress - fade_from) / max(1e-6, 1.0 - fade_from)
+        fade = max(0.0, min(1.0, fade))
 
         radius = int(progress * config.TARGET_RIPPLE_MAX_RADIUS)
         inner_radius = int(radius * 0.45)
 
-        # Expanding outer circle
-        outer_pen = QPen(QColor(58, 134, 255, alpha), 2.0)
-        painter.setPen(outer_pen)
+        base_alpha = int(235 * fade)
+
+        # Filled disc: low alpha so it reads as a glow rather than hiding what is under
+        # it. The overlay is click-through, but obscuring the target the agent is about
+        # to click would defeat the purpose of marking it.
+        if radius > 1:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(58, 134, 255, int(46 * fade))))
+            painter.drawEllipse(pos, radius, radius)
+
+        # Expanding outer ring
+        painter.setPen(QPen(QColor(58, 134, 255, base_alpha), 3.0))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(pos, radius, radius)
 
         # Concentric inner ring
         if inner_radius > 2:
-            inner_pen = QPen(QColor(123, 44, 191, int(alpha * 0.9)), 1.5)
-            painter.setPen(inner_pen)
+            painter.setPen(QPen(QColor(123, 44, 191, int(base_alpha * 0.95)), 2.5))
             painter.drawEllipse(pos, inner_radius, inner_radius)
 
-        # Center target dot
-        dot_pen = QPen(QColor(255, 255, 255, alpha), 1.0)
-        dot_brush = QBrush(QColor(255, 50, 100, alpha))
-        painter.setPen(dot_pen)
-        painter.setBrush(dot_brush)
-        painter.drawEllipse(pos, 4, 4)
+        # Centre dot stays legible for the whole animation rather than fading with the
+        # rings: it marks the point, and the point is still the point at the end.
+        dot_alpha = max(base_alpha, int(235 * (1.0 - progress * 0.5)))
+        painter.setPen(QPen(QColor(255, 255, 255, dot_alpha), 1.5))
+        painter.setBrush(QBrush(QColor(255, 50, 100, dot_alpha)))
+        painter.drawEllipse(pos, 6, 6)
 
-        # Crosshair lines
-        line_len = 10
-        painter.setPen(QPen(QColor(255, 255, 255, int(alpha * 0.7)), 1.0))
-        painter.drawLine(pos.x() - line_len, pos.y(), pos.x() - 4, pos.y())
-        painter.drawLine(pos.x() + 4, pos.y(), pos.x() + line_len, pos.y())
-        painter.drawLine(pos.x(), pos.y() - line_len, pos.x(), pos.y() - 4)
-        painter.drawLine(pos.x(), pos.y() + 4, pos.x(), pos.y() + line_len)
+        # Crosshair lines. Scaled with the rest of the marker: at the old 10 px arm on a
+        # 36 px ring the arms were shorter than the dot is now, and the whole reticle
+        # read as a speck at desktop scale.
+        line_len = max(14, int(config.TARGET_RIPPLE_MAX_RADIUS * 0.22))
+        gap = 8
+        painter.setPen(QPen(QColor(255, 255, 255, int(dot_alpha * 0.85)), 2.0))
+        painter.drawLine(pos.x() - line_len, pos.y(), pos.x() - gap, pos.y())
+        painter.drawLine(pos.x() + gap, pos.y(), pos.x() + line_len, pos.y())
+        painter.drawLine(pos.x(), pos.y() - line_len, pos.x(), pos.y() - gap)
+        painter.drawLine(pos.x(), pos.y() + gap, pos.x(), pos.y() + line_len)
 
