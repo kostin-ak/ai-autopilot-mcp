@@ -1626,5 +1626,49 @@ async def execute_batch(
     return blocks
 
 
+@mcp.tool()
+async def get_cursor_state() -> str:
+    """
+    Read the pointer shape and the caret position without moving anything.
+
+    Two facts no screenshot provides.
+
+    The shape says what the thing under the pointer accepts: `ibeam` means the target
+    takes text, `hand` means it is clickable, `no` means the action would be refused,
+    `wait` or `appstarting` means the application is busy and any action now is
+    unreliable. That is evidence about the target obtained *before* typing or clicking,
+    which is when a wrong guess is still cheap.
+
+    The caret rectangle says where typed text will actually land -- a different question
+    from where the pointer is, since a field can hold focus and a blinking caret while the
+    pointer sits anywhere else on screen. When no caret exists at all, no input field has
+    focus and text typed now goes nowhere; that is worth knowing before blaming the
+    application for swallowing it.
+
+    Standard shapes are identified by comparing the pointer handle against the handles
+    LoadCursor returns for each system cursor. Anything else is reported as `custom`,
+    which is a real case (application-drawn cursors), not an error.
+
+    Observation only: it takes no input lock and works while a human has the machine.
+    """
+    resp = await _send_daemon_request("get_cursor_state", {})
+    if resp.get("status") != "ok":
+        return f"Ошибка чтения состояния курсора: {resp.get('message', 'Неизвестная ошибка')}"
+
+    d = resp.get("data", {})
+    cur = d.get("cursor") or {}
+    car = d.get("caret") or {}
+    lines = [d.get("message", "")]
+    lines.append(f"  позиция: {cur.get('position')}  виден: {cur.get('showing')}  "
+                 f"handle: {cur.get('handle')}")
+    if car.get("available"):
+        lines.append(f"  каретка: видна={car.get('caret_visible')} "
+                     f"rect={car.get('caret_rect')} "
+                     f"hwnd_caret={car.get('hwnd_caret')}")
+        lines.append(f"  фокус:   hwnd={car.get('hwnd_focus')} "
+                     f"класс={car.get('focus_class')!r} поток={car.get('thread_id')}")
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     main()

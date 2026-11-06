@@ -200,6 +200,170 @@ if sys.platform == "win32":
     }
 
 
+# Standard system cursors are shared handles, so the shape can be identified by comparing
+# GetCursorInfo's handle against the handle LoadCursor returns for each standard id.
+#
+# The comparison must be built at runtime rather than from a table of constants, and this
+# was measured rather than assumed: a hand-written handle table was wrong on all 18
+# entries. The documented IDC_* values are resource identifiers, not handles -- on this
+# machine the arrow loads as 65539, the I-beam as 65541, and so on. A hard-coded table
+# therefore classified every cursor as custom, which reads as "this technique does not
+# work here" when in fact the table was simply wrong.
+_IDC_CURSORS: dict[int, str] = {
+    32512: "arrow",
+    32513: "ibeam",          # text entry point
+    32514: "wait",
+    32515: "cross",
+    32516: "uparrow",
+    32642: "sizenwse",
+    32643: "sizenesw",
+    32644: "sizewe",
+    32645: "sizens",
+    32646: "sizeall",
+    32648: "no",             # action refused
+    32649: "hand",           # clickable
+    32650: "appstarting",
+    32651: "help",
+    32671: "pin",
+    32672: "person",
+}
+
+# handle -> shape name, filled on first use and cached. Handles for shared system cursors
+# are stable for the session, so resolving them once is enough.
+_CURSOR_HANDLE_MAP: dict[int, str] | None = None
+
+# Obsolete ids that LoadCursor refuses (returns 0) are skipped rather than mapped: a
+# handle of 0 means "not loaded", and mapping it would make a failed GetCursorInfo look
+# like a recognised shape.
+_OBSOLETE_IDC = {32640: "size", 32641: "icon"}
+
+
+def _build_cursor_handle_map() -> dict[int, str]:
+    """Resolves each standard cursor id to the handle this system gives it."""
+    user32 = ctypes.windll.user32
+    user32.LoadCursorW.restype = wintypes.HANDLE
+    user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+    out: dict[int, str] = {}
+    for idc, name in _IDC_CURSORS.items():
+        # MAKEINTRESOURCE packs the id into the low word of a pointer-sized value.
+        handle = int(user32.LoadCursorW(None, wintypes.LPCWSTR(idc)) or 0)
+        if handle:
+            out[handle] = name
+    return out
+
+
+def standard_cursor_handles() -> dict[int, str]:
+    """handle -> shape name for the standard cursors, resolved once."""
+    global _CURSOR_HANDLE_MAP
+    if _CURSOR_HANDLE_MAP is None:
+        _CURSOR_HANDLE_MAP = _build_cursor_handle_map()
+    return _CURSOR_HANDLE_MAP
+
+
+class CURSORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("hCursor", ctypes.c_void_p), ("ptScreenPos", POINT)]
+
+
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND), ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT)]
+
+
+# CURSORINFO_SHOWING: the pointer is visible. When it is absent the handle still names a
+# cursor shape, but nothing is drawn -- which matters because a hidden pointer is a
+# different fact from an arrow.
+CURSORINFO_SHOWING = 0x00000001
+
+
+def get_cursor_shape() -> dict:
+    """Current pointer shape, position and whether it is drawn.
+
+    "ibeam" over a point is evidence the thing under it accepts text, before any text is
+    typed; "hand" is evidence it is a link or button; "no" is evidence the action would
+    be refused. Those are cheaper and more reliable than OCR for deciding whether a
+    target is editable.
+
+    Returns shape="unavailable" if the call fails rather than guessing "arrow", because a
+    guess would look like a positive answer.
+    """
+    user32 = ctypes.windll.user32
+    user32.GetCursorInfo.argtypes = [ctypes.POINTER(CURSORINFO)]
+    user32.GetCursorInfo.restype = wintypes.BOOL
+
+    info = CURSORINFO()
+    info.cbSize = ctypes.sizeof(CURSORINFO)
+    if not user32.GetCursorInfo(ctypes.byref(info)):
+        return {"shape": "unavailable", "showing": False, "position": None,
+                "handle": None, "error": ctypes.GetLastError()}
+
+    handle = int(info.hCursor or 0)
+    return {
+        "shape": standard_cursor_handles().get(handle, "custom"),
+        "showing": bool(info.flags & CURSORINFO_SHOWING),
+        "position": [int(info.ptScreenPos.x), int(info.ptScreenPos.y)],
+        "handle": handle,
+    }
+
+
+def get_caret_info(thread_id: int | None = None) -> dict:
+    """Caret rectangle and focus window, in screen coordinates.
+
+    The caret position is where typed text will land, which is a different question from
+    where the pointer is: a text box has focus and a blinking caret while the pointer can
+    be anywhere on screen.
+
+    ``thread_id`` defaults to the foreground window's thread, because passing 0 to
+    GetGUIThreadInfo means "the calling thread" -- and the daemon is not the application
+    being automated, so 0 would report the daemon's own (empty) GUI state and look like
+    a successful answer about the wrong process.
+    """
+    user32 = ctypes.windll.user32
+    user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)]
+    user32.GetGUIThreadInfo.restype = wintypes.BOOL
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                                ctypes.POINTER(wintypes.DWORD)]
+
+    if thread_id is None:
+        fg = user32.GetForegroundWindow()
+        if not fg:
+            return {"available": False, "error": "no foreground window"}
+        thread_id = int(user32.GetWindowThreadProcessId(wintypes.HWND(fg), None))
+
+    info = GUITHREADINFO()
+    info.cbSize = ctypes.sizeof(GUITHREADINFO)
+    if not user32.GetGUIThreadInfo(wintypes.DWORD(thread_id), ctypes.byref(info)):
+        return {"available": False, "error": ctypes.GetLastError(),
+                "thread_id": thread_id}
+
+    rc = info.rcCaret
+    return {
+        "available": True,
+        "thread_id": thread_id,
+        # GUI_CARETBLINKING is 0x2. Its absence means the caret is present but not
+        # blinking, which happens while text is being inserted.
+        "caret_visible": bool(info.flags & 0x00000002),
+        "caret_rect": [int(rc.left), int(rc.top), int(rc.right), int(rc.bottom)],
+        "caret_empty": int(rc.right) - int(rc.left) == 0 and int(rc.bottom) - int(rc.top) == 0,
+        "hwnd_focus": int(info.hwndFocus or 0),
+        "hwnd_active": int(info.hwndActive or 0),
+        "hwnd_caret": int(info.hwndCaret or 0),
+        "focus_class": _window_class(int(info.hwndFocus or 0)),
+    }
+
+
+def _window_class(hwnd: int) -> str:
+    if not hwnd:
+        return ""
+    buf = ctypes.create_unicode_buffer(80)
+    n = ctypes.windll.user32.GetClassNameW(wintypes.HWND(hwnd), buf, 80)
+    return buf.value[:n] if n else ""
+
+
 def seconds_since_physical_input() -> float | None:
     """Seconds since the session last saw physical input, or None if unavailable.
 

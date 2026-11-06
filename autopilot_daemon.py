@@ -31,6 +31,7 @@ import audit
 import config
 import event_waiter
 import host_guard
+import input_controller
 import risk
 import session_state
 import single_instance
@@ -98,6 +99,11 @@ NON_INPUT_ACTIONS: frozenset[str] = frozenset({
     # the cheapest observation in the set -- no capture, no tree walk -- so blocking it
     # behind the input lock would serialise waiting against acting for no reason.
     "wait_for_event",
+    # Reading the pointer shape and the caret rect moves nothing and holds no input, so
+    # it stays available during a pause. It is also the reading that tells the agent a
+    # target accepts text before it types -- which is exactly when a paused session most
+    # needs to be observable rather than blocked.
+    "get_cursor_state",
     "reset_override",
     "release_control",
     "hud_state",
@@ -218,6 +224,50 @@ def pause_message() -> str:
           "со стороны пользователя."
         + tail
     )
+
+
+def _describe_cursor(shape: dict[str, Any], caret: dict[str, Any]) -> str:
+    """Turns the two readings into a sentence that says what they license.
+
+    Naming the shape is not the useful part; saying what it permits is. "ibeam" on its
+    own leaves the caller to know the convention, and the convention is the whole reason
+    the reading was taken.
+    """
+    name = shape.get("shape", "unavailable")
+    meaning = {
+        "ibeam": "цель принимает текст",
+        "hand": "цель кликабельна (ссылка или кнопка)",
+        "no": "действие здесь будет отклонено",
+        "wait": "приложение занято, действие сейчас ненадёжно",
+        "appstarting": "приложение запускается, действие сейчас ненадёжно",
+        "arrow": "обычный указатель",
+        "sizeall": "цель можно перетаскивать",
+        "sizewe": "цель можно тянуть по горизонтали",
+        "sizens": "цель можно тянуть по вертикали",
+        "sizenwse": "цель можно тянуть по диагонали",
+        "sizenesw": "цель можно тянуть по диагонали",
+        "custom": "курсор приложения; форма не опознана как системная",
+        "unavailable": "форму курсора прочитать не удалось",
+    }.get(name, name)
+    if not shape.get("showing", True):
+        meaning += "; указатель сейчас скрыт"
+
+    text = f"Курсор: {name} — {meaning}."
+    if caret.get("available"):
+        if caret.get("caret_visible"):
+            r = caret.get("caret_rect") or []
+            text += (f" Каретка видна в {r}, фокус на "
+                     f"{caret.get('focus_class') or 'неизвестном классе'} "
+                     f"(hwnd={caret.get('hwnd_focus')}) — текст ляжет туда.")
+        elif caret.get("hwnd_caret"):
+            text += (" Каретка есть, но не мигает — обычно так бывает во время вставки "
+                     "текста.")
+        else:
+            text += (" Каретки нет: ни одно поле ввода не держит фокус, поэтому вводимый "
+                     "текст никуда не попадёт.")
+    else:
+        text += f" Состояние каретки недоступно ({caret.get('error')})."
+    return text
 
 
 class AutopilotDaemon:
@@ -495,6 +545,30 @@ class AutopilotDaemon:
         if note:
             data["session_warning"] = note
         return resp
+
+    async def _action_get_cursor_state(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Pointer shape plus caret position, read without touching the cursor.
+
+        Two facts no screenshot provides. The shape says what the thing under the pointer
+        accepts -- an I-beam means text, a hand means clickable, "no" means the action
+        would be refused -- and it says so before anything is typed or clicked. The caret
+        rectangle says where text will actually land, which is a different question from
+        where the pointer is: a field can hold focus and a blinking caret while the
+        pointer sits anywhere else on screen.
+
+        Observation only, so it holds no input lock and works while a human has the
+        machine.
+        """
+        shape = await asyncio.to_thread(input_controller.get_cursor_shape)
+        caret = await asyncio.to_thread(input_controller.get_caret_info)
+        return {
+            "status": "ok",
+            "data": {
+                "cursor": shape,
+                "caret": caret,
+                "message": _describe_cursor(shape, caret),
+            },
+        }
 
     # ------------------------------------------------------ event waiting
     def _event_quiescence(self, since_tick: int, quiet_ms: float,
@@ -1069,6 +1143,8 @@ class AutopilotDaemon:
                 return await self._action_wait_for_text(params)
             elif action == "wait_for_event":
                 return await self._action_wait_for_event(params)
+            elif action == "get_cursor_state":
+                return await self._action_get_cursor_state(params)
             elif action == "execute_batch":
                 # Mutates application state, so it is deliberately absent from
                 # NON_INPUT_ACTIONS: it takes the input lock and stays blocked during
