@@ -1822,6 +1822,19 @@ class AutopilotDaemon:
                         "class_name": w.class_name,
                         "pid": w.pid,
                         "is_active": w.is_active,
+                        # Spread only when determined, because this dict is built from a
+                        # fixed field list: an attribute set on the WindowInfo object does
+                        # not reach the response on its own. Without these two lines the
+                        # annotate() call above computed the desktop and then threw it away
+                        # at serialization -- a feature that was dead while every test that
+                        # exercised annotate still passed.
+                        #
+                        # Conditional rather than always-present-and-null: unknown must not
+                        # read as "elsewhere", which is what a false default would say.
+                        **({"on_current_desktop": w.on_current_desktop}
+                           if getattr(w, "on_current_desktop", None) is not None else {}),
+                        **({"desktop_id": w.desktop_id}
+                           if getattr(w, "desktop_id", None) else {}),
                     }
                     for w in windows[:25]
                 ],

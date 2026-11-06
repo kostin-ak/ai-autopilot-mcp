@@ -144,6 +144,78 @@ class TestAnnotate:
         assert getattr(w, "on_current_desktop", None) in (True, False, None)
 
 
+class TestSerializationCarriesTheField:
+    """The defect this class exists to prevent.
+
+    The daemon builds the windows payload from a fixed field list, so an attribute set on
+    the WindowInfo object by annotate() does not reach the response on its own. Before the
+    spread was added, the field was computed and discarded at serialization -- dead while
+    every test that exercised annotate still passed. A test over annotate alone cannot see
+    that; only the serialized dict can.
+    """
+
+    def _daemon_with_windows(self, windows):
+        import asyncio
+
+        from autopilot_daemon import AutopilotDaemon
+
+        d = AutopilotDaemon.__new__(AutopilotDaemon)
+        d.vision = type("V", (), {
+            "list_monitors": lambda self: [],
+            "list_windows": lambda self: windows,
+        })()
+        return asyncio.run(d._action_list_windows_and_monitors())
+
+    def test_a_determined_value_reaches_the_payload(self):
+        class W:
+            handle = 1
+            title = "t"
+            rect = (0, 0, 1, 1)
+            monitor_index = 1
+            on_monitor = True
+            class_name = "C"
+            pid = 1
+            is_active = False
+            on_current_desktop = True
+
+        data = self._daemon_with_windows([W()])["data"]
+        assert data["windows"][0]["on_current_desktop"] is True
+
+    def test_an_absent_value_stays_absent(self):
+        """Unknown must not become false in the payload, the same rule as in the text."""
+        class W:
+            handle = 2
+            title = "t"
+            rect = (0, 0, 1, 1)
+            monitor_index = 1
+            on_monitor = True
+            class_name = "C"
+            pid = 1
+            is_active = False
+
+        data = self._daemon_with_windows([W()])["data"]
+        assert "on_current_desktop" not in data["windows"][0]
+        assert "desktop_id" not in data["windows"][0]
+
+    def test_a_false_value_is_preserved_not_dropped(self):
+        """The conditional spread must not mistake False for absent."""
+        class W:
+            handle = 3
+            title = "t"
+            rect = (0, 0, 1, 1)
+            monitor_index = 1
+            on_monitor = True
+            class_name = "C"
+            pid = 1
+            is_active = False
+            on_current_desktop = False
+            desktop_id = "{11111111-2222-3333-4444-555555555555}"
+
+        row = self._daemon_with_windows([W()])["data"]["windows"][0]
+        assert row["on_current_desktop"] is False
+        assert row["desktop_id"] == "{11111111-2222-3333-4444-555555555555}"
+
+
 class TestTheFieldIsVisible:
     """A field that exists in the data but not in the formatted text is a field nobody
     reads. The model sees the text, so the mark is where the reading has to appear."""
