@@ -284,6 +284,18 @@ CURSOR_COLOR_OUTLINE: tuple[int, int, int] = (0, 0, 0)       # Black border
 # Set to "drawn" to restore the old rendering without touching code.
 CURSOR_RENDER_MODE: str = "native"
 
+# Upper bound on hold_key's duration, in milliseconds. Capped rather than trusted: an
+# unbounded hold keeps a key pressed and the daemon's input thread busy for as long as the
+# caller asked, and nothing else in the system would explain why the keyboard had stopped
+# behaving. Ten seconds covers a long press in any application that distinguishes one.
+HOLD_KEY_MAX_MS: int = 10_000
+
+# Upper bound on the plain wait action, in milliseconds. The condition-based waits
+# (wait_for_event, wait_for_text, wait_terminal) return as soon as the thing happens; a
+# fixed sleep returns after a guess. Capping it keeps the guess from becoming a way to
+# block the daemon for an arbitrary time.
+WAIT_MAX_MS: int = 30_000
+
 
 # ---------------------------------------------------------
 # Safety layer (ADR-0004)

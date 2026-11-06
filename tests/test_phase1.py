@@ -58,6 +58,10 @@ class StubController:
     # method taking self. `_send_win32_key` is deliberately NOT rebound -- the stub has
     # its own recording version, and overwriting it broke hotkey and unicode typing.
     _button_flags = staticmethod(ic.InputController._button_flags)
+    # Same reason, same trap: press_hotkey now resolves tokens through a shared static
+    # method, and a staticmethod read off a class is a plain function that becomes an
+    # instance method when assigned to another class.
+    _resolve_hotkey = staticmethod(ic.InputController._resolve_hotkey)
     click = ic.InputController.click
     scroll = ic.InputController.scroll
 

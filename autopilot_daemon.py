@@ -106,6 +106,10 @@ NON_INPUT_ACTIONS: frozenset[str] = frozenset({
     # target accepts text before it types -- which is exactly when a paused session most
     # needs to be observable rather than blocked.
     "get_cursor_state",
+    # Waiting holds no input and moves nothing. Serialising it against acting would block
+    # a no-op behind the most expensive action, and a caller that wants to let the desktop
+    # settle is doing the opposite of contending for the cursor.
+    "wait",
     "reset_override",
     "release_control",
     "hud_state",
@@ -570,6 +574,114 @@ class AutopilotDaemon:
                 "caret": caret,
                 "message": _describe_cursor(shape, caret),
             },
+        }
+
+    async def _action_hold_key(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Holds a key combination down for a given duration, then releases it.
+
+        Class A: it occupies the session keyboard, so physical input interrupts it. The
+        release happens either way -- see InputController.hold_key.
+        """
+        hotkey = params.get("hotkey")
+        duration = params.get("duration_ms", 500)
+        if not hotkey or not isinstance(hotkey, str):
+            return {"status": "error",
+                    "message": "hold_key требует строку 'hotkey'; клавиши НЕ отправлены."}
+        try:
+            duration_ms = int(duration)
+        except (TypeError, ValueError):
+            return {"status": "error",
+                    "message": (f"duration_ms должно быть целым числом, получено "
+                                f"{duration!r}; клавиши НЕ отправлены.")}
+
+        fg_pid = await asyncio.to_thread(host_guard.foreground_pid)
+        app = (self.host_tree.names.get(fg_pid, "") if self.host_tree and fg_pid
+               else "")
+        # Classified as a hotkey rather than as an unknown verb, and against the focused
+        # application: holding Enter for a second in a messenger is the send action, and
+        # the level has to say so or the batch policy would treat it as reversible.
+        level = self._risk_of("hotkey", verb=str(hotkey), app=app)
+        if (refusal := self._host_refusal(fg_pid, bool(params.get("allow_host_input")),
+                                          f"клавиши {hotkey!r} в {app or 'фокусе'}",
+                                          "hold_key")) is not None:
+            return refusal
+
+        since_tick = event_waiter.tick_now()
+        self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
+        await asyncio.to_thread(self.input_ctrl.hold_key, hotkey, duration_ms)
+
+        cursor_abs = self.input_ctrl.get_cursor_pos()
+        encoded_webp, w, h, sx, sy, mon = await asyncio.to_thread(
+            self.vision.capture_screen,
+            monitor_index=params.get("monitor_index"),
+            cursor_pos=cursor_abs,
+            wait_stabilization=True,
+            show_grid=params.get("show_grid", False),
+            since_tick=since_tick,
+        )
+        return {
+            "status": "ok",
+            "state": self.input_ctrl.state.value,
+            "_risk": level,
+            "data": self._frame_block(
+                encoded_webp, w, h, sx, sy, mon, cursor_abs,
+                risk_level=level.level,
+                risk_reason=level.reason,
+                hotkey=hotkey,
+                held_ms=min(duration_ms, config.HOLD_KEY_MAX_MS),
+                capped=duration_ms > config.HOLD_KEY_MAX_MS,
+                message=(f"Клавиши {hotkey!r} удержаны "
+                         f"{min(duration_ms, config.HOLD_KEY_MAX_MS)} мс и отпущены."),
+            ),
+        }
+
+    async def _action_wait(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Waits a bounded time and returns a fresh frame.
+
+        Deliberately capped and deliberately dull. The condition-based waits
+        (wait_for_event, wait_for_text, wait_terminal) are cheaper and more reliable,
+        because they return as soon as the thing happens instead of after a guessed
+        duration; this exists for the case where there is no observable condition -- a
+        known server-side delay, a rate limit, a fixed animation.
+        """
+        raw = params.get("duration_ms", 1000)
+        try:
+            duration_ms = int(raw)
+        except (TypeError, ValueError):
+            return {"status": "error",
+                    "message": f"duration_ms должно быть целым числом, получено {raw!r}."}
+        if duration_ms < 0:
+            return {"status": "error",
+                    "message": f"Длительность ожидания не может быть отрицательной "
+                               f"(получено {duration_ms})."}
+        capped = min(duration_ms, config.WAIT_MAX_MS)
+        if capped:
+            await asyncio.sleep(capped / 1000.0)
+
+        cursor_abs = self.input_ctrl.get_cursor_pos()
+        encoded_webp, w, h, sx, sy, mon = await asyncio.to_thread(
+            self.vision.capture_screen,
+            monitor_index=params.get("monitor_index"),
+            cursor_pos=cursor_abs,
+            # No stabilization wait on top of an explicit wait: the caller asked for a
+            # duration, and adding an unbounded quiet-window search to it would make the
+            # result depend on desktop activity the caller did not ask about.
+            wait_stabilization=False,
+            show_grid=params.get("show_grid", False),
+        )
+        return {
+            "status": "ok",
+            "state": self.input_ctrl.state.value,
+            "data": self._frame_block(
+                encoded_webp, w, h, sx, sy, mon, cursor_abs,
+                waited_ms=capped,
+                requested_ms=duration_ms,
+                capped=duration_ms > capped,
+                message=(f"Ожидание {capped} мс завершено."
+                         + (f" Запрошено {duration_ms} мс, ограничено до {capped} мс "
+                            f"(предел WAIT_MAX_MS)."
+                            if duration_ms > capped else "")),
+            ),
         }
 
     # ------------------------------------------------------ event waiting
@@ -1147,6 +1259,10 @@ class AutopilotDaemon:
                 return await self._action_wait_for_event(params)
             elif action == "get_cursor_state":
                 return await self._action_get_cursor_state(params)
+            elif action == "hold_key":
+                return await self._action_hold_key(params)
+            elif action == "wait":
+                return await self._action_wait(params)
             elif action == "execute_batch":
                 # Mutates application state, so it is deliberately absent from
                 # NON_INPUT_ACTIONS: it takes the input lock and stays blocked during

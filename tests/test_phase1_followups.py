@@ -791,6 +791,7 @@ class TestToolDescriptions:
         "read_terminal", "write_terminal", "wait_terminal",
         "find_text_on_screen", "read_screen_text", "wait_for_text",
         "wait_for_event", "execute_batch", "get_cursor_state",
+        "hold_key", "wait",
     }
 
     def test_element_verbs_match_the_daemon_dispatch(self):

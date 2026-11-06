@@ -1034,22 +1034,23 @@ class InputController:
                 )
             time.sleep(config.UNICODE_CHAR_DELAY_SEC)
 
-    def press_hotkey(self, hotkey_str: str) -> None:
-        """Parses and executes key combinations like 'ctrl+c', 'alt+tab', 'enter'.
+    @staticmethod
+    def _resolve_hotkey(hotkey_str: str) -> list[int]:
+        """Turns 'ctrl+shift+a' into virtual key codes, or raises.
+
+        Shared by press_hotkey and hold_key. Two copies of this parser would drift the way
+        four copies of the frame response did, and the drift would show up as one action
+        accepting a token the other refuses.
 
         An unrecognized token aborts the whole combination rather than being skipped.
         Skipping sent real keystrokes for partial garbage: a live check with
-        "not+a+key+combo" pressed the letter A, because "a" is a single-character
-        token and was sent while the other three were silently dropped. Nothing is
-        sent unless every token is understood, and the message names the ones that
-        were not, so a caller can tell a typo from a missing mapping.
+        "not+a+key+combo" pressed the letter A, because "a" is a single-character token and
+        was sent while the other three were silently dropped. Nothing is sent unless every
+        token is understood, and the message names the ones that were not.
         """
-        if self.state == AutopilotState.USER_OVERRIDE:
-            raise InterruptedByUserError("Hotkey aborted: System is in USER_OVERRIDE mode.")
-
         parts = [p.strip().lower() for p in hotkey_str.split("+")]
-        vks = []
-        unknown = []
+        vks: list[int] = []
+        unknown: list[str] = []
         for part in parts:
             if not part:
                 unknown.append("<пусто>")
@@ -1077,6 +1078,14 @@ class InputController:
                 f"hotkey {hotkey_str!r} не содержит ни одной клавиши; "
                 "ничего не отправлено."
             )
+        return vks
+
+    def press_hotkey(self, hotkey_str: str) -> None:
+        """Parses and executes key combinations like 'ctrl+c', 'alt+tab', 'enter'."""
+        if self.state == AutopilotState.USER_OVERRIDE:
+            raise InterruptedByUserError("Hotkey aborted: System is in USER_OVERRIDE mode.")
+
+        vks = self._resolve_hotkey(hotkey_str)
 
         # Press all keys in order
         for vk in vks:
@@ -1089,6 +1098,49 @@ class InputController:
         for vk in reversed(vks):
             self._send_win32_key(vk, key_up=True)
             time.sleep(0.02)
+
+    def hold_key(self, hotkey_str: str, duration_ms: int) -> None:
+        """Presses a combination, holds it for a given time, then releases it.
+
+        The gap press_hotkey cannot fill: it holds for a fixed 40 ms, which is enough for
+        a shortcut the target reads on key-down and not enough for anything that samples
+        the keyboard over time -- a game, a media key, an application that distinguishes a
+        tap from a hold.
+
+        Release is in a finally, and that is the part that matters. A key left down turns
+        every subsequent keystroke in the session into a shortcut, a fault that outlives
+        this call by an unbounded time and is very hard to attribute back to it. An
+        interrupt during the hold raises out of the sleep and still releases.
+
+        The duration is capped rather than trusted: an unbounded hold would keep the
+        daemon's input thread busy and the key pressed for as long as the caller asked,
+        with no way for anyone else to notice why the keyboard had stopped behaving.
+        """
+        if self.state == AutopilotState.USER_OVERRIDE:
+            raise InterruptedByUserError("hold_key aborted: System is in USER_OVERRIDE mode.")
+
+        vks = self._resolve_hotkey(hotkey_str)
+        if duration_ms < 0:
+            raise ValueError(
+                f"Длительность удержания не может быть отрицательной "
+                f"(получено {duration_ms}); клавиши НЕ отправлены."
+            )
+        capped = min(int(duration_ms), config.HOLD_KEY_MAX_MS)
+
+        held: list[int] = []
+        try:
+            for vk in vks:
+                self._send_win32_key(vk, key_up=False)
+                held.append(vk)
+                time.sleep(0.02)
+            if capped:
+                time.sleep(capped / 1000.0)
+        finally:
+            for vk in reversed(held):
+                try:
+                    self._send_win32_key(vk, key_up=True)
+                except Exception as exc:  # pragma: no cover - must not mask the first error
+                    logger.error("hold_key failed to release vk=%#x: %s", vk, exc)
 
     def type_text(self, text: str) -> None:
         """Types text, layout-independent and clipboard-free for normal payloads.

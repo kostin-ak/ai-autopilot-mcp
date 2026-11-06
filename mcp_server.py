@@ -1693,5 +1693,74 @@ async def get_cursor_state() -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+async def hold_key(
+    hotkey: str,
+    duration_ms: int = 500,
+    monitor_index: int | None = None,
+    show_grid: bool = False,
+) -> list[ImageContent | TextContent]:
+    """
+    Press a key combination, hold it for a while, then release it.
+
+    Use this when the target cares how long a key was down, which `keyboard_action` cannot
+    express: it holds for a fixed 40 ms, enough for a shortcut read on key-down and not
+    enough for anything that samples the keyboard over time -- a game, a media key, an
+    application that distinguishes a tap from a hold.
+
+    The keys are released even if something interrupts the hold. That matters more than it
+    sounds: a key left down turns every later keystroke in the session into a shortcut, a
+    fault that outlives this call by an unbounded time and is very hard to trace back to
+    it.
+
+    `duration_ms` is capped at `HOLD_KEY_MAX_MS`; the response says whether it was capped.
+
+    Class A: this occupies the session keyboard, so a physical keypress switches the daemon
+    to USER_OVERRIDE and aborts it.
+
+    Args:
+        hotkey: Combination such as 'w', 'shift+w', 'ctrl+alt+del', 'f5'.
+        duration_ms: How long to hold, default 500.
+        monitor_index: Which monitor the returned frame comes from.
+        show_grid: Overlay a grid on the resulting frame. Off by default.
+    """
+    resp = await _send_daemon_request("hold_key", {
+        "hotkey": hotkey,
+        "duration_ms": duration_ms,
+        "monitor_index": monitor_index,
+        "show_grid": show_grid,
+    })
+    return _format_image_and_text(resp)
+
+
+@mcp.tool()
+async def wait(
+    duration_ms: int = 1000,
+    monitor_index: int | None = None,
+    show_grid: bool = False,
+) -> list[ImageContent | TextContent]:
+    """
+    Wait a fixed time, then return a fresh frame of the screen.
+
+    Reach for the condition-based waits first. `wait_for_event` waits on the interface's
+    own change notifications, `wait_for_text` on text appearing or disappearing, and
+    `wait_terminal` on a line in a console buffer; all three return as soon as the thing
+    happens rather than after a guessed duration, and none of them can be wrong about how
+    long an operation takes. A fixed sleep is the fallback for when there is no observable
+    condition at all -- a known server-side delay, a rate limit, a fixed-length animation.
+
+    `duration_ms` is capped at `WAIT_MAX_MS`, and the response reports both the requested
+    and the actual wait so a cap is visible rather than silent.
+
+    Takes no input lock: it holds nothing and moves nothing.
+    """
+    resp = await _send_daemon_request("wait", {
+        "duration_ms": duration_ms,
+        "monitor_index": monitor_index,
+        "show_grid": show_grid,
+    })
+    return _format_image_and_text(resp)
+
+
 if __name__ == "__main__":
     main()
