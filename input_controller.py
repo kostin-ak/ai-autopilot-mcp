@@ -458,20 +458,32 @@ class InputController:
         if self._on_state_change:
             self._on_state_change(new_state)
 
+    def _drop_stale_physical_position(self) -> None:
+        """Forgets the last physical pointer position.
+
+        It is stale by definition once a pause ends -- the agent has usually moved the
+        cursor since -- so leaving it in place makes the very next physical movement
+        compute a huge delta and re-trigger USER_OVERRIDE immediately.
+        """
+        self._last_phys_x = None
+        self._last_phys_y = None
+
     def reset_override(self) -> None:
-        """Manually or hotkey resets USER_OVERRIDE back to IDLE."""
+        """Manually or hotkey resets USER_OVERRIDE back to IDLE.
+
+        Deliberately IDLE rather than AI_ACTIVE: a human pressing Ctrl+Alt+Space or
+        calling reset_override is clearing the pause, not asking the agent to resume
+        acting on their behalf. Re-acquiring control is take_control's job, and keeping
+        the two distinct means an explicit human gesture does not silently hand the
+        machine back to the agent.
+        """
         if self.state == AutopilotState.USER_OVERRIDE:
             logger.info("Resetting USER_OVERRIDE back to IDLE.")
-            # Drop the last physical position too. It is stale by definition --
-            # the agent has usually moved the cursor since -- so leaving it in
-            # place makes the very next physical movement compute a huge delta
-            # and immediately re-trigger USER_OVERRIDE.
-            self._last_phys_x = None
-            self._last_phys_y = None
+            self._drop_stale_physical_position()
             self.set_state(AutopilotState.IDLE)
 
     def maybe_auto_resume(self) -> bool:
-        """Releases USER_OVERRIDE on its own once the human stops touching input.
+        """Returns control to the agent once the human stops touching input.
 
         Returns True when the state was actually released, so the caller can update
         the overlay.
@@ -482,6 +494,19 @@ class InputController:
         That asymmetry bought no safety: the interrupt trigger stays armed after an
         auto-release, so the human retakes the machine instantly by touching the
         mouse. What it did buy was a stall on every incidental movement.
+
+        Releases to AI_ACTIVE, not IDLE, and the difference is not cosmetic. Control was
+        acquired explicitly by take_control; an incidental mouse twitch followed by five
+        seconds of stillness is not a decision by anyone to give it up. Going to IDLE
+        turned the HUD frame off -- the frame is drawn only while the state is not IDLE --
+        while mouse and keyboard actions kept working, because the gate is on
+        USER_OVERRIDE alone. So the one visible signal about who has the machine said
+        "nobody" while the daemon was still accepting commands. Observed live
+        2026-11-06: take_control, a mouse movement, five seconds of stillness, and the
+        frame vanished with the state reading IDLE and placement_correct still True.
+
+        A manual reset_override still goes to IDLE: a human pressing Ctrl+Alt+Space is
+        clearing the pause, not asking the agent to resume acting.
 
         Idleness is measured with GetLastInputInfo, which counts any physical input in
         the session, including mouse movement -- so a human holding a key or moving
@@ -497,11 +522,10 @@ class InputController:
             return False
         logger.info(
             f"USER_OVERRIDE auto-released after {idle:.1f} s without physical input "
-            f"(threshold {threshold:g} s)."
+            f"(threshold {threshold:g} s); control returned to the agent."
         )
-        # Delegates so the stale physical position is dropped too: leaving it makes
-        # the next movement compute a huge delta and re-trigger immediately.
-        self.reset_override()
+        self._drop_stale_physical_position()
+        self.set_state(AutopilotState.AI_ACTIVE)
         return True
 
     @contextlib.contextmanager

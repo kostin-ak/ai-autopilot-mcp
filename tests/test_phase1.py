@@ -50,6 +50,7 @@ class StubController:
     set_state = ic.InputController.set_state
     reset_override = ic.InputController.reset_override
     maybe_auto_resume = ic.InputController.maybe_auto_resume
+    _drop_stale_physical_position = ic.InputController._drop_stale_physical_position
     _send_win32_mouse_input = ic.InputController._send_win32_mouse_input
     # click now resolves button flags through the shipped path, so the stub must not
     # reimplement it. Re-wrapped in staticmethod: reading it off the class yields the
@@ -570,8 +571,38 @@ class TestIdleAutoResume:
         monkeypatch.setattr(ic, "seconds_since_physical_input", lambda: 10.0)
         stub = StubController(state=AutopilotState.USER_OVERRIDE)
         assert stub.maybe_auto_resume() is True
+        # AI_ACTIVE, not IDLE. Control was acquired explicitly by take_control, and an
+        # incidental mouse twitch followed by stillness is nobody's decision to give it
+        # up. IDLE also turned the HUD frame off while mouse and keyboard actions kept
+        # working, because the gate is on USER_OVERRIDE alone -- so the one visible
+        # signal about who has the machine said "nobody" while commands were accepted.
+        assert stub.state == AutopilotState.AI_ACTIVE
+        assert stub.transitions == [AutopilotState.AI_ACTIVE]
+
+    def test_a_manual_reset_still_goes_to_idle(self):
+        """The two releases are different acts and must not converge.
+
+        A human pressing Ctrl+Alt+Space or calling reset_override is clearing the pause,
+        not asking the agent to resume acting on their behalf. Re-acquiring control is
+        take_control's job.
+        """
+        stub = StubController(state=AutopilotState.USER_OVERRIDE)
+        stub.reset_override()
         assert stub.state == AutopilotState.IDLE
         assert stub.transitions == [AutopilotState.IDLE]
+
+    def test_the_two_releases_land_in_different_states(self, monkeypatch):
+        """Pinned together because they share a helper and a stale-position drop; if one
+        is ever rerouted through the other, the distinction this project just paid for
+        disappears silently."""
+        monkeypatch.setattr(ic, "seconds_since_physical_input", lambda: 10.0)
+        auto = StubController(state=AutopilotState.USER_OVERRIDE)
+        auto.maybe_auto_resume()
+        manual = StubController(state=AutopilotState.USER_OVERRIDE)
+        manual.reset_override()
+        assert auto.state == AutopilotState.AI_ACTIVE
+        assert manual.state == AutopilotState.IDLE
+        assert auto.state != manual.state
 
     def test_stays_paused_while_input_is_recent(self, monkeypatch):
         monkeypatch.setattr(ic, "seconds_since_physical_input", lambda: 0.4)
