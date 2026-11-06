@@ -1906,31 +1906,29 @@ class UIAClient:
     def _is_minimized(self, hwnd: int) -> bool:
         """Whether the window is an icon right now.
 
-        Separate from `set_window_state`, which asks UIA for the visual state: this one
-        answers the Win32 question, so activation can tell "already an icon" from
-        "occluded behind another window" without a UIA round trip.
+        Asks IsIconic rather than parsing WINDOWPLACEMENT.showCmd, and the reason is a
+        measured defect rather than taste: the previous version tested showCmd against
+        (6, 7) -- SW_MINIMIZE and SW_SHOWMINNOACTIVE -- while a normally minimized window
+        reports SW_SHOWMINIMIZED = 2. A minimized window was therefore not recognised as
+        minimized, activate_window proceeded, and the caller was told the window had become
+        foreground while it was still an icon. Verified live by creating a window, sending
+        SW_MINIMIZE, and reading showCmd = 2 with IsIconic = True.
+
+        IsIconic is the dedicated API for exactly this question, so it cannot disagree with
+        the enum values the way a hand-written set does. Kept separate from set_window_state,
+        which asks UIA for the visual state: this answers the Win32 question, so activation
+        can tell "already an icon" from "occluded behind another window" without a UIA round
+        trip.
         """
+        if not hwnd:
+            return False
         try:
             import ctypes
-            from ctypes import wintypes
 
-            class WINDOWPLACEMENT(ctypes.Structure):
-                _fields_ = [
-                    ("length", wintypes.UINT),
-                    ("flags", wintypes.UINT),
-                    ("showCmd", wintypes.UINT),
-                    ("ptMinPosition", wintypes.POINT),
-                    ("ptMaxPosition", wintypes.POINT),
-                    ("rcNormalPosition", wintypes.RECT),
-                ]
-
-            placement = WINDOWPLACEMENT()
-            placement.length = ctypes.sizeof(placement)
-            if not ctypes.windll.user32.GetWindowPlacement(
-                    wintypes.HWND(hwnd), ctypes.byref(placement)):
-                return False
-            # 6 == SW_SHOWMINIMIZED, 7 == SW_SHOWMINNOACTIVE.
-            return int(placement.showCmd) in (6, 7)
+            user32 = ctypes.windll.user32
+            user32.IsIconic.argtypes = [ctypes.c_void_p]
+            user32.IsIconic.restype = ctypes.c_bool
+            return bool(user32.IsIconic(int(hwnd)))
         except Exception:
             return False
 
