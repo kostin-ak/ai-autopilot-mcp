@@ -542,6 +542,17 @@ class VisionEngine:
                 logger.debug("native cursor capture raised, falling back: %s", exc)
                 shot = None
             if shot is not None and shot.image.size[0] > 0 and shot.image.size[1] > 0:
+                # A fully transparent capture is not a failure: applications swap in a
+                # blank cursor resource to hide the pointer over video and while typing.
+                # GetCursorInfo still reports it as showing, and compositing it changes
+                # nothing -- so the agent loses the one thing the marker exists for, the
+                # point a click would land on. Drawing the marker there is the useful
+                # answer even though the pointer is invisible to the operator.
+                if shot.image.getbbox() is None:
+                    logger.debug("captured cursor is fully transparent; drawing the "
+                                 "fallback marker so the click point is still visible")
+                    self._draw_cursor_pointer(image, x, y)
+                    return
                 try:
                     sx, sy = scale
                     # Scaled with the frame. The frame is downscaled to a fixed width, and

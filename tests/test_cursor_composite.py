@@ -33,6 +33,17 @@ def blank(w=400, h=300):
     return Image.new("RGB", (w, h), BG)
 
 
+def _visible(w, h):
+    """A synthetic cursor with something in it.
+
+    A fully transparent image is treated as a blank cursor resource and routed to the
+    fallback marker, so tests about scaling and compositing need one that is not blank.
+    """
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    img.putpixel((0, 0), (255, 255, 255, 255))
+    return img
+
+
 def changed_pixels(a, b, step=2):
     return sum(1 for y in range(0, a.height, step) for x in range(0, a.width, step)
                if a.getpixel((x, y)) != b.getpixel((x, y)))
@@ -56,6 +67,12 @@ class TestCapture:
             pytest.skip("the pointer is hidden right now; nothing to capture")
         assert shot.image.mode == "RGBA"
         assert shot.image.width > 0 and shot.image.height > 0
+        if shot.image.getbbox() is None:
+            # A legitimate case, not a failure: applications swap in a fully transparent
+            # cursor resource to hide the pointer over video or while typing, and
+            # GetCursorInfo still reports it as showing. There is nothing to assert about
+            # an intentionally blank cursor.
+            pytest.skip("the current cursor is a blank resource")
         px = shot.image.load()
         opaque = sum(1 for y in range(shot.image.height)
                      for x in range(shot.image.width) if px[x, y][3] > 0)
@@ -163,14 +180,28 @@ class TestPaintCursor:
         """The assertion that distinguishes the two paths. Without it, a silent fallthrough
         to the fallback passes every test that merely checks something was drawn."""
         shot = cc.capture_cursor()
-        if shot is None:
-            pytest.skip("the pointer is hidden right now")
+        if shot is None or shot.image.getbbox() is None:
+            pytest.skip("no visible cursor to composite right now")
         ve = VisionEngine()
         img = blank()
         ve._paint_cursor(img, 200, 150, (1.0, 1.0))
         assert changed_pixels(img, blank()) > 0, "nothing was painted"
         assert saturated_red_count(img, 200, 150) == 0, (
             "native mode produced the red arrow, so it silently fell back")
+
+    def test_a_blank_cursor_falls_back_so_the_click_point_stays_visible(self, monkeypatch):
+        """Applications swap in a fully transparent cursor to hide the pointer over video.
+        Compositing it changes nothing, so the agent would lose the one thing the marker
+        exists for -- the point a click would land on."""
+        blank_shot = cc.CursorCapture(Image.new("RGBA", (32, 32), (0, 0, 0, 0)),
+                                      (0, 0), (0, 0), 1)
+        assert blank_shot.image.getbbox() is None
+        monkeypatch.setattr(cc, "capture_cursor", lambda: blank_shot)
+        ve = VisionEngine()
+        img = blank()
+        ve._paint_cursor(img, 200, 150, (1.0, 1.0))
+        assert saturated_red_count(img, 200, 150) > 50, (
+            "a blank cursor left the frame with no click-point marker at all")
 
     def test_drawn_mode_still_produces_the_red_arrow(self):
         ve = VisionEngine()
@@ -243,7 +274,7 @@ class TestPaintCursor:
             seen["hotspot"] = shot.hotspot
 
         monkeypatch.setattr(cc, "composite", fake_composite)
-        shot = cc.CursorCapture(Image.new("RGBA", (32, 32), (0, 0, 0, 0)),
+        shot = cc.CursorCapture(_visible(32, 32),
                                 (8, 4), (0, 0), 1)
         monkeypatch.setattr(cc, "capture_cursor", lambda: shot)
         ve = VisionEngine()
@@ -256,7 +287,7 @@ class TestPaintCursor:
         monkeypatch.setattr(
             cc, "composite",
             lambda t, shot, x, y: seen.update(size=shot.image.size))
-        shot = cc.CursorCapture(Image.new("RGBA", (32, 32), (0, 0, 0, 0)),
+        shot = cc.CursorCapture(_visible(32, 32),
                                 (0, 0), (0, 0), 1)
         monkeypatch.setattr(cc, "capture_cursor", lambda: shot)
         VisionEngine()._paint_cursor(blank(200, 150), 100, 75, (1.0, 1.0))
@@ -266,8 +297,8 @@ class TestPaintCursor:
 class TestComposite:
     def test_it_changes_the_target_around_the_point(self):
         shot = cc.capture_cursor()
-        if shot is None:
-            pytest.skip("the pointer is hidden right now")
+        if shot is None or shot.image.getbbox() is None:
+            pytest.skip("no visible cursor to composite right now")
         img = blank()
         before = img.copy()
         cc.composite(img, shot, 200, 150)
