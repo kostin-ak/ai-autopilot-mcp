@@ -35,6 +35,7 @@ import input_controller
 import risk
 import session_state
 import single_instance
+import virtual_desktop
 from config import AutopilotState
 from input_controller import (
     CLICK_MODIFIERS,
@@ -1791,6 +1792,13 @@ class AutopilotDaemon:
         """Returns metadata for all displays and open program windows."""
         monitors = self.vision.list_monitors()
         windows = await asyncio.to_thread(self.vision.list_windows)
+        # Which desktop each window lives on. A window on another virtual desktop is
+        # visible, has a valid handle and a sane rectangle, and yet does not appear in a
+        # capture of that monitor while clicks aimed at its coordinates land on whatever
+        # occupies the spot on the current desktop. Without this the symptom is
+        # indistinguishable from a rendering fault, and the attempts go to the wrong
+        # hypothesis. Unknown results are omitted rather than reported as false.
+        virtual_desktop.annotate(windows)
 
         return {
             "status": "ok",
