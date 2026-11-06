@@ -876,10 +876,11 @@ class AutopilotDaemon:
                 wait_stabilization=True,
                 since_tick=since_tick,
             )
-            return {"screenshot": encoded, "scaled_width": w, "scaled_height": h,
-                    "scale_x": sx, "scale_y": sy,
-                    "stabilization": self.vision.last_stabilization,
-                    "stabilization_ms": round(self.vision.last_stabilization_ms, 1)}
+            return self._frame_block(
+                encoded, w, h, sx, sy, mon, cursor_abs,
+                stabilization=self.vision.last_stabilization,
+                stabilization_ms=round(self.vision.last_stabilization_ms, 1),
+            )
         except Exception as exc:
             # A failed observation must not erase the record of what the batch did. The
             # steps already ran; losing their outcomes would be worse than losing a
@@ -1146,20 +1147,12 @@ class AutopilotDaemon:
             show_grid=show_grid,
         )
 
-        cursor_frame = self._cursor_in_frame(cursor_abs, mon, sx, sy)
-
         return {
             "status": "ok",
             "state": self.input_ctrl.state.value,
-            "data": {
-                "screenshot": encoded_webp,
-                "scaled_width": w,
-                "scaled_height": h,
-                "scale_x": sx,
-                "scale_y": sy,
-                "cursor": cursor_frame,
-                "cursor_desktop": list(cursor_abs),
-                "message": (
+            "data": self._frame_block(
+                encoded_webp, w, h, sx, sy, mon, cursor_abs,
+                message=(
                     "Управление возвращено агенту после перехвата пользователем. "
                     f"Рамка HUD снова активна на мониторе {mon.index} ('{mon.name}'). "
                     "Любое физическое движение мыши или нажатие клавиши снова "
@@ -1168,7 +1161,7 @@ class AutopilotDaemon:
                     f"Управление захвачено. Рамка HUD активна на мониторе "
                     f"{mon.index} ('{mon.name}')."
                 ),
-            },
+            ),
         }
 
     async def _action_release_control(self) -> dict[str, Any]:
@@ -1198,26 +1191,44 @@ class AutopilotDaemon:
             show_grid=show_grid,
         )
 
-        cursor_frame = self._cursor_in_frame(cursor_abs, mon, sx, sy)
-
         return {
             "status": "ok",
             "state": self.input_ctrl.state.value,
-            "data": {
-                "screenshot": encoded_webp,
-                "scaled_width": w,
-                "scaled_height": h,
-                "scale_x": sx,
-                "scale_y": sy,
-                "cursor": cursor_frame,
-                "cursor_desktop": list(cursor_abs),
-                "monitor": {
-                    "index": mon.index,
-                    "name": mon.name,
-                    "bounds": [mon.left, mon.top, mon.width, mon.height],
-                },
+            "data": self._frame_block(encoded_webp, w, h, sx, sy, mon, cursor_abs),
+        }
+
+    def _frame_block(self, encoded: str, w: int, h: int, sx: float, sy: float,
+                     mon: Any, cursor_abs: tuple[int, int],
+                     **extra: Any) -> dict[str, Any]:
+        """The one shape every frame-returning action answers with.
+
+        Four actions each built this dict by hand and they drifted: `take_control` had no
+        `monitor` block, and `keyboard_action` and `scroll_screen` dropped `cursor`,
+        `cursor_desktop`, `scale_x` and `scale_y`. That is not cosmetics. Without the
+        scale a caller cannot convert a frame coordinate into a physical one on its own,
+        and without the cursor it cannot tell whether a keystroke landed where it
+        expected.
+
+        A single builder makes the fields impossible to drop by accident in one action
+        and present in another. `extra` carries the genuinely action-specific parts, such
+        as the coordinates a mouse action was asked to hit.
+        """
+        block: dict[str, Any] = {
+            "screenshot": encoded,
+            "scaled_width": w,
+            "scaled_height": h,
+            "scale_x": sx,
+            "scale_y": sy,
+            "cursor": self._cursor_in_frame(cursor_abs, mon, sx, sy),
+            "cursor_desktop": list(cursor_abs),
+            "monitor": {
+                "index": mon.index,
+                "name": mon.name,
+                "bounds": [mon.left, mon.top, mon.width, mon.height],
             },
         }
+        block.update(extra)
+        return block
 
     def _frame_size(self, monitor_index: int | None) -> tuple[int, int]:
         """Frame dimensions in the coordinate space callers must use.
@@ -1380,24 +1391,11 @@ class AutopilotDaemon:
             "status": "ok",
             "state": self.input_ctrl.state.value,
             "_risk": self._risk_of("click"),
-            "data": {
-                "screenshot": encoded_webp,
-                "scaled_width": w,
-                "scaled_height": h,
-                "scale_x": sx,
-                "scale_y": sy,
-                "requested": [x, y],
-                "cursor": actual,
-                "cursor_desktop": list(cursor_abs),
-                "monitor": {
-                    "index": mon.index,
-                    "name": mon.name,
-                    "bounds": [mon.left, mon.top, mon.width, mon.height],
-                },
-                "message": (
-                    f"Mouse {sub_action} at ({x}, {y}); cursor now at {actual_desc}."
-                ),
-            },
+            "data": self._frame_block(
+                encoded_webp, w, h, sx, sy, mon, cursor_abs,
+                requested=[x, y],
+                message=f"Mouse {sub_action} at ({x}, {y}); cursor now at {actual_desc}.",
+            ),
         }
 
     async def _action_keyboard_action(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -1481,14 +1479,12 @@ class AutopilotDaemon:
             "status": "ok",
             "state": self.input_ctrl.state.value,
             "_risk": level,
-            "data": {
-                "screenshot": encoded_webp,
-                "scaled_width": w,
-                "scaled_height": h,
-                "risk_level": level.level,
-                "risk_reason": level.reason,
-                "message": f"Keyboard action completed (text={bool(text)}, hotkey={hotkey}).",
-            },
+            "data": self._frame_block(
+                encoded_webp, w, h, sx, sy, mon, cursor_abs,
+                risk_level=level.level,
+                risk_reason=level.reason,
+                message=f"Keyboard action completed (text={bool(text)}, hotkey={hotkey}).",
+            ),
         }
 
     async def _action_scroll_screen(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -1565,12 +1561,10 @@ class AutopilotDaemon:
         return {
             "status": "ok",
             "state": self.input_ctrl.state.value,
-            "data": {
-                "screenshot": encoded_webp,
-                "scaled_width": w,
-                "scaled_height": h,
-                "message": f"Scrolled {direction} by {amount} clicks.",
-            },
+            "data": self._frame_block(
+                encoded_webp, w, h, sx, sy, mon, cursor_abs,
+                message=f"Scrolled {direction} by {amount} clicks.",
+            ),
         }
 
     async def _action_list_windows_and_monitors(self) -> dict[str, Any]:

@@ -30,6 +30,18 @@ class FakeUIA:
         return self.names.get(path, {"name": "", "role": "", "pid": None})
 
 
+class FakeMonitor:
+    """Stands in for MonitorInfo. The batch observation goes through the same frame
+    builder as every other frame-returning action, which reads these fields."""
+
+    index = 1
+    name = "DISPLAY1"
+    left = 0
+    top = 0
+    width = 1920
+    height = 1080
+
+
 class FakeVision:
     def __init__(self, raise_on_capture=False):
         self.captures = 0
@@ -41,7 +53,7 @@ class FakeVision:
         self.captures += 1
         if self.raise_on_capture:
             raise RuntimeError("capture failed")
-        return ("B64", 1280, 720, 1.5, 1.5, None)
+        return ("B64", 1280, 720, 1.5, 1.5, FakeMonitor())
 
 
 class FakeInput:
@@ -415,6 +427,19 @@ class TestBatchObservability:
         d = make_daemon(step_results=[ok_envelope("select", "1.0")] * 3)
         out = run(d, {"steps": steps(3)})
         assert "полностью" in out["data"]["message"]
+
+    def test_the_observation_carries_the_unified_frame_shape(self):
+        """A batch's single frame goes through the same builder as every other
+        frame-returning action. Letting it keep a private shape is how the drift this
+        builder exists to prevent starts again, in the fifth place."""
+        d = make_daemon(step_results=[ok_envelope("select", "1.0")])
+        out = run(d, {"steps": steps(1)})
+        data = out["data"]
+        required = {"screenshot", "scaled_width", "scaled_height", "scale_x",
+                    "scale_y", "cursor", "cursor_desktop", "monitor"}
+        missing = required - set(data)
+        assert not missing, f"batch observation is missing {sorted(missing)}"
+        assert data["monitor"]["bounds"] == [0, 0, 1920, 1080]
 
     def test_the_batch_takes_the_input_lock(self):
         """It mutates application state, so it must serialise against in-flight input and
