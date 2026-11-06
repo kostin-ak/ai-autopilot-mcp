@@ -51,6 +51,12 @@ class StubController:
     reset_override = ic.InputController.reset_override
     maybe_auto_resume = ic.InputController.maybe_auto_resume
     _send_win32_mouse_input = ic.InputController._send_win32_mouse_input
+    # click now resolves button flags through the shipped path, so the stub must not
+    # reimplement it. Re-wrapped in staticmethod: reading it off the class yields the
+    # plain function, and assigning that to another class would make it an instance
+    # method taking self. `_send_win32_key` is deliberately NOT rebound -- the stub has
+    # its own recording version, and overwriting it broke hotkey and unicode typing.
+    _button_flags = staticmethod(ic.InputController._button_flags)
     click = ic.InputController.click
     scroll = ic.InputController.scroll
 
@@ -651,10 +657,51 @@ class TestInputValueRejection:
         assert len(captured_sendinput) == 2, "one down, one up"
 
     def test_unknown_direction_raises_and_sends_nothing(self, captured_sendinput):
+        """Not "left": horizontal scrolling is supported now, and this test used to use
+        it as the invalid example, which is exactly how a widened contract turns an old
+        assertion into a false failure."""
         stub = StubController()
         with pytest.raises(ValueError, match="Неизвестное направление"):
-            stub.scroll("left", 3)
+            stub.scroll("sideways", 3)
         assert captured_sendinput == []
+
+    def test_the_direction_set_and_the_handler_agree(self):
+        """Four names are accepted, and the handler must have a branch for each. A name in
+        the set with no branch would scroll the wrong axis rather than fail."""
+        assert {"up", "down", "left", "right"} == ic.SCROLL_DIRECTIONS
+        import inspect
+
+        src = inspect.getsource(ic.InputController.scroll)
+        assert "MOUSEEVENTF_HWHEEL" in src, "horizontal has no wheel flag of its own"
+
+    def test_horizontal_uses_the_horizontal_wheel_flag(self):
+        """Intercepted at the sender rather than at SendInput, so the assertion is about
+        the flag chosen and not about how the capture fixture happens to record a struct."""
+        stub = StubController()
+        sent = []
+        stub._send_win32_mouse_input = lambda flags, dx=0, dy=0, data=0: sent.append(
+            (flags, data))
+        stub.scroll("right", 2)
+        assert sent == [(ic.MOUSEEVENTF_HWHEEL, 240)], sent
+        stub.scroll("left", 2)
+        assert sent[-1] == (ic.MOUSEEVENTF_HWHEEL, -240)
+
+    def test_vertical_uses_the_vertical_wheel_flag(self):
+        stub = StubController()
+        sent = []
+        stub._send_win32_mouse_input = lambda flags, dx=0, dy=0, data=0: sent.append(
+            (flags, data))
+        stub.scroll("up", 2)
+        assert sent == [(ic.MOUSEEVENTF_WHEEL, 240)], sent
+        stub.scroll("down", 2)
+        assert sent[-1] == (ic.MOUSEEVENTF_WHEEL, -240)
+
+    def test_the_two_wheel_flags_are_distinct(self):
+        """If they were equal, a horizontal scroll would silently be a vertical one and
+        every assertion above would pass anyway."""
+        assert ic.MOUSEEVENTF_HWHEEL != ic.MOUSEEVENTF_WHEEL
+        assert ic.MOUSEEVENTF_HWHEEL == 0x01000
+        assert ic.MOUSEEVENTF_WHEEL == 0x0800
 
     def test_negative_amount_is_rejected(self, captured_sendinput):
         """amount=-3 with direction="up" used to scroll down: the sign inverted it."""

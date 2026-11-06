@@ -37,6 +37,8 @@ import session_state
 import single_instance
 from config import AutopilotState
 from input_controller import (
+    CLICK_MODIFIERS,
+    MOUSE_BUTTONS,
     MOUSE_SUB_ACTIONS,
     SCROLL_DIRECTIONS,
     InputController,
@@ -1411,15 +1413,41 @@ class AutopilotDaemon:
         # Execute smooth move and click in worker thread
         if sub_action == "move":
             await asyncio.to_thread(self.input_ctrl.smooth_move, abs_x, abs_y)
-        elif sub_action == "click":
+        elif sub_action in ("click", "middle_click", "right_click"):
+            button = {"click": "left", "middle_click": "middle",
+                      "right_click": "right"}[sub_action]
+            mods = params.get("modifiers") or []
+            if not isinstance(mods, (list, tuple)):
+                mods = [mods]
+            bad = [m for m in mods if m not in CLICK_MODIFIERS]
+            if bad:
+                return {
+                    "status": "error",
+                    "message": (f"Неизвестный модификатор {bad[0]!r}; клик НЕ отправлен. "
+                                f"Допустимые значения: "
+                                f"{', '.join(sorted(CLICK_MODIFIERS))}."),
+                }
             await asyncio.to_thread(self.input_ctrl.smooth_move, abs_x, abs_y)
-            await asyncio.to_thread(self.input_ctrl.click, "left")
+            await asyncio.to_thread(self.input_ctrl.click, button, list(mods))
         elif sub_action == "double_click":
             await asyncio.to_thread(self.input_ctrl.smooth_move, abs_x, abs_y)
             await asyncio.to_thread(self.input_ctrl.double_click)
-        elif sub_action == "right_click":
+        elif sub_action == "triple_click":
             await asyncio.to_thread(self.input_ctrl.smooth_move, abs_x, abs_y)
-            await asyncio.to_thread(self.input_ctrl.click, "right")
+            await asyncio.to_thread(self.input_ctrl.triple_click)
+        elif sub_action in ("mouse_down", "mouse_up"):
+            button = str(params.get("button") or "left")
+            if button not in MOUSE_BUTTONS:
+                return {
+                    "status": "error",
+                    "message": (f"Неизвестная кнопка {button!r}; событие НЕ отправлено. "
+                                f"Допустимые значения: "
+                                f"{', '.join(sorted(MOUSE_BUTTONS))}."),
+                }
+            await asyncio.to_thread(self.input_ctrl.smooth_move, abs_x, abs_y)
+            fn = (self.input_ctrl.mouse_down if sub_action == "mouse_down"
+                  else self.input_ctrl.mouse_up)
+            await asyncio.to_thread(fn, button)
         elif sub_action == "drag":
             end_x = int(params.get("end_x", x))
             end_y = int(params.get("end_y", y))

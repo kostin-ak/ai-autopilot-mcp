@@ -7,7 +7,7 @@ import math
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from ctypes import wintypes
 
 import pyperclip
@@ -40,10 +40,27 @@ class InterruptedByUserError(Exception):
 # touching any input queue, and a constant that only exists on one platform is a
 # NameError waiting to happen on import order.
 MOUSE_BUTTONS: frozenset[str] = frozenset({"left", "right", "middle"})
-SCROLL_DIRECTIONS: frozenset[str] = frozenset({"up", "down"})
+
+# Actions mouse_action accepts. Kept in step with the gateway's Literal and with the
+# daemon's handler chain by a test, because three separate literals drift and the
+# failure mode of drift is a request that is accepted and then does nothing.
 MOUSE_SUB_ACTIONS: frozenset[str] = frozenset({
-    "move", "click", "double_click", "right_click", "drag",
+    "click", "double_click", "right_click", "middle_click", "triple_click",
+    "move", "drag", "mouse_down", "mouse_up",
 })
+SCROLL_DIRECTIONS: frozenset[str] = frozenset({"up", "down", "left", "right"})
+
+# Modifiers that can be held across a click. Shift+click extends a selection and
+# ctrl+click toggles membership in one -- both are how file managers and list controls
+# are actually driven, and neither is expressible as a hotkey, because a hotkey releases
+# the modifier before the click rather than holding it across.
+CLICK_MODIFIERS: frozenset[str] = frozenset({"ctrl", "shift", "alt", "win"})
+_MODIFIER_VK: dict[str, int] = {
+    "ctrl": 0xA2,    # VK_LCONTROL
+    "shift": 0xA0,   # VK_LSHIFT
+    "alt": 0xA4,     # VK_LMENU
+    "win": 0x5B,     # VK_LWIN
+}
 
 
 # =====================================================================
@@ -146,6 +163,10 @@ if sys.platform == "win32":
     MOUSEEVENTF_MIDDLEDOWN: int = 0x0020
     MOUSEEVENTF_MIDDLEUP: int = 0x0040
     MOUSEEVENTF_WHEEL: int = 0x0800
+    # Horizontal wheel, Windows Vista+. Not a fallback for a tilted vertical wheel: a
+    # device without one simply ignores the event, and reporting success for a scroll
+    # that did not happen is worse than not offering the direction at all.
+    MOUSEEVENTF_HWHEEL: int = 0x01000
     MOUSEEVENTF_VIRTUALDESK: int = 0x4000
     MOUSEEVENTF_ABSOLUTE: int = 0x8000
 
@@ -716,45 +737,116 @@ class InputController:
             if sys.platform == "win32":
                 self._send_absolute_move(target_x, target_y)
 
-    def click(self, button: str = "left") -> None:
-        """Sends mouse down and up events.
+    @staticmethod
+    def _button_flags(button: str) -> tuple[int, int]:
+        """Down and up flags for a named mouse button.
 
-        An unrecognized button name raises instead of falling through to a left
-        click. The gateway shields this with a Literal annotation, but the daemon
-        forwards params verbatim, so a direct WebSocket call asking for button
-        "back" used to receive a left click and a success status -- the same
-        silent-acceptance defect already fixed twice in this project, in
-        press_hotkey and in the out-of-frame coordinate check. The failure mode is
-        worse than a crash: a left click is the destructive one, so the caller
-        that asked for a side button gets the action it was trying to avoid.
+        Raises on an unknown name rather than defaulting to left. The gateway shields this
+        with a Literal, but the daemon forwards params verbatim, so a direct WebSocket call
+        asking for button "back" used to receive a left click and a success status -- the
+        silent-acceptance defect already fixed twice in this project. The failure mode is
+        worse than a crash: a left click is the destructive one, so a caller that asked for
+        a side button got the action it was trying to avoid.
+        """
+        table = {
+            "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+            "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+            "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+        }
+        if button not in table:
+            raise ValueError(
+                f"Неизвестная кнопка мыши {button!r}; событие НЕ отправлено. "
+                f"Допустимые значения: {', '.join(sorted(MOUSE_BUTTONS))}."
+            )
+        return table[button]
+
+    def mouse_down(self, button: str = "left") -> None:
+        """Presses a button and leaves it held.
+
+        Paired with ``mouse_up`` this expresses things a single ``click`` cannot: a
+        press-and-hold, a drag whose path is not a straight line between two points, and a
+        click with a modifier held across it. The held state is real -- the button stays
+        down until released, an interrupt, or the process exits -- so the daemon pairs it
+        with a risk level rather than treating it as reversible.
+        """
+        if self.state == AutopilotState.USER_OVERRIDE:
+            raise InterruptedByUserError(
+                "mouse_down aborted: System is in USER_OVERRIDE mode.")
+        down, _up = self._button_flags(button)
+        if sys.platform == "win32":
+            self._send_win32_mouse_input(down)
+
+    def mouse_up(self, button: str = "left") -> None:
+        """Releases a button held by ``mouse_down``."""
+        if self.state == AutopilotState.USER_OVERRIDE:
+            raise InterruptedByUserError(
+                "mouse_up aborted: System is in USER_OVERRIDE mode.")
+        _down, up = self._button_flags(button)
+        if sys.platform == "win32":
+            self._send_win32_mouse_input(up)
+
+    def click(self, button: str = "left",
+              modifiers: Sequence[str] | None = None) -> None:
+        """Sends mouse down and up events, optionally with modifiers held across both.
+
+        Modifiers are pressed before the button goes down and released after it comes up,
+        in reverse order. That ordering is what makes shift+click a range selection rather
+        than two unrelated events: releasing the modifier first produces a plain click
+        followed by a stray keystroke, which is the failure that would be hardest to
+        notice from the result.
+
+        Unknown modifiers raise before anything is sent, for the same reason an unknown
+        button does.
         """
         if self.state == AutopilotState.USER_OVERRIDE:
             raise InterruptedByUserError("Click aborted: System is in USER_OVERRIDE mode.")
 
-        if sys.platform == "win32":
-            if button == "left":
-                down = MOUSEEVENTF_LEFTDOWN
-                up = MOUSEEVENTF_LEFTUP
-            elif button == "right":
-                down = MOUSEEVENTF_RIGHTDOWN
-                up = MOUSEEVENTF_RIGHTUP
-            elif button == "middle":
-                down = MOUSEEVENTF_MIDDLEDOWN
-                up = MOUSEEVENTF_MIDDLEUP
-            else:
+        mods = list(modifiers or [])
+        for m in mods:
+            if m not in CLICK_MODIFIERS:
                 raise ValueError(
-                    f"Неизвестная кнопка мыши {button!r}; клик НЕ отправлен. "
-                    f"Допустимые значения: {', '.join(sorted(MOUSE_BUTTONS))}."
+                    f"Неизвестный модификатор {m!r}; клик НЕ отправлен. Допустимые "
+                    f"значения: {', '.join(sorted(CLICK_MODIFIERS))}."
                 )
 
+        down, up = self._button_flags(button)
+        if sys.platform != "win32":
+            return
+
+        held: list[int] = []
+        try:
+            for m in mods:
+                vk = _MODIFIER_VK[m]
+                self._send_win32_key(vk, key_up=False)
+                held.append(vk)
             self._send_win32_mouse_input(down)
             time.sleep(0.04)
             self._send_win32_mouse_input(up)
+        finally:
+            # Released in reverse order, and always released: a modifier left down would
+            # make every subsequent keystroke in the session a shortcut, which is a fault
+            # that outlives this call and is very hard to attribute to it.
+            for vk in reversed(held):
+                self._send_win32_key(vk, key_up=True)
 
     def double_click(self) -> None:
         """Executes a double click with proper inter-click timing."""
         self.click("left")
         time.sleep(0.08)
+        self.click("left")
+
+    def triple_click(self) -> None:
+        """Selects a whole line or paragraph, the way a user does.
+
+        The interval is the one Windows uses to decide whether clicks belong to the same
+        sequence: too slow and the third click lands as a fresh single click, which
+        deselects what the first two selected. That failure looks like "triple click does
+        not work" rather than like a timing problem.
+        """
+        self.click("left")
+        time.sleep(0.06)
+        self.click("left")
+        time.sleep(0.06)
         self.click("left")
 
     def drag(self, start_x: int, start_y: int, end_x: int, end_y: int) -> None:
@@ -800,10 +892,20 @@ class InputController:
         if amount == 0:
             return
 
-        clicks = amount if direction == "up" else -amount
+        horizontal = direction in ("left", "right")
+        # Vertical: positive is away from the user ("up"). Horizontal: positive is right,
+        # per the WM_MOUSEHWHEEL contract -- the sign convention is the opposite of what
+        # reading "left is negative, right is positive" as a guess would give for the
+        # vertical axis, so each axis is written out rather than derived from one rule.
+        if horizontal:
+            clicks = amount if direction == "right" else -amount
+            flag = MOUSEEVENTF_HWHEEL
+        else:
+            clicks = amount if direction == "up" else -amount
+            flag = MOUSEEVENTF_WHEEL
         wheel_delta = clicks * 120
         if sys.platform == "win32":
-            self._send_win32_mouse_input(MOUSEEVENTF_WHEEL, data=wheel_delta)
+            self._send_win32_mouse_input(flag, data=wheel_delta)
 
     def _send_win32_key(self, vk: int, key_up: bool = False) -> None:
         """Sends synthetic keyboard key event."""

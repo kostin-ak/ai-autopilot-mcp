@@ -1232,9 +1232,11 @@ class TestDaemonRequestValidation:
         import asyncio
 
         stub = self._stub()
-        resp = asyncio.run(stub._action_mouse_action({"action": "triple_click", "x": 1, "y": 2}))
+        # "hover", not "triple_click": triple_click became a supported sub-action, and a
+        # widened contract turns an old invalid-example into a false failure.
+        resp = asyncio.run(stub._action_mouse_action({"action": "hover", "x": 1, "y": 2}))
         assert resp["status"] == "error"
-        assert "triple_click" in resp["message"]
+        assert "hover" in resp["message"]
 
     def test_refusal_names_every_accepted_sub_action(self):
         import asyncio
@@ -1250,9 +1252,11 @@ class TestDaemonRequestValidation:
         import asyncio
 
         stub = self._stub()
-        resp = asyncio.run(stub._action_scroll_screen({"direction": "left", "amount": 2}))
+        # "sideways", not "left": horizontal scrolling is supported now.
+        resp = asyncio.run(stub._action_scroll_screen({"direction": "sideways",
+                                                       "amount": 2}))
         assert resp["status"] == "error"
-        assert "left" in resp["message"]
+        assert "sideways" in resp["message"]
 
     def test_negative_scroll_amount_is_refused(self):
         import asyncio

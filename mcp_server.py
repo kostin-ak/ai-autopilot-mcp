@@ -269,11 +269,14 @@ async def get_screen_state(
 
 @mcp.tool()
 async def mouse_action(
-    action: Literal["click", "double_click", "right_click", "move", "drag"],
+    action: Literal["click", "double_click", "right_click", "middle_click",
+                    "triple_click", "move", "drag", "mouse_down", "mouse_up"],
     x: int,
     y: int,
     end_x: int | None = None,
     end_y: int | None = None,
+    modifiers: list[Literal["ctrl", "shift", "alt", "win"]] | None = None,
+    button: Literal["left", "right", "middle"] | None = None,
     monitor_index: int | None = None,
     show_grid: bool = False,
 ) -> list[ContentBlock]:
@@ -295,11 +298,17 @@ async def mouse_action(
     the signal a click failed.
 
     Args:
-        action: 'click', 'double_click', 'right_click', 'move' or 'drag'.
+        action: 'click', 'double_click', 'right_click', 'middle_click', 'triple_click',
+            'move', 'drag', 'mouse_down' or 'mouse_up'.
         x: X in the downscaled frame (0..scaled_width).
         y: Y in the downscaled frame (0..scaled_height).
         end_x: Destination X for 'drag'.
         end_y: Destination Y for 'drag'.
+        modifiers: Keys held across a click, for shift+click range selection and
+            ctrl+click toggling. Pressed before the button goes down and released after
+            it comes up, which is what makes the combination a single gesture rather than
+            a click followed by a stray keystroke.
+        button: Which button 'mouse_down' and 'mouse_up' act on. Defaults to 'left'.
         monitor_index: Which monitor the frame coordinates refer to.
         show_grid: Overlay a grid on the resulting frame. Off by default.
     """
@@ -309,6 +318,8 @@ async def mouse_action(
         "y": y,
         "end_x": end_x,
         "end_y": end_y,
+        "modifiers": modifiers,
+        "button": button,
         "monitor_index": monitor_index,
         "show_grid": show_grid,
     }
@@ -356,7 +367,7 @@ async def keyboard_action(
 
 @mcp.tool()
 async def scroll_screen(
-    direction: Literal["up", "down"] = "down",
+    direction: Literal["up", "down", "left", "right"] = "down",
     amount: int = 3,
     x: int | None = None,
     y: int | None = None,
