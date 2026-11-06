@@ -270,6 +270,24 @@ class VisionEngine:
         }
         return bbox, target
 
+    def _reset_change_fields(self) -> None:
+        """Clears the change-signal fields after a capture that made no comparison.
+
+        These describe the comparison that just ran, not the most recent one that happened
+        to run. Leaving them set means a capture taken without any comparison reports a
+        previous capture's verdict -- and the value is attached to the response as
+        screen_change, where it reads as evidence this action produced. take_control is the
+        live case: it captures with wait_stabilization=False and is in FRAME_CHANGE_ACTIONS,
+        so before this reset it published whatever the preceding action had concluded.
+
+        "Not compared" has to be stated rather than left implied, which is why the source
+        becomes "none" instead of the numbers merely going stale.
+        """
+        self.last_changed = None
+        self.last_diff = None
+        self.last_events_seen = None
+        self.last_change_source = "none"
+
     def capture_screen(
         self,
         monitor_index: int | None = None,
@@ -307,6 +325,7 @@ class VisionEngine:
                     pil_image = Image.frombytes("RGB", raw_frame.size, raw_frame.bgra, "raw", "BGRX")
                     self.last_stabilization = "none"
                     self.last_stabilization_ms = 0.0
+                    self._reset_change_fields()
         except Exception as exc:
             msg = f"Screen capture failed. Windows UAC or secure desktop may be active: {exc}"
             logger.error(msg)
