@@ -15,6 +15,7 @@ from PyQt6.QtGui import (
     QPainter,
     QPaintEvent,
     QPen,
+    QPixmap,
 )
 from PyQt6.QtWidgets import QMainWindow, QWidget
 
@@ -61,6 +62,9 @@ class HUDOverlayWindow(QMainWindow):
         # Display-topology tracking; see _connect_screen_signals
         self._app_signals_connected: bool = False
         self._tracked_screens: list = []
+
+        # Cached border image: (key, pixmap, origin). See _draw_neon_border.
+        self._border_cache: tuple | None = None
 
         # Predictive ripple animation state
         self._ripple_pos: QPoint | None = None
@@ -165,6 +169,9 @@ class HUDOverlayWindow(QMainWindow):
         self.setGeometry(virtual_geo)
         if self._target_rect is None:
             self._target_rect = QRect(virtual_geo)
+        # The window moved, so every widget-local coordinate in the cache is now wrong
+        # even though the key looks unchanged.
+        self._invalidate_border_cache()
 
     def _global_to_local_rect(self, rect: QRect) -> QRect:
         """Converts a desktop-coordinate rect into this window's paint space.
@@ -411,7 +418,64 @@ class HUDOverlayWindow(QMainWindow):
     def _draw_neon_border(
         self, painter: QPainter, rect: QRect, state: config.AutopilotState
     ) -> None:
-        """Draws soft gradient glow along the inside edge of rect."""
+        """Draws soft gradient glow along the inside edge of rect, from a cache.
+
+        The border is static between state changes, but paintEvent runs on every ripple
+        tick -- about 66 times a second -- and the naive version rebuilt a QLinearGradient
+        for each of ``width + glow_radius`` steps on every one of those paints. Nothing in
+        that work depended on anything that had changed.
+
+        It is rendered once into a QPixmap and blitted thereafter. The pixmap covers only
+        the glow band around the target rect, not the whole virtual desktop: the border is
+        a hollow frame, so the interior would be transparent pixels held for nothing, and
+        at 4480x1440 a full-surface cache would cost about 26 MB to store a thin rectangle.
+
+        Cache key is the rect and the state, both in widget-local coordinates. Anything
+        that can change the pixels -- a state transition, a new target rect, a topology
+        change that moves the window origin, a device-pixel-ratio change -- invalidates
+        through _invalidate_border_cache rather than being reasoned about here.
+        """
+        cached = self._border_cache
+        key = (rect.x(), rect.y(), rect.width(), rect.height(), state.value,
+               self.devicePixelRatioF())
+        if cached is not None and cached[0] == key:
+            painter.drawPixmap(cached[2], cached[1])
+            return
+
+        band = config.HUD_BORDER_WIDTH + config.HUD_GLOW_RADIUS
+        # Origin of the cached image in widget coordinates, and the translation that maps
+        # the caller's rect into the pixmap's own coordinate space. Keeping the drawing
+        # code in the caller's coordinates is what lets the gradient endpoints stay
+        # correct: a gradient built from current_rect's corners means the same thing
+        # before and after caching, rather than needing to be rebuilt around a new origin.
+        origin = QPoint(rect.x() - band, rect.y() - band)
+        pm = QPixmap((rect.width() + 2 * band), (rect.height() + 2 * band))
+        dpr = self.devicePixelRatioF()
+        if dpr and dpr != 1.0:
+            pm = QPixmap(int(pm.width() * dpr), int(pm.height() * dpr))
+            pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.GlobalColor.transparent)
+
+        cache_painter = QPainter(pm)
+        try:
+            cache_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            cache_painter.translate(-origin.x(), -origin.y())
+            self._paint_border_into(cache_painter, rect, state)
+        finally:
+            cache_painter.end()
+
+        self._border_cache = (key, pm, origin)
+        painter.drawPixmap(origin, pm)
+
+    def _paint_border_into(self, painter: QPainter, rect: QRect,
+                           state: config.AutopilotState) -> None:
+        """The border itself, drawn into whatever painter is handed in.
+
+        Split out from the cache so the drawing is not duplicated between the cached and
+        uncached paths. Two copies of a rendering loop is how a cache starts returning
+        pixels that differ from what the direct path would have drawn -- and that
+        difference is invisible in every test that does not compare the two.
+        """
         width = config.HUD_BORDER_WIDTH
         glow_radius = config.HUD_GLOW_RADIUS
 
@@ -446,6 +510,22 @@ class HUDOverlayWindow(QMainWindow):
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(current_rect)
+
+    def _invalidate_border_cache(self) -> None:
+        """Drops the cached border image.
+
+        Most invalidation happens through the key itself: it carries the rect, the state
+        and the device pixel ratio, so a state transition, a new target rect, or a window
+        move that shifts the rect's local coordinates all miss the cache on their own.
+
+        This explicit drop covers what the key cannot see -- a colour changed in config at
+        runtime, and a geometry recomputation. Missing one of those would leave a stale
+        frame drawing the previous colour, and because the overlay carries
+        WDA_EXCLUDEFROMCAPTURE the stale frame appears in no screenshot, so nothing in the
+        tool's own output would reveal it. get_hud_state's placement_correct flag covers
+        position; nothing but this covers colour.
+        """
+        self._border_cache = None
 
     def _draw_ripple_marker(self, painter: QPainter, pos: QPoint) -> None:
         """Renders dynamic reticle with expanding circles at point pos."""
