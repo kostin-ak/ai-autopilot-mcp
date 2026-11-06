@@ -144,6 +144,49 @@ class TestAnnotate:
         assert getattr(w, "on_current_desktop", None) in (True, False, None)
 
 
+class TestTheFieldIsVisible:
+    """A field that exists in the data but not in the formatted text is a field nobody
+    reads. The model sees the text, so the mark is where the reading has to appear."""
+
+    def test_a_window_on_another_desktop_is_marked_in_the_listing(self, monkeypatch):
+        """Driven through the tool itself with the transport replaced, so the assertion is
+        about the text the model actually receives rather than about a helper."""
+        import asyncio
+
+        import mcp_server
+
+        payload = {
+            "status": "ok",
+            "data": {
+                "monitors": [{"index": 1, "name": "D1", "bounds": [0, 0, 100, 100],
+                              "is_primary": True}],
+                "windows": [
+                    {"handle": 1, "title": "here", "monitor_index": 1,
+                     "bounds": [0, 0, 10, 10], "on_monitor": True,
+                     "on_current_desktop": True},
+                    {"handle": 2, "title": "elsewhere", "monitor_index": 1,
+                     "bounds": [0, 0, 10, 10], "on_monitor": True,
+                     "on_current_desktop": False},
+                    {"handle": 3, "title": "unknown", "monitor_index": 1,
+                     "bounds": [0, 0, 10, 10], "on_monitor": True},
+                ],
+            },
+        }
+
+        async def fake_request(_action, _params):
+            return payload
+
+        monkeypatch.setattr(mcp_server, "_send_daemon_request", fake_request)
+        text = asyncio.run(mcp_server.list_windows_and_monitors())
+
+        lines = [ln for ln in text.splitlines() if ln.startswith("- handle=")]
+        assert len(lines) == 3, lines
+        assert "[на другом виртуальном столе]" in lines[1]
+        assert "[на другом виртуальном столе]" not in lines[0]
+        # An absent field must not read as "on another desktop".
+        assert "[на другом виртуальном столе]" not in lines[2]
+
+
 class TestWindowInfoContract:
     """annotate sets an attribute on whatever list_windows returns.
 

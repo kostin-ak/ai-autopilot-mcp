@@ -452,6 +452,12 @@ async def list_windows_and_monitors() -> str:
             # Center point landed in a gap between monitors, so the index is the
             # nearest screen rather than the containing one.
             marks += " [вне мониторов: индекс приблизительный]"
+        if w.get("on_current_desktop") is False:
+            # The window exists and is visible but lives on another virtual desktop, so
+            # it is absent from any capture of this monitor and clicks at its coordinates
+            # land on whatever occupies that spot here. Stating it is the difference
+            # between "this window is broken" and "this window is somewhere else".
+            marks += " [на другом виртуальном столе]"
         output.append(
             f"- handle={w.get('handle')} '{w['title']}'"
             f" (Монитор {w['monitor_index']}, границы={w['bounds']}){marks}"
