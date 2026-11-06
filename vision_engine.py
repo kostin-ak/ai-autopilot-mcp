@@ -16,6 +16,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 import config
+import cursor_composite
 
 logger = logging.getLogger(__name__)
 
@@ -334,7 +335,8 @@ class VisionEngine:
             ):
                 img_cur_x = int(round((cur_x - bbox["left"]) / scale_x))
                 img_cur_y = int(round((cur_y - bbox["top"]) / scale_y))
-                self._draw_cursor_pointer(scaled_image, img_cur_x, img_cur_y)
+                self._paint_cursor(scaled_image, img_cur_x, img_cur_y,
+                                   (scale_x, scale_y))
 
         # Encode to WebP
         buffer = io.BytesIO()
@@ -501,6 +503,46 @@ class VisionEngine:
             max_diff >= config.STABILIZATION_DIFF_THRESHOLD)
         self.last_events_seen = None
         self.last_change_source = "frames"
+
+    def _paint_cursor(self, image: Image.Image, x: int, y: int,
+                      scale: tuple[float, float]) -> None:
+        """Paints the pointer onto a captured frame, preferring the real cursor.
+
+        Falls back to the drawn arrow on any failure, and that fallback is the reason the
+        native path can be attempted at all inside a capture: a cursor that cannot be read
+        must not cost the frame it is being drawn onto. The mode is configurable so the old
+        rendering can be restored without editing code.
+        """
+        mode = getattr(config, "CURSOR_RENDER_MODE", "native")
+        if mode == "off":
+            return
+        if mode == "native":
+            try:
+                shot = cursor_composite.capture_cursor()
+            except Exception as exc:  # pragma: no cover - defensive, must not lose a frame
+                logger.debug("native cursor capture raised, falling back: %s", exc)
+                shot = None
+            if shot is not None and shot.image.size[0] > 0 and shot.image.size[1] > 0:
+                try:
+                    sx, sy = scale
+                    # Scaled with the frame. The frame is downscaled to a fixed width, and
+                    # a cursor left at native size would appear twice as large as it does
+                    # on the operator's screen -- proportionally wrong in exactly the frame
+                    # whose proportions the agent is reasoning about.
+                    if sx and sy and (sx != 1.0 or sy != 1.0):
+                        new_w = max(1, int(round(shot.image.width / sx)))
+                        new_h = max(1, int(round(shot.image.height / sy)))
+                        shot.image = shot.image.resize(
+                            (new_w, new_h), Image.Resampling.LANCZOS)
+                        shot.hotspot = (int(round(shot.hotspot[0] / sx)),
+                                        int(round(shot.hotspot[1] / sy)))
+                    cursor_composite.composite(image, shot, x, y)
+                    return
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("native cursor composite failed, falling back: %s", exc)
+            else:
+                logger.debug("native cursor unavailable; drawing the fallback marker")
+        self._draw_cursor_pointer(image, x, y)
 
     def _draw_cursor_pointer(self, image: Image.Image, x: int, y: int) -> None:
         """Draws an unmistakable high-contrast pointer arrow directly on the scaled image."""

@@ -270,6 +270,20 @@ EVENT_WATCHER_ENABLED: bool = True
 CURSOR_COLOR_FILL: tuple[int, int, int] = (255, 0, 50)       # High-contrast Red
 CURSOR_COLOR_OUTLINE: tuple[int, int, int] = (0, 0, 0)       # Black border
 
+# How the pointer is shown in a captured frame.
+#
+# "native" composites the real system cursor, so the frame shows the shape the cursor
+# actually has -- I-beam over text, wait while the application is busy, "no" over
+# something that would refuse the action -- and occludes only what the cursor itself
+# covers. "drawn" is the previous behaviour: a fixed red arrow polygon at the cursor
+# position, which reported the same shape every time and painted over the pixels
+# underneath, including the control the agent was about to click.
+#
+# Default is "native"; any failure in capturing the real cursor falls back to "drawn"
+# rather than losing the frame, because a frame with an approximate marker beats no frame.
+# Set to "drawn" to restore the old rendering without touching code.
+CURSOR_RENDER_MODE: str = "native"
+
 
 # ---------------------------------------------------------
 # Safety layer (ADR-0004)
