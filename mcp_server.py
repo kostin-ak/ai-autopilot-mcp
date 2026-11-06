@@ -413,6 +413,16 @@ async def list_windows_and_monitors() -> str:
     and an on_monitor flag. on_monitor=False means the window's centre fell in a gap
     between displays -- monitors do not necessarily tile the virtual desktop -- so its
     monitor_index is the nearest screen rather than the containing one.
+
+    Each window also reports `on_current_desktop`, and `desktop_id` when it is elsewhere.
+    A window on another virtual desktop is visible, has a valid handle and a sane
+    rectangle, and yet does not appear in a capture of that monitor while clicks aimed at
+    its coordinates land on whatever occupies that spot on the current one. That reading is
+    the difference between "this window is broken" and "this window is somewhere else", and
+    without it the symptom sends you looking for a rendering fault.
+
+    When the desktop cannot be determined the field is absent rather than false: unknown and
+    "on another desktop" are different claims and must not read the same.
     """
     resp = await _send_daemon_request("list_windows_and_monitors", {})
     if resp.get("status") != "ok":
