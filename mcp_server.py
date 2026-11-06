@@ -1660,6 +1660,13 @@ async def get_cursor_state() -> str:
     LoadCursor returns for each system cursor. Anything else is reported as `custom`,
     which is a real case (application-drawn cursors), not an error.
 
+    The position is reported twice: `position` from GetCursorInfo, and `position_physical`
+    from GetPhysicalCursorPos, which is unscaled by the thread's DPI context. They agree
+    whenever process DPI awareness matches the monitor's and differ otherwise -- a
+    `dpi_mismatch` of true means a click aimed at one of them lands somewhere other than
+    the other. Reading only the first would look correct on a 100%-DPI machine and be
+    wrong on a mixed-DPI one, so both are published rather than one being assumed.
+
     Observation only: it takes no input lock and works while a human has the machine.
     """
     resp = await _send_daemon_request("get_cursor_state", {})
@@ -1672,6 +1679,11 @@ async def get_cursor_state() -> str:
     lines = [d.get("message", "")]
     lines.append(f"  позиция: {cur.get('position')}  виден: {cur.get('showing')}  "
                  f"handle: {cur.get('handle')}")
+    # Reported separately because the two agree at 100% DPI and differ otherwise. A
+    # mismatch means the process DPI context does not match the monitor's, which is the
+    # condition under which a click lands somewhere other than where it was aimed.
+    lines.append(f"  физическая позиция: {cur.get('position_physical')}  "
+                 f"расхождение DPI: {cur.get('dpi_mismatch')}")
     if car.get("available"):
         lines.append(f"  каретка: видна={car.get('caret_visible')} "
                      f"rect={car.get('caret_rect')} "

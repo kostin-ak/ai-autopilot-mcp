@@ -322,12 +322,36 @@ def get_cursor_shape() -> dict:
                 "handle": None, "error": ctypes.GetLastError()}
 
     handle = int(info.hCursor or 0)
+    physical = _physical_cursor_pos()
+    logical = [int(info.ptScreenPos.x), int(info.ptScreenPos.y)]
     return {
         "shape": standard_cursor_handles().get(handle, "custom"),
         "showing": bool(info.flags & CURSORINFO_SHOWING),
-        "position": [int(info.ptScreenPos.x), int(info.ptScreenPos.y)],
+        "position": logical,
+        # Reported alongside the logical position rather than instead of it: the two
+        # differ exactly when the process DPI context does not match the monitor's, and
+        # that difference is otherwise invisible until a click lands in the wrong place.
+        "position_physical": physical,
+        "dpi_mismatch": (physical is not None and physical != logical),
         "handle": handle,
     }
+
+
+def _physical_cursor_pos() -> list[int] | None:
+    """GetPhysicalCursorPos as a list, or None. Module-level so it is reachable without
+    constructing an InputController, which would install input hooks."""
+    if sys.platform != "win32":
+        return None
+    user32 = ctypes.windll.user32
+    try:
+        user32.GetPhysicalCursorPos.argtypes = [ctypes.POINTER(POINT)]
+        user32.GetPhysicalCursorPos.restype = wintypes.BOOL
+    except AttributeError:
+        return None
+    pt = POINT()
+    if not user32.GetPhysicalCursorPos(ctypes.byref(pt)):
+        return None
+    return [int(pt.x), int(pt.y)]
 
 
 def get_caret_info(thread_id: int | None = None) -> dict:
@@ -686,6 +710,25 @@ class InputController:
             ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
             return int(pt.x), int(pt.y)
         return (0, 0)
+
+    def get_physical_cursor_pos(self) -> tuple[int, int] | None:
+        """Cursor position in physical screen coordinates, or None if unavailable.
+
+        GetCursorPos returns coordinates in the calling thread's DPI context;
+        GetPhysicalCursorPos returns unscaled physical pixels regardless of it. The two
+        agree whenever the process DPI awareness matches the monitor's, and differ
+        otherwise -- which is exactly the case that is invisible until a click lands in
+        the wrong place.
+
+        On this machine DPI is 100% and they coincide, so reading only GetCursorPos
+        would appear correct here and be wrong on a mixed-DPI setup. Reporting both makes
+        the difference observable rather than assumed away, and lets a caller notice the
+        mismatch instead of silently acting on the wrong one.
+
+        None means the API is absent or failed, which is a different claim from (0, 0).
+        """
+        got = _physical_cursor_pos()
+        return None if got is None else (got[0], got[1])
 
     def _send_win32_mouse_input(self, flags: int, dx: int = 0, dy: int = 0, data: int = 0) -> None:
         """Injects hardware-level mouse event using Win32 SendInput."""

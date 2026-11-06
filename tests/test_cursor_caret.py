@@ -123,12 +123,39 @@ class TestHandleMapLive:
 class TestReadingsLive:
     def test_cursor_shape_has_the_fields_a_caller_needs(self):
         s = ic.get_cursor_shape()
-        assert set(s) == {"shape", "showing", "position", "handle"} or "error" in s
+        assert set(s) == {"shape", "showing", "position", "position_physical",
+                          "dpi_mismatch", "handle"} or "error" in s
         assert isinstance(s["shape"], str) and s["shape"]
         assert isinstance(s["showing"], bool)
         if s["shape"] != "unavailable":
             assert len(s["position"]) == 2
             assert s["handle"] != 0
+
+    def test_physical_and_logical_positions_are_both_reported(self):
+        """They coincide at 100% DPI, which is this machine's setting, so reading only
+        GetCursorPos looks correct here and would be wrong on a mixed-DPI setup. Both are
+        published so the mismatch is observable rather than assumed away."""
+        s = ic.get_cursor_shape()
+        assert "position_physical" in s and "dpi_mismatch" in s
+        assert isinstance(s["dpi_mismatch"], bool)
+        if s["position_physical"] is not None:
+            assert len(s["position_physical"]) == 2
+            assert s["dpi_mismatch"] == (s["position_physical"] != s["position"])
+
+    def test_the_physical_position_helper_is_reachable_without_a_controller(self):
+        """Module level on purpose: constructing an InputController installs input hooks,
+        which a read-only caller must not do."""
+        got = ic._physical_cursor_pos()
+        assert got is None or (isinstance(got, list) and len(got) == 2)
+
+    def test_the_controller_method_agrees_with_the_helper(self):
+        ctrl = ic.InputController.__new__(ic.InputController)
+        got = ctrl.get_physical_cursor_pos()
+        helper = ic._physical_cursor_pos()
+        if helper is None:
+            assert got is None
+        else:
+            assert got == (helper[0], helper[1])
 
     def test_caret_info_reports_availability_explicitly(self):
         c = ic.get_caret_info()
