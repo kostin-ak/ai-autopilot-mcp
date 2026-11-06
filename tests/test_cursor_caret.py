@@ -129,6 +129,12 @@ class TestReadingsLive:
         assert isinstance(s["showing"], bool)
         if s["shape"] != "unavailable":
             assert len(s["position"]) == 2
+            if s["handle"] == 0 and not s["showing"]:
+                # The pointer is suppressed right now (a video player hiding it, or the
+                # cursor otherwise absent). There is no cursor to identify, so asserting a
+                # handle would make this test's verdict depend on what the operator's
+                # screen happens to be doing.
+                pytest.skip("the cursor is hidden right now")
             assert s["handle"] != 0
 
     def test_physical_and_logical_positions_are_both_reported(self):

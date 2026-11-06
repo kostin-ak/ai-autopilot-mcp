@@ -230,6 +230,16 @@ IDLE_RESUME_POLL_SECONDS: float = 0.5
 # Vision and Screenshot Settings
 # ---------------------------------------------------------
 TARGET_IMAGE_WIDTH: int = 1280
+# Bounds for a caller-requested frame width (the image_width parameter on the tools that
+# return a frame). The default above stays the default; these only bound what a caller may
+# ask for.
+#
+# The floor is the default itself: asking for less detail than the default would shrink the
+# coordinate space the whole project reasons in, and a smaller frame buys nothing the
+# caller wants. The ceiling is a payload limit -- a 2560-wide monitor captured at native
+# resolution is a several-megabyte WebP per action, and every action returns one.
+TARGET_IMAGE_WIDTH_MIN: int = 1280
+TARGET_IMAGE_WIDTH_MAX: int = 2560
 WEBP_QUALITY: int = 80
 STABILIZATION_DIFF_THRESHOLD: float = 1.5
 STABILIZATION_MAX_ITERATIONS: int = 10

@@ -186,6 +186,38 @@ def _distance_to_rect(x: int, y: int, mon: MonitorInfo) -> float:
     return math.hypot(dx, dy)
 
 
+def resolve_image_width(requested: int | None) -> int:
+    """The frame width a capture will use, given what the caller asked for.
+
+    A single function on purpose. The bounds check that rejects out-of-frame coordinates
+    runs BEFORE the capture, so it cannot read the width the capture chose; it has to
+    compute the same width independently. If the two computations differed by even one
+    pixel, a coordinate on the frame edge would be accepted and then land outside, or
+    rejected while being perfectly valid. One function, called by both, is the only
+    arrangement that cannot drift.
+
+    None means "the default", not "zero" or "whatever". Out-of-range values raise rather
+    than clamp, following the project's rule that a malformed request must say so: a
+    silently clamped width would produce a frame the caller did not ask for and
+    coordinates interpreted against the wrong space.
+    """
+    if requested is None:
+        return config.TARGET_IMAGE_WIDTH
+    try:
+        width = int(requested)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"image_width должно быть целым числом, получено {requested!r}."
+        ) from None
+    lo, hi = config.TARGET_IMAGE_WIDTH_MIN, config.TARGET_IMAGE_WIDTH_MAX
+    if not (lo <= width <= hi):
+        raise ValueError(
+            f"image_width {width} вне допустимого диапазона {lo}..{hi}; "
+            f"кадр не снят."
+        )
+    return width
+
+
 class VisionEngine:
     """Handles multi-monitor frame acquisition, stabilization, and accessibility inspection."""
 
@@ -291,6 +323,7 @@ class VisionEngine:
     def capture_screen(
         self,
         monitor_index: int | None = None,
+        image_width: int | None = None,
         cursor_pos: tuple[int, int] | None = None,
         wait_stabilization: bool = False,
         show_grid: bool = False,
@@ -332,7 +365,7 @@ class VisionEngine:
             raise ScreenCaptureError(msg) from exc
 
         orig_w, orig_h = pil_image.size
-        scaled_w = config.TARGET_IMAGE_WIDTH
+        scaled_w = resolve_image_width(image_width)
         scaled_h = int(round(orig_h * (scaled_w / float(orig_w))))
 
         scale_x = orig_w / float(scaled_w)

@@ -133,7 +133,11 @@ class TestCapture:
             "the counter is not usable, so this test would prove nothing")
 
         captures = sum(1 for _ in range(200) if cc.capture_cursor() is not None)
-        assert captures > 0, "no cursor could be captured at all"
+        if captures == 0:
+            # A hidden or blank cursor yields no capture at all, and there is then nothing
+            # whose handles could leak. Asserting on zero captures would make the test's
+            # verdict depend on the operator's screen.
+            pytest.skip("no cursor could be captured right now")
         growth = gdi() - baseline
         assert growth <= 2, f"GDI grew by {growth} over {captures} captures"
 

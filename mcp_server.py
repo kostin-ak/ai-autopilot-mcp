@@ -204,6 +204,7 @@ def _format_image_and_text(resp: dict[str, Any], default_text: str = "") -> list
 async def take_control(
     monitor_index: int | None = None,
     show_grid: bool = False,
+    image_width: int | None = None,
 ) -> list[ContentBlock]:
     """
     Takes control of the desktop session for the agent: lights a persistent neon frame
@@ -219,9 +220,15 @@ async def take_control(
             because falling back to 0 changes the frame scale and invalidates every
             coordinate accumulated so far.
         show_grid: Overlay a 100px coordinate grid. Off by default; the grid draws over
+        image_width: Frame width in pixels for this capture, or None for the default.
+            Bounds-checked against TARGET_IMAGE_WIDTH_MIN/MAX; out of range raises
+            rather than clamping. The same value is used by the coordinate bounds
+            check, so a coordinate valid for the frame you asked for is valid for
+            the frame you get.
             the title-bar area where window controls live.
     """
-    params = {"monitor_index": monitor_index, "show_grid": show_grid}
+    params = {"monitor_index": monitor_index, "show_grid": show_grid,
+              "image_width": image_width}
     resp = await _send_daemon_request("take_control", params)
     return _format_image_and_text(resp, "Управление рабочим столом успешно захвачено агентом.")
 
@@ -247,6 +254,7 @@ async def release_control() -> str:
 async def get_screen_state(
     monitor_index: int | None = None,
     show_grid: bool = False,
+    image_width: int | None = None,
 ) -> list[ContentBlock]:
     """
     Requests a fresh screen capture plus system state (IDLE, AI_ACTIVE, USER_OVERRIDE),
@@ -260,9 +268,15 @@ async def get_screen_state(
         monitor_index: 1 = primary, 0 = every display as one virtual desktop,
             None = automatic.
         show_grid: Overlay a 100px coordinate grid. Off by default.
+        image_width: Frame width in pixels for this capture, or None for the default.
+            Bounds-checked against TARGET_IMAGE_WIDTH_MIN/MAX; out of range raises
+            rather than clamping. The same value is used by the coordinate bounds
+            check, so a coordinate valid for the frame you asked for is valid for
+            the frame you get.
     """
     resp = await _send_daemon_request(
-        "get_screen_state", {"monitor_index": monitor_index, "show_grid": show_grid}
+        "get_screen_state", {"monitor_index": monitor_index, "show_grid": show_grid,
+                             "image_width": image_width}
     )
     return _format_image_and_text(resp, "Снимок экрана успешно получен.")
 
@@ -279,6 +293,7 @@ async def mouse_action(
     button: Literal["left", "right", "middle"] | None = None,
     monitor_index: int | None = None,
     show_grid: bool = False,
+    image_width: int | None = None,
 ) -> list[ContentBlock]:
     """
     Performs a mouse action with a predictive visual marker and human-interruption check.
@@ -311,6 +326,11 @@ async def mouse_action(
         button: Which button 'mouse_down' and 'mouse_up' act on. Defaults to 'left'.
         monitor_index: Which monitor the frame coordinates refer to.
         show_grid: Overlay a grid on the resulting frame. Off by default.
+        image_width: Frame width in pixels for this capture, or None for the default.
+            Bounds-checked against TARGET_IMAGE_WIDTH_MIN/MAX; out of range raises
+            rather than clamping. The same value is used by the coordinate bounds
+            check, so a coordinate valid for the frame you asked for is valid for
+            the frame you get.
     """
     params = {
         "action": action,
@@ -322,6 +342,7 @@ async def mouse_action(
         "button": button,
         "monitor_index": monitor_index,
         "show_grid": show_grid,
+        "image_width": image_width,
     }
     resp = await _send_daemon_request("mouse_action", params)
     return _format_image_and_text(resp)
@@ -333,6 +354,7 @@ async def keyboard_action(
     hotkey: str | None = None,
     monitor_index: int | None = None,
     show_grid: bool = False,
+    image_width: int | None = None,
 ) -> list[ContentBlock]:
     """
     Types text or presses a key combination.
@@ -354,12 +376,18 @@ async def keyboard_action(
             caused malformed input to press a real key.
         monitor_index: Which monitor the returned frame should show.
         show_grid: Overlay a grid on the resulting frame. Off by default.
+        image_width: Frame width in pixels for this capture, or None for the default.
+            Bounds-checked against TARGET_IMAGE_WIDTH_MIN/MAX; out of range raises
+            rather than clamping. The same value is used by the coordinate bounds
+            check, so a coordinate valid for the frame you asked for is valid for
+            the frame you get.
     """
     params = {
         "text": text,
         "hotkey": hotkey,
         "monitor_index": monitor_index,
         "show_grid": show_grid,
+        "image_width": image_width,
     }
     resp = await _send_daemon_request("keyboard_action", params)
     return _format_image_and_text(resp)
@@ -373,6 +401,7 @@ async def scroll_screen(
     y: int | None = None,
     monitor_index: int | None = None,
     show_grid: bool = False,
+    image_width: int | None = None,
 ) -> list[ContentBlock]:
     """
     Scrolls the screen with the mouse wheel and waits for the image to settle.
@@ -387,6 +416,11 @@ async def scroll_screen(
         y: Optional Y in the downscaled frame to move the cursor to first.
         monitor_index: Which monitor the frame coordinates refer to.
         show_grid: Overlay a grid on the resulting frame. Off by default.
+        image_width: Frame width in pixels for this capture, or None for the default.
+            Bounds-checked against TARGET_IMAGE_WIDTH_MIN/MAX; out of range raises
+            rather than clamping. The same value is used by the coordinate bounds
+            check, so a coordinate valid for the frame you asked for is valid for
+            the frame you get.
     """
     params = {
         "direction": direction,
@@ -395,6 +429,7 @@ async def scroll_screen(
         "y": y,
         "monitor_index": monitor_index,
         "show_grid": show_grid,
+        "image_width": image_width,
     }
     resp = await _send_daemon_request("scroll_screen", params)
     return _format_image_and_text(resp)
@@ -1715,6 +1750,7 @@ async def hold_key(
     duration_ms: int = 500,
     monitor_index: int | None = None,
     show_grid: bool = False,
+    image_width: int | None = None,
 ) -> list[ImageContent | TextContent]:
     """
     Press a key combination, hold it for a while, then release it.
@@ -1739,12 +1775,18 @@ async def hold_key(
         duration_ms: How long to hold, default 500.
         monitor_index: Which monitor the returned frame comes from.
         show_grid: Overlay a grid on the resulting frame. Off by default.
+        image_width: Frame width in pixels for this capture, or None for the default.
+            Bounds-checked against TARGET_IMAGE_WIDTH_MIN/MAX; out of range raises
+            rather than clamping. The same value is used by the coordinate bounds
+            check, so a coordinate valid for the frame you asked for is valid for
+            the frame you get.
     """
     resp = await _send_daemon_request("hold_key", {
         "hotkey": hotkey,
         "duration_ms": duration_ms,
         "monitor_index": monitor_index,
         "show_grid": show_grid,
+        "image_width": image_width,
     })
     return _format_image_and_text(resp)
 
@@ -1754,6 +1796,7 @@ async def wait(
     duration_ms: int = 1000,
     monitor_index: int | None = None,
     show_grid: bool = False,
+    image_width: int | None = None,
 ) -> list[ImageContent | TextContent]:
     """
     Wait a fixed time, then return a fresh frame of the screen.
@@ -1774,6 +1817,7 @@ async def wait(
         "duration_ms": duration_ms,
         "monitor_index": monitor_index,
         "show_grid": show_grid,
+        "image_width": image_width,
     })
     return _format_image_and_text(resp)
 

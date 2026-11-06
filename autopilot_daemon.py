@@ -36,6 +36,7 @@ import risk
 import session_state
 import single_instance
 import virtual_desktop
+import vision_engine
 from config import AutopilotState
 from input_controller import (
     CLICK_MODIFIERS,
@@ -618,6 +619,7 @@ class AutopilotDaemon:
             cursor_pos=cursor_abs,
             wait_stabilization=True,
             show_grid=params.get("show_grid", False),
+            image_width=params.get("image_width"),
             since_tick=since_tick,
         )
         return {
@@ -669,6 +671,7 @@ class AutopilotDaemon:
             # result depend on desktop activity the caller did not ask about.
             wait_stabilization=False,
             show_grid=params.get("show_grid", False),
+            image_width=params.get("image_width"),
         )
         return {
             "status": "ok",
@@ -1063,6 +1066,7 @@ class AutopilotDaemon:
                 monitor_index=params.get("monitor_index"),
                 cursor_pos=cursor_abs,
                 wait_stabilization=True,
+                image_width=params.get("image_width"),
                 since_tick=since_tick,
             )
             return self._frame_block(
@@ -1340,6 +1344,7 @@ class AutopilotDaemon:
             cursor_pos=cursor_abs,
             wait_stabilization=False,
             show_grid=show_grid,
+            image_width=params.get("image_width"),
         )
 
         return {
@@ -1384,6 +1389,7 @@ class AutopilotDaemon:
             cursor_pos=cursor_abs,
             wait_stabilization=False,
             show_grid=show_grid,
+            image_width=params.get("image_width"),
         )
 
         return {
@@ -1425,20 +1431,26 @@ class AutopilotDaemon:
         block.update(extra)
         return block
 
-    def _frame_size(self, monitor_index: int | None) -> tuple[int, int]:
+    def _frame_size(self, monitor_index: int | None,
+                    image_width: int | None = None) -> tuple[int, int]:
         """Frame dimensions in the coordinate space callers must use.
 
         Callers give coordinates relative to the scaled frame, not to the desktop.
         Without knowing the frame size the daemon cannot tell a coordinate that
         belongs to another monitor from one that is simply wrong.
+
+        Takes the requested width because this runs BEFORE the capture: the bounds check
+        has to predict the frame the capture is about to produce. Both go through
+        vision_engine.resolve_image_width, so they cannot disagree about the size.
         """
         bbox, _mon = self.vision.get_monitor_bounds(monitor_index)
-        width = config.TARGET_IMAGE_WIDTH
+        width = vision_engine.resolve_image_width(image_width)
         height = int(round(bbox["height"] * (width / float(bbox["width"]))))
         return width, height
 
     def _reject_out_of_frame(
-        self, mon_idx: int | None, points: list[tuple[str, int | None, int | None]]
+        self, mon_idx: int | None, points: list[tuple[str, int | None, int | None]],
+        image_width: int | None = None,
     ) -> dict[str, Any] | None:
         """Returns an error response if any point falls outside the frame.
 
@@ -1450,7 +1462,7 @@ class AutopilotDaemon:
         tells the caller that its coordinates were wrong. Stale or miscomputed
         coordinates are exactly what a bounds check should stop.
         """
-        frame_w, frame_h = self._frame_size(mon_idx)
+        frame_w, frame_h = self._frame_size(mon_idx, image_width)
         for label, px, py in points:
             if px is None or py is None:
                 continue
@@ -1498,7 +1510,8 @@ class AutopilotDaemon:
         if sub_action == "drag":
             points.append(("Конечные координаты", params.get("end_x"),
                            params.get("end_y")))
-        rejected = self._reject_out_of_frame(mon_idx, points)
+        rejected = self._reject_out_of_frame(
+            mon_idx, points, params.get("image_width"))
         if rejected is not None:
             return rejected
 
@@ -1592,6 +1605,7 @@ class AutopilotDaemon:
             cursor_pos=cursor_abs,
             wait_stabilization=True,
             show_grid=show_grid,
+            image_width=params.get("image_width"),
             since_tick=since_tick,
         )
 
@@ -1693,6 +1707,7 @@ class AutopilotDaemon:
             cursor_pos=cursor_abs,
             wait_stabilization=True,
             show_grid=show_grid,
+            image_width=params.get("image_width"),
             since_tick=since_tick,
         )
 
@@ -1776,6 +1791,7 @@ class AutopilotDaemon:
             cursor_pos=cursor_abs,
             wait_stabilization=True,
             show_grid=show_grid,
+            image_width=params.get("image_width"),
             since_tick=since_tick,
         )
 
