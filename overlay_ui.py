@@ -52,6 +52,7 @@ class HUDOverlayWindow(QMainWindow):
     sig_set_state = pyqtSignal(str)
     sig_set_target_rect = pyqtSignal(int, int, int, int)
     sig_show_target = pyqtSignal(int, int)
+    sig_flash_action = pyqtSignal(int, int, int, int, str, str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -77,10 +78,19 @@ class HUDOverlayWindow(QMainWindow):
         self._ripple_timer.setInterval(config.TARGET_RIPPLE_TICK_MS)
         self._ripple_timer.timeout.connect(self._on_ripple_tick)
 
+        # Action highlight flashes. See flash_action for why they are a list with one
+        # shared timer rather than one animation object per flash.
+        self._flashes: list[dict] = []
+        self._flash_total: int = 0
+        self._flash_timer: QTimer = QTimer(self)
+        self._flash_timer.setInterval(config.ACTION_HIGHLIGHT_TICK_MS)
+        self._flash_timer.timeout.connect(self._on_flash_tick)
+
         # Wire up signals
         self.sig_set_state.connect(self.set_state)
         self.sig_set_target_rect.connect(self._on_set_target_rect)
         self.sig_show_target.connect(self.show_target)
+        self.sig_flash_action.connect(self.flash_action)
 
         self._init_window_flags()
         self._update_geometry()
@@ -231,6 +241,10 @@ class HUDOverlayWindow(QMainWindow):
                 else None
             ),
             "state": self._state.value,
+            # Machine-checkable evidence that action highlights fired: like the HUD
+            # frame, the flashes themselves appear in no capture.
+            "active_flashes": len(self._flashes),
+            "flashes_total": self._flash_total,
         }
 
     def showEvent(self, event) -> None:
@@ -340,6 +354,202 @@ class HUDOverlayWindow(QMainWindow):
         self._ripple_timer.start()
         self.update()
 
+    @pyqtSlot(int, int, int, int, str, str)
+    def flash_action(self, x: int, y: int, width: int, height: int,
+                     level: str, action: str) -> None:
+        """Flashes a rectangle around an element or window an action just hit.
+
+        The highlight is how a Class B action becomes visible. Pattern actions never
+        move the cursor, so the ripple cannot mark them; this marks the rect the action
+        actually touched instead. Colour comes from risk classification (ADR-0004).
+
+        One list with a shared timer, not one QTimer per flash: a batch dispatches
+        several steps in quick succession, and a timer per step would mean a growing
+        number of independent paint callbacks competing for the GUI thread. The list is
+        bounded so a long batch cannot accumulate unbounded paint regions.
+
+        The rect is global desktop coordinates and is converted at paint time, exactly
+        like the HUD frame and ripple, so a topology change mid-flash cannot misplace it.
+        """
+        if not config.ACTION_HIGHLIGHTS:
+            return
+        if width <= 0 or height <= 0:
+            # Degenerate rects (zero-sized elements) have nothing to mark.
+            return
+        if len(self._flashes) >= config.ACTION_HIGHLIGHT_MAX_CONCURRENT:
+            dropped = self._flashes.pop(0)
+            self.update(self._flash_dirty_rect(dropped["rect"]))
+        self._flashes.append({
+            "rect": QRect(x, y, width, height),
+            "level": str(level),
+            "action": str(action),
+            "start": time.monotonic(),
+        })
+        self._flash_total += 1
+        self._flash_timer.start()
+        self.update(self._flash_dirty_rect(QRect(x, y, width, height)))
+
+    def _flash_dirty_rect(self, global_rect: QRect) -> QRect:
+        """Widget-local rect a flash can paint into, including halo and label.
+
+        Deliberately generous: it bounds the outer halo growth, the glow pens and the
+        risk label chip drawn above the rect. The label is the reason the margin is
+        larger than the halo alone. Like the ripple, an undersized dirty rect leaves a
+        permanent ghost that no screenshot can reveal, since the overlay is excluded
+        from capture.
+        """
+        m = config.ACTION_HIGHLIGHT_MAX_GROW_PX + config.ACTION_HIGHLIGHT_DIRTY_MARGIN_PX
+        local = self._global_to_local_rect(global_rect)
+        return local.adjusted(-m, -m, m, m).intersected(self.rect())
+
+    def _on_flash_tick(self) -> None:
+        """Advances every active flash and clears expired ones."""
+        if not self._flashes:
+            self._flash_timer.stop()
+            return
+        now = time.monotonic()
+        duration_s = config.ACTION_HIGHLIGHT_DURATION_MS / 1000.0
+        keep: list[dict] = []
+        # Expired flashes must repaint their region one last time, or their last visible
+        # frame stays on screen forever. Collect dirty rects before dropping them.
+        for flash in self._flashes:
+            self.update(self._flash_dirty_rect(flash["rect"]))
+            if now - flash["start"] < duration_s:
+                keep.append(flash)
+        self._flashes = keep
+        if not keep:
+            self._flash_timer.stop()
+
+    def _draw_action_flashes(self, painter: QPainter) -> None:
+        """Renders all active action flashes."""
+        if not self._flashes:
+            return
+        duration = config.ACTION_HIGHLIGHT_DURATION_MS
+        for flash in self._flashes:
+            elapsed_ms = (time.monotonic() - flash["start"]) * 1000.0
+            progress = min(1.0, max(0.0, elapsed_ms / duration))
+            self._draw_action_flash(
+                painter,
+                self._global_to_local_rect(flash["rect"]),
+                flash["level"], flash["action"], progress,
+            )
+
+    def _draw_action_flash(self, painter: QPainter, rect: QRect,
+                           level: str, action: str, progress: float) -> None:
+        """One glowing, labelled flash, coloured by risk level.
+
+        Visual language, in order of what the eye catches first at desktop scale:
+
+        1. A translucent fill and a bright outline around the target rect. The outline is
+           the precise boundary; the fill makes it a region rather than a hairline.
+        2. A halo that expands from the rect over the animation. Motion is what makes
+           a sub-second mark noticeable when the operator is not already looking at it.
+        3. Corner brackets at full alpha for most of the animation. They hold the shape
+           after the halo has grown away from the rect, so the target stays identifiable.
+        4. A small risk chip above the top-left corner, drawn inside when there is no
+           room above. It says which verb fired and how reversible it is -- the fact the
+           operator most needs when something they did not click happens on screen.
+
+        Alpha follows the ripple's rule: hold at full, then fade. A linear fade from the
+        first frame would make the most visible phase the faintest.
+        """
+        color = config.ACTION_HIGHLIGHT_COLORS.get(
+            level, config.ACTION_HIGHLIGHT_DEFAULT_COLOR
+        )
+        fade_from = max(0.0, 1.0 - config.ACTION_HIGHLIGHT_FADE_FRACTION)
+        if progress <= fade_from:
+            fade = 1.0
+        else:
+            fade = 1.0 - (progress - fade_from) / max(1e-6, 1.0 - fade_from)
+        fade = max(0.0, min(1.0, fade))
+        r, g, b = color.r, color.g, color.b
+
+        # Expanding bloom: three nested outlines with decreasing width and alpha read
+        # as one soft glow rather than a hard band. The outermost is deliberately
+        # faint; the innermost is the precise edge.
+        grow = int(config.ACTION_HIGHLIGHT_MAX_GROW_PX * progress)
+        for pad, width, alpha in ((grow + 9, 12.0, 26), (grow + 4, 6.0, 58),
+                                  (grow, 2.5, 104)):
+            halo = rect.adjusted(-pad, -pad, pad, pad)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(r, g, b, int(alpha * fade)), width))
+            painter.drawRoundedRect(halo, 10, 10)
+
+        # Frosted fill: brighter at the top edge, fading downward so the target
+        # remains readable through it. A flat fill looked like a selection rectangle.
+        fill = QLinearGradient(rect.topLeft().toPointF(), rect.bottomLeft().toPointF())
+        fill.setColorAt(0.0, QColor(r, g, b, int(48 * fade)))
+        fill.setColorAt(1.0, QColor(r, g, b, int(14 * fade)))
+        painter.setBrush(QBrush(fill))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(rect, 7, 7)
+
+        # Gradient outline: a lighter leading edge and the risk colour trailing, so
+        # the frame has depth instead of reading as one flat stroke.
+        lead = QColor(min(255, r + 60), min(255, g + 60), min(255, b + 60),
+                      int(245 * fade))
+        trail = QColor(r, g, b, int(225 * fade))
+        outline = QLinearGradient(rect.topLeft().toPointF(), rect.bottomRight().toPointF())
+        outline.setColorAt(0.0, lead)
+        outline.setColorAt(1.0, trail)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QBrush(outline), 2.8))
+        painter.drawRoundedRect(rect, 7, 7)
+
+        # A slow sheen travelling down the target. Low alpha: it is a finishing cue,
+        # not a cover. Clipped to the rect so it cannot paint outside the flash.
+        sheen_y = rect.top() + int(rect.height() * min(1.0, progress * 1.15))
+        sheen = QRect(rect.left() + 2, sheen_y, max(0, rect.width() - 4), 2)
+        if sheen.width() > 0:
+            painter.fillRect(sheen, QColor(255, 255, 255, int(20 * fade)))
+
+        # Corner brackets at nearly full alpha.
+        arm = max(10, min(30, int(min(rect.width(), rect.height()) * 0.25)))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(r, g, b, int(250 * fade)), 3.2))
+        left, top, right, bottom = rect.left(), rect.top(), rect.right(), rect.bottom()
+        for x, sx in ((left, 1), (right, -1)):
+            for y, sy in ((top, 1), (bottom, -1)):
+                painter.drawLine(x, y, x + sx * arm, y)
+                painter.drawLine(x, y, x, y + sy * arm)
+
+        # Risk/verb chip.
+        level_ru = {
+            "reversible": "обратимо",
+            "medium": "осторожно",
+            "irreversible": "необратимо",
+        }.get(level, level)
+        label = f"{action} · {level_ru}" if action else level_ru
+        font = painter.font()
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        chip_w = metrics.horizontalAdvance(label) + 26
+        chip_h = metrics.height() + 8
+        chip_x = rect.left() + 2
+        chip_y = rect.top() - chip_h - 4
+        if chip_y < self.rect().top() + 2:
+            chip_y = rect.top() + 4
+        chip = QRect(chip_x, chip_y, chip_w, chip_h)
+        shadow = QRect(chip).translated(2, 2)
+        painter.setBrush(QBrush(QColor(0, 0, 0, int(110 * fade))))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(shadow, 6, 6)
+        chip_fill = QLinearGradient(chip.topLeft().toPointF(),
+                                    chip.bottomLeft().toPointF())
+        chip_fill.setColorAt(0.0, QColor(28, 31, 42, int(235 * fade)))
+        chip_fill.setColorAt(1.0, QColor(11, 13, 20, int(225 * fade)))
+        painter.setBrush(QBrush(chip_fill))
+        painter.setPen(QPen(QColor(r, g, b, int(210 * fade)), 1.2))
+        painter.drawRoundedRect(chip, 6, 6)
+        # Coloured status dot: the risk level is legible even before the text is read.
+        painter.setBrush(QBrush(QColor(r, g, b, int(255 * fade))))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(QPoint(chip.left() + 9, chip.center().y()), 3, 3)
+        painter.setPen(QColor(245, 246, 252, int(245 * fade)))
+        painter.drawText(chip.adjusted(17, 0, -3, 0),
+                         Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
+
     def _on_ripple_tick(self) -> None:
         """Advances ripple animation frames."""
         if not self._ripple_active:
@@ -407,7 +617,10 @@ class HUDOverlayWindow(QMainWindow):
                 painter, self._global_to_local_rect(self._target_rect), self._state
             )
 
-        # 2. Draw predictive ripple target if active
+        # 2. Draw action highlight flashes (Class B and any other action rect)
+        self._draw_action_flashes(painter)
+
+        # 3. Draw predictive ripple target if active
         if self._ripple_active and self._ripple_pos:
             self._draw_ripple_marker(
                 painter, self._global_to_local_point(self._ripple_pos)
@@ -594,4 +807,3 @@ class HUDOverlayWindow(QMainWindow):
         painter.drawLine(pos.x() + gap, pos.y(), pos.x() + line_len, pos.y())
         painter.drawLine(pos.x(), pos.y() - line_len, pos.x(), pos.y() - gap)
         painter.drawLine(pos.x(), pos.y() + gap, pos.x(), pos.y() + line_len)
-

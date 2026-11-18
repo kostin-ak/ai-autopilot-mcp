@@ -2,6 +2,7 @@
 
 import contextlib
 import logging
+import os
 from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
@@ -131,6 +132,10 @@ WS_ACTION_TIMEOUTS: dict[str, float] = {
     # Descendants walks on Chrome / VS Code / Electron can legitimately take a
     # while; this is the one action that needs a generous ceiling.
     "get_ui_elements": 90.0,
+    # A browser window can contain a very large page tree behind the chrome; the
+    # landmark action deliberately pages only far enough for the chrome, but the
+    # bound still needs room above one second of per-query cost on a busy page.
+    "browser_landmarks": 20.0,
 }
 
 
@@ -186,6 +191,36 @@ TARGET_RIPPLE_TICK_MS: int = 12
 # therefore most visible frames the faintest ones, which wastes exactly the part of the
 # animation that could be seen.
 TARGET_RIPPLE_FADE_FRACTION: float = 0.35
+
+# ---------------------------------------------------------
+# Action Highlight Flash
+# ---------------------------------------------------------
+# Visual confirmation of Class B actions over the live UI. The overlay carries
+# WDA_EXCLUDEFROMCAPTURE, so the operator sees every flash but the agent's own
+# captures never do: a highlight must never pollute the frame the agent aims in.
+ACTION_HIGHLIGHTS: bool = os.environ.get("AUTOPILOT_ACTION_HIGHLIGHTS", "1") not in {
+    "0", "false", "False",
+}
+ACTION_HIGHLIGHT_DURATION_MS: int = 900
+ACTION_HIGHLIGHT_TICK_MS: int = 16
+# Fraction of the animation at full alpha before fading out, same reading logic as
+# the ripple: a flash that is largest when it is faintest is invisible at desktop scale.
+ACTION_HIGHLIGHT_FADE_FRACTION: float = 0.45
+# Outer halo grows by this many pixels over the animation, and paints nothing beyond
+# rect grown by this plus the dirty margin below.
+ACTION_HIGHLIGHT_MAX_GROW_PX: int = 26
+ACTION_HIGHLIGHT_DIRTY_MARGIN_PX: int = 56
+# At most this many flashes render at once. A batch of the maximum size could
+# otherwise queue one flash per step and stack an unbounded number of regions.
+ACTION_HIGHLIGHT_MAX_CONCURRENT: int = 8
+# One colour per risk level (ADR-0004), so the operator reads "where" and "how
+# reversible" from the same glance. Unknown levels fall back to the AI_ACTIVE primary.
+ACTION_HIGHLIGHT_COLORS: dict[str, RGBAColor] = {
+    "reversible": RGBAColor(64, 220, 128, 235),   # green: nothing committed that cannot be undone
+    "medium": RGBAColor(255, 183, 3, 240),        # amber: caution, same family as USER_OVERRIDE
+    "irreversible": RGBAColor(255, 64, 96, 245),  # crimson: send/delete/close territory
+}
+ACTION_HIGHLIGHT_DEFAULT_COLOR: RGBAColor = COLOR_AI_ACTIVE_PRIMARY
 
 # ---------------------------------------------------------
 # Input and Interruption Settings
@@ -306,6 +341,25 @@ HOLD_KEY_MAX_MS: int = 10_000
 # block the daemon for an arbitrary time.
 WAIT_MAX_MS: int = 30_000
 
+# Click post-check: how large a native region around the target is compared before and
+# after a click, and the mean absolute pixel difference above which the region counts
+# as changed. The cursor positions are masked out of both grabs, so the pointer moving
+# to the target does not by itself count as a change. Measured live: a click whose only
+# effect was deselecting an object (a thin outline disappearing inside the region)
+# scored 0.28, while clicks on inert wallpaper scored exactly 0.00, so 0.3 catches real
+# repaints without crying wolf on sub-pixel noise. It is a hint in the response, not a
+# proof, and the message says so.
+CLICK_CHECK_REGION_HALF: int = 160
+CLICK_CHANGED_DIFF_THRESHOLD: float = 0.3
+
+# How long a vkeys-mode key press is held between down and up, in seconds. Measured
+# live on Blender: a down/up pair sent back to back never reached its text fields,
+# while the same virtual key held for the hotkey path's ~40 ms typed into them. The
+# hold is part of what makes a synthetic press readable as a key press.
+# Measured live on Blender's operator search: 0 ms and 20 ms holds never reached the
+# field, while the hotkey path's ~60 ms hold typed into it on the first try.
+VKEY_HOLD_SEC: float = 0.06
+
 
 # ---------------------------------------------------------
 # Safety layer (ADR-0004)
@@ -356,7 +410,7 @@ READ_ONLY_ACTIONS: frozenset[str] = frozenset({
     "get_screen_state", "list_windows_and_monitors", "get_ui_elements",
     "get_snapshot", "probe_target", "resolve_clickable", "read_terminal",
     "wait_terminal", "read_screen_text", "find_text_on_screen", "wait_for_text",
-    "get_hud_state",
+    "get_hud_state", "browser_landmarks",
 })
 
 
@@ -385,28 +439,45 @@ def configure_stdio_encoding() -> None:
             reconfigure(encoding="utf-8", errors="replace")
 
 
-def ensure_interactive_desktop() -> None:
-    """Ensures current thread is attached to the user's interactive desktop and has Per-Monitor DPI awareness."""
-    import contextlib
+def ensure_thread_dpi_context() -> None:
+    """Sets Per-Monitor DPI V2 for the current thread when the platform supports it.
+
+    The daemon already sets process-level DPI awareness once at startup. This function
+    exists for pool threads that historically needed an explicit context and for future
+    separation of concerns: a caller that only needs the interactive desktop should not
+    also ask for DPI changes as a side effect.
+    """
     import sys
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            kernel32 = ctypes.windll.kernel32
-            # Per-Monitor DPI Awareness V2 (-4)
-            with contextlib.suppress(Exception):
-                user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
-
-            h_desk = user32.GetThreadDesktop(kernel32.GetCurrentThreadId())
-            buf = ctypes.create_unicode_buffer(256)
-            user32.GetUserObjectInformationW(h_desk, 2, buf, 256, None)
-            if buf.value.lower() != "default":
-                GENERIC_ALL = 0x10000000
-                h_interactive = user32.OpenDesktopW("default", 0, False, GENERIC_ALL)
-                if h_interactive:
-                    user32.SetThreadDesktop(h_interactive)
-        except Exception:
-            pass
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        pass
 
 
+def ensure_thread_interactive_desktop() -> None:
+    """Attaches the current thread to the user's interactive desktop when it is not already there.
+
+    This is deliberately independent of DPI awareness. The previous combined helper forced
+    every pool-thread call site to choose between two unrelated obligations or silently
+    accept both; the separation makes the intent explicit at each call site.
+    """
+    import sys
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        h_desk = user32.GetThreadDesktop(kernel32.GetCurrentThreadId())
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetUserObjectInformationW(h_desk, 2, buf, 256, None)
+        if buf.value.lower() != "default":
+            GENERIC_ALL = 0x10000000
+            h_interactive = user32.OpenDesktopW("default", 0, False, GENERIC_ALL)
+            if h_interactive:
+                user32.SetThreadDesktop(h_interactive)
+    except Exception:
+        pass

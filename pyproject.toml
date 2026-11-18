@@ -57,14 +57,22 @@ autopilot-mcp = "mcp_server:main"
 # Плоская раскладка сохраняется намеренно: переход на src-layout отложен до
 # Фазы 2, когда появится слой UI Automation и число модулей вырастет.
 py-modules = [
+    "audit",
     "autopilot_daemon",
+    "browser_targets",
     "config",
+    "cursor_composite",
+    "event_waiter",
+    "host_guard",
     "input_controller",
     "mcp_server",
     "ocr_engine",
     "overlay_ui",
+    "risk",
     "session_state",
+    "single_instance",
     "uia_client",
+    "virtual_desktop",
     "vision_engine",
 ]
 

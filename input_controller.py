@@ -50,6 +50,11 @@ MOUSE_SUB_ACTIONS: frozenset[str] = frozenset({
 })
 SCROLL_DIRECTIONS: frozenset[str] = frozenset({"up", "down", "left", "right"})
 
+# How keyboard_action delivers literal text. "unicode" is layout-independent and the
+# default; "vkeys" exists because some applications (Blender's GHOST event system is the
+# measured case) build characters from WM_KEYDOWN and never see KEYEVENTF_UNICODE.
+TEXT_MODES: frozenset[str] = frozenset({"unicode", "vkeys"})
+
 # Modifiers that can be held across a click. Shift+click extends a selection and
 # ctrl+click toggles membership in one -- both are how file managers and list controls
 # are actually driven, and neither is expressible as a hotkey, because a hotkey releases
@@ -173,6 +178,7 @@ if sys.platform == "win32":
     KEYEVENTF_EXTENDEDKEY: int = 0x0001
     KEYEVENTF_KEYUP: int = 0x0002
     KEYEVENTF_UNICODE: int = 0x0004
+    KEYEVENTF_SCANCODE: int = 0x0008
 
     SM_XVIRTUALSCREEN: int = 76
     SM_YVIRTUALSCREEN: int = 77
@@ -198,8 +204,14 @@ if sys.platform == "win32":
     VK_MAP = {
         "ctrl": 0x11,
         "control": 0x11,
+        "lctrl": 0xA2,
+        "rctrl": 0xA3,
         "alt": 0x12,
+        "lalt": 0xA4,
+        "ralt": 0xA5,
         "shift": 0x10,
+        "lshift": 0xA0,
+        "rshift": 0xA1,
         "win": 0x5B,
         "super": 0x5B,
         "enter": 0x0D,
@@ -218,6 +230,51 @@ if sys.platform == "win32":
         "pagedown": 0x22,
         "home": 0x24,
         "end": 0x23,
+    }
+
+    # Punctuation and numpad keys. A single-character token used to resolve through
+    # ord(), which is only correct for A-Z and 0-9: "." became 0x2E (VK_DELETE), so a
+    # request to type a decimal point pressed Delete instead. Each entry here is the
+    # OEM/numpad virtual key the key actually lives on.
+    PUNCT_VK = {
+        "period": 0xBE,
+        "dot": 0xBE,
+        "comma": 0xBC,
+        "minus": 0xBD,
+        "equal": 0xBB,
+        "plus": 0xBB,
+        "slash": 0xBF,
+        "backslash": 0xDC,
+        "semicolon": 0xBA,
+        "quote": 0xDE,
+        "lbracket": 0xDB,
+        "rbracket": 0xDD,
+        "backquote": 0xC0,
+        "numpad_period": 0x6E,
+        "numpad_decimal": 0x6E,
+        "numpad_plus": 0x6B,
+        "numpad_minus": 0x6D,
+        "numpad_multiply": 0x6A,
+        "numpad_divide": 0x6F,
+    }
+
+    # Single printable characters that are not alphanumerics, mapped to the virtual key
+    # that produces them. Kept apart from PUNCT_VK because the hotkey parser looks up
+    # names there and single characters here.
+    CHAR_VK = {
+        ".": 0xBE,
+        ",": 0xBC,
+        "-": 0xBD,
+        "=": 0xBB,
+        "+": 0xBB,
+        "/": 0xBF,
+        "\\": 0xDC,
+        ";": 0xBA,
+        "'": 0xDE,
+        '"': 0xDE,
+        "[": 0xDB,
+        "]": 0xDD,
+        "`": 0xC0,
     }
 
 
@@ -578,7 +635,7 @@ class InputController:
 
     def _win32_hook_loop(self) -> None:
         """Dedicated message pump thread for Windows low-level input hooks."""
-        config.ensure_interactive_desktop()
+        config.ensure_thread_interactive_desktop()
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         self._hook_thread_id = kernel32.GetCurrentThreadId()
@@ -704,7 +761,8 @@ class InputController:
     # =================================================================
     def get_cursor_pos(self) -> tuple[int, int]:
         """Returns current cursor position (x, y) in desktop coordinates."""
-        config.ensure_interactive_desktop()
+        config.ensure_thread_dpi_context()
+        config.ensure_thread_interactive_desktop()
         if sys.platform == "win32":
             pt = POINT()
             ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
@@ -779,7 +837,8 @@ class InputController:
 
     def smooth_move(self, target_x: int, target_y: int) -> None:
         """Moves cursor smoothly using ease-out interpolation, checking for interruption."""
-        config.ensure_interactive_desktop()
+        config.ensure_thread_dpi_context()
+        config.ensure_thread_interactive_desktop()
         start_x, start_y = self.get_cursor_pos()
         steps = config.MOUSE_MOVE_STEPS
         duration = config.MOUSE_MOVE_DURATION_MS / 1000.0
@@ -803,6 +862,22 @@ class InputController:
             # Ensure exact landing
             if sys.platform == "win32":
                 self._send_absolute_move(target_x, target_y)
+
+    def instant_move(self, target_x: int, target_y: int) -> None:
+        """Moves the cursor to the target in a single event, without interpolation.
+
+        For transient UI -- cascading menus, tooltips, hover popups. A smooth move
+        sweeps the cursor across every item between the start and the target, and each
+        of those hovers can open or close a submenu mid-gesture: measured live on
+        Blender's Add menu, the sweep closed a submenu the next call then clicked into
+        empty space. A single jump touches nothing on the way.
+        """
+        config.ensure_thread_dpi_context()
+        config.ensure_thread_interactive_desktop()
+        if self.state == AutopilotState.USER_OVERRIDE:
+            raise InterruptedByUserError("Mouse movement interrupted by physical human input.")
+        if sys.platform == "win32":
+            self._send_absolute_move(target_x, target_y)
 
     @staticmethod
     def _button_flags(button: str) -> tuple[int, int]:
@@ -1034,6 +1109,93 @@ class InputController:
                 )
             time.sleep(config.UNICODE_CHAR_DELAY_SEC)
 
+    # VkKeyScanEx modifier bits in the high byte of its return value.
+    _VKMOD_SHIFT = 0x01
+    _VKMOD_CTRL = 0x02
+    _VKMOD_ALT = 0x04
+
+    def _foreground_keyboard_layout(self) -> int:
+        """Keyboard layout of the thread that owns the foreground window.
+
+        The layout of the daemon's own thread would be wrong whenever the user runs a
+        different layout in the target application, which is the normal case on a
+        machine with RU and EN installed.
+        """
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        tid = user32.GetWindowThreadProcessId(hwnd, None)
+        return user32.GetKeyboardLayout(tid) or 0
+
+    def _char_to_vkey(self, ch: str, hkl: int) -> tuple[int | None, int]:
+        """Resolves one character to (virtual key, modifier bits) in a layout.
+
+        Returns (None, 0) when the layout cannot produce the character, so the caller
+        can fall back per character instead of failing the whole string.
+        """
+        # WCHAR, not str: ctypes marshals a bare Python str as a pointer, which made
+        # every character resolve as unmappable and silently route the whole string
+        # through the unicode fallback -- the very path this mode exists to avoid.
+        res = ctypes.windll.user32.VkKeyScanExW(wintypes.WCHAR(ch), hkl)
+        if res == -1 or res == 0xFFFF:
+            return None, 0
+        return res & 0xFF, (res >> 8) & 0xFF
+
+    def _send_vkey_text(self, text: str) -> None:
+        """Types text as plain virtual-key presses, the same shape as hotkeys.
+
+        Measured live on Blender, whose GHOST event system ignores both other paths:
+        KEYEVENTF_UNICODE never reaches its text fields, and -- this took a second
+        round to find -- key presses carrying KEYEVENTF_SCANCODE with a hardware
+        scancode do not reach them either, while an ordinary virtual-key keydown
+        (wScan = 0, no scancode flag, exactly what press_hotkey sends) types into the
+        same field without trouble. GHOST resolves the character of a key press itself,
+        through ToUnicodeEx in its own process, which is why the layout here is read
+        from the foreground thread rather than assumed.
+
+        Characters the layout cannot produce fall back to the unicode path one by one,
+        so a mixed string still arrives in full on ordinary Win32 controls.
+        """
+        hkl = self._foreground_keyboard_layout()
+        for ch in text:
+            if self.state == AutopilotState.USER_OVERRIDE:
+                raise InterruptedByUserError("Text typing interrupted by physical human input.")
+
+            if ch in ("\n", "\r"):
+                self._send_win32_key(VK_MAP["enter"], key_up=False)
+                self._send_win32_key(VK_MAP["enter"], key_up=True)
+                continue
+            if ch == "\t":
+                self._send_win32_key(VK_MAP["tab"], key_up=False)
+                self._send_win32_key(VK_MAP["tab"], key_up=True)
+                continue
+
+            vk, mods = self._char_to_vkey(ch, hkl)
+            if vk is None:
+                self._send_unicode_text(ch)
+                continue
+
+            held: list[int] = []
+            for bit, mod_vk in (
+                (self._VKMOD_SHIFT, 0x10),
+                (self._VKMOD_CTRL, 0x11),
+                (self._VKMOD_ALT, 0x12),
+            ):
+                if mods & bit:
+                    self._send_win32_key(mod_vk, key_up=False)
+                    held.append(mod_vk)
+            try:
+                self._send_win32_key(vk, key_up=False)
+                # A down/up pair sent back to back never reached Blender's text field,
+                # while the same key held ~40 ms by press_hotkey typed into it: the
+                # hold is what makes the press a press. Same order of delay as the
+                # hotkey path, per character.
+                time.sleep(config.VKEY_HOLD_SEC)
+                self._send_win32_key(vk, key_up=True)
+            finally:
+                for mod_vk in reversed(held):
+                    self._send_win32_key(mod_vk, key_up=True)
+            time.sleep(config.UNICODE_CHAR_DELAY_SEC)
+
     @staticmethod
     def _resolve_hotkey(hotkey_str: str) -> list[int]:
         """Turns 'ctrl+shift+a' into virtual key codes, or raises.
@@ -1056,9 +1218,19 @@ class InputController:
                 unknown.append("<пусто>")
             elif part in VK_MAP:
                 vks.append(VK_MAP[part])
+            elif part in PUNCT_VK:
+                vks.append(PUNCT_VK[part])
             elif len(part) == 1:
-                # Character key (A-Z, 0-9)
-                vks.append(ord(part.upper()))
+                # Character key. ord() is only correct for A-Z and 0-9: it mapped "." to
+                # VK_DELETE and any non-ASCII letter to a virtual key that does not
+                # exist. Punctuation has its own table; anything else is an error
+                # rather than a guessed keypress.
+                if part in CHAR_VK:
+                    vks.append(CHAR_VK[part])
+                elif part.isascii() and part.isalnum():
+                    vks.append(ord(part.upper()))
+                else:
+                    unknown.append(part)
             elif (part.startswith("f") and part[1:].isdigit()
                     and 1 <= int(part[1:]) <= 24):
                 # F1 - F24. Bounded because an out-of-range number yields a virtual
@@ -1142,7 +1314,7 @@ class InputController:
                 except Exception as exc:  # pragma: no cover - must not mask the first error
                     logger.error("hold_key failed to release vk=%#x: %s", vk, exc)
 
-    def type_text(self, text: str) -> None:
+    def type_text(self, text: str, mode: str = "unicode") -> None:
         """Types text, layout-independent and clipboard-free for normal payloads.
 
         KEYEVENTF_UNICODE is the primary path. The clipboard is used only above
@@ -1151,11 +1323,26 @@ class InputController:
         it destroys non-text clipboard formats, fails wherever Ctrl+V is not
         paste (vim, ssh sessions, many terminals, games), and contends for a
         single global resource the user may be using at the same time.
+
+        ``mode="vkeys"`` switches to virtual-key events with hardware scancodes for
+        applications that ignore the unicode path entirely; see ``_send_vkey_text``.
+        An unknown mode raises rather than falling back to unicode, because silently
+        typing into an application that cannot hear it is the defect this mode exists
+        to fix.
         """
+        if mode not in TEXT_MODES:
+            raise ValueError(
+                f"Неизвестный режим ввода текста {mode!r}; ничего не отправлено. "
+                f"Допустимые значения: {', '.join(sorted(TEXT_MODES))}."
+            )
         if self.state == AutopilotState.USER_OVERRIDE:
             raise InterruptedByUserError("Text typing aborted: System is in USER_OVERRIDE mode.")
 
         if not text:
+            return
+
+        if mode == "vkeys":
+            self._send_vkey_text(text)
             return
 
         if len(text) <= config.CLIPBOARD_TYPING_THRESHOLD:
@@ -1188,4 +1375,3 @@ class InputController:
         self._stop_event.set()
         if self._hook_thread_id and sys.platform == "win32":
             ctypes.windll.user32.PostThreadMessageW(self._hook_thread_id, 0x0012, 0, 0)  # WM_QUIT
-

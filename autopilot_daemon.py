@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 from websockets.asyncio.server import ServerConnection
 
 import audit
+import browser_targets
 import config
 import event_waiter
 import host_guard
@@ -43,6 +44,7 @@ from input_controller import (
     MOUSE_BUTTONS,
     MOUSE_SUB_ACTIONS,
     SCROLL_DIRECTIONS,
+    TEXT_MODES,
     InputController,
     InterruptedByUserError,
 )
@@ -89,6 +91,7 @@ NON_INPUT_ACTIONS: frozenset[str] = frozenset({
     "get_ui_elements",
     "probe_target",
     "get_snapshot",
+    "browser_landmarks",
     "resolve_clickable",
     # Reading a console buffer touches nothing. Writing to one does mutate the
     # target, so write_terminal is deliberately absent: it takes the input lock and
@@ -611,6 +614,7 @@ class AutopilotDaemon:
         since_tick = event_waiter.tick_now()
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
         await asyncio.to_thread(self.input_ctrl.hold_key, hotkey, duration_ms)
+        await self._flash_foreground(level.level, "hold_key")
 
         cursor_abs = self.input_ctrl.get_cursor_pos()
         encoded_webp, w, h, sx, sy, mon = await asyncio.to_thread(
@@ -661,6 +665,11 @@ class AutopilotDaemon:
         if capped:
             await asyncio.sleep(capped / 1000.0)
 
+        crop, err, meta = self._resolve_crop(
+            params.get("monitor_index"), params.get("crop"), params.get("image_width"))
+        if err is not None:
+            return err
+
         cursor_abs = self.input_ctrl.get_cursor_pos()
         encoded_webp, w, h, sx, sy, mon = await asyncio.to_thread(
             self.vision.capture_screen,
@@ -672,6 +681,7 @@ class AutopilotDaemon:
             wait_stabilization=False,
             show_grid=params.get("show_grid", False),
             image_width=params.get("image_width"),
+            crop=crop,
         )
         return {
             "status": "ok",
@@ -681,6 +691,7 @@ class AutopilotDaemon:
                 waited_ms=capped,
                 requested_ms=duration_ms,
                 capped=duration_ms > capped,
+                **({"crop": meta} if meta else {}),
                 message=(f"Ожидание {capped} мс завершено."
                          + (f" Запрошено {duration_ms} мс, ограничено до {capped} мс "
                             f"(предел WAIT_MAX_MS)."
@@ -1242,6 +1253,8 @@ class AutopilotDaemon:
                 return await self._action_probe_target(params)
             elif action == "get_snapshot":
                 return await self._action_get_snapshot(params)
+            elif action == "browser_landmarks":
+                return await self._action_browser_landmarks(params)
             elif action == "resolve_clickable":
                 return await self._action_resolve_clickable(params)
             elif action == "element_action":
@@ -1382,6 +1395,11 @@ class AutopilotDaemon:
         show_grid = params.get("show_grid", False)
         self._update_overlay_target(mon_idx)
 
+        crop, err, meta = self._resolve_crop(
+            mon_idx, params.get("crop"), params.get("image_width"))
+        if err is not None:
+            return err
+
         cursor_abs = self.input_ctrl.get_cursor_pos()
         encoded_webp, w, h, sx, sy, mon = await asyncio.to_thread(
             self.vision.capture_screen,
@@ -1390,13 +1408,44 @@ class AutopilotDaemon:
             wait_stabilization=False,
             show_grid=show_grid,
             image_width=params.get("image_width"),
+            crop=crop,
         )
 
         return {
             "status": "ok",
             "state": self.input_ctrl.state.value,
-            "data": self._frame_block(encoded_webp, w, h, sx, sy, mon, cursor_abs),
+            "data": self._frame_block(encoded_webp, w, h, sx, sy, mon, cursor_abs,
+                                      **({"crop": meta} if meta else {})),
         }
+
+    def _resolve_crop(self, mon_idx: int | None, crop: Any,
+                      image_width: int | None) -> tuple[Any, dict[str, Any] | None, Any]:
+        """Validates a crop against the frame the capture will produce.
+
+        Returns (normalized crop, error response, metadata for the answer). The
+        metadata carries the crop origin in frame coordinates and the full-frame
+        scale, because a cropped frame comes back at native resolution with scale
+        factors of 1.0: without the origin and the scale the caller cannot convert a
+        pixel of the crop into a coordinate mouse_action accepts.
+        """
+        if crop is None:
+            return None, None, None
+        frame_w, frame_h = self._frame_size(mon_idx, image_width)
+        try:
+            norm = vision_engine.validate_crop(crop, frame_w, frame_h)
+        except ValueError as exc:
+            return None, {"status": "error", "message": str(exc)}, None
+        bbox, _mon = self.vision.get_monitor_bounds(mon_idx)
+        meta = {
+            "frame": list(norm),
+            "full_scale": [
+                round(bbox["width"] / float(frame_w), 6),
+                round(bbox["height"] / float(frame_h), 6),
+            ],
+            "note": ("кадр возвращён в нативном разрешении области; координата кадра "
+                     "= frame[x0,y0] + local / full_scale"),
+        }
+        return norm, None, meta
 
     def _frame_block(self, encoded: str, w: int, h: int, sx: float, sy: float,
                      mon: Any, cursor_abs: tuple[int, int],
@@ -1489,6 +1538,11 @@ class AutopilotDaemon:
         y = int(params.get("y", 0))
         mon_idx = params.get("monitor_index")
         show_grid = params.get("show_grid", False)
+        instant = bool(params.get("instant", False))
+        crop, err, meta = self._resolve_crop(
+            mon_idx, params.get("crop"), params.get("image_width"))
+        if err is not None:
+            return err
 
         # Rejected here rather than left to the dispatch chain below, because the
         # chain has no else branch: an unrecognized sub_action used to fall through
@@ -1534,15 +1588,39 @@ class AutopilotDaemon:
         # guard: a refused action must not produce a frame at all.
         since_tick = event_waiter.tick_now()
 
+        # Post-check observation: a small native region around the target before the
+        # click, compared with the same region after. A click that changed nothing is
+        # the commonest silent failure on transient UI (menus, hover popups), and the
+        # response used to have no way to say so.
+        region_box = None
+        pre_img = None
+        pre_cursor = (0, 0)
+        if sub_action in ("click", "double_click", "right_click",
+                          "middle_click", "triple_click"):
+            bbox, _mon = self.vision.get_monitor_bounds(mon_idx)
+            half = config.CLICK_CHECK_REGION_HALF
+            r_left = max(bbox["left"], abs_x - half)
+            r_top = max(bbox["top"], abs_y - half)
+            r_right = min(bbox["left"] + bbox["width"], abs_x + half)
+            r_bottom = min(bbox["top"] + bbox["height"], abs_y + half)
+            region_box = (r_left, r_top, r_right - r_left, r_bottom - r_top)
+            pre_img = await asyncio.to_thread(
+                self.vision.grab_native_region, *region_box)
+            pre_cursor = self.input_ctrl.get_cursor_pos()
+
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
 
-        # Trigger 250ms predictive ripple at target location
-        self.overlay.sig_show_target.emit(abs_x, abs_y)
-        await asyncio.sleep(config.TARGET_RIPPLE_DURATION_MS / 1000.0)
+        # Trigger 250ms predictive ripple at target location. Skipped in instant mode:
+        # the whole point of instant is to act on transient UI before it disappears.
+        if not instant:
+            self.overlay.sig_show_target.emit(abs_x, abs_y)
+            await asyncio.sleep(config.TARGET_RIPPLE_DURATION_MS / 1000.0)
+
+        move_fn = self.input_ctrl.instant_move if instant else self.input_ctrl.smooth_move
 
         # Execute smooth move and click in worker thread
         if sub_action == "move":
-            await asyncio.to_thread(self.input_ctrl.smooth_move, abs_x, abs_y)
+            await asyncio.to_thread(move_fn, abs_x, abs_y)
         elif sub_action in ("click", "middle_click", "right_click"):
             button = {"click": "left", "middle_click": "middle",
                       "right_click": "right"}[sub_action]
@@ -1557,13 +1635,13 @@ class AutopilotDaemon:
                                 f"Допустимые значения: "
                                 f"{', '.join(sorted(CLICK_MODIFIERS))}."),
                 }
-            await asyncio.to_thread(self.input_ctrl.smooth_move, abs_x, abs_y)
+            await asyncio.to_thread(move_fn, abs_x, abs_y)
             await asyncio.to_thread(self.input_ctrl.click, button, list(mods))
         elif sub_action == "double_click":
-            await asyncio.to_thread(self.input_ctrl.smooth_move, abs_x, abs_y)
+            await asyncio.to_thread(move_fn, abs_x, abs_y)
             await asyncio.to_thread(self.input_ctrl.double_click)
         elif sub_action == "triple_click":
-            await asyncio.to_thread(self.input_ctrl.smooth_move, abs_x, abs_y)
+            await asyncio.to_thread(move_fn, abs_x, abs_y)
             await asyncio.to_thread(self.input_ctrl.triple_click)
         elif sub_action in ("mouse_down", "mouse_up"):
             button = str(params.get("button") or "left")
@@ -1574,7 +1652,7 @@ class AutopilotDaemon:
                                 f"Допустимые значения: "
                                 f"{', '.join(sorted(MOUSE_BUTTONS))}."),
                 }
-            await asyncio.to_thread(self.input_ctrl.smooth_move, abs_x, abs_y)
+            await asyncio.to_thread(move_fn, abs_x, abs_y)
             fn = (self.input_ctrl.mouse_down if sub_action == "mouse_down"
                   else self.input_ctrl.mouse_up)
             await asyncio.to_thread(fn, button)
@@ -1607,7 +1685,23 @@ class AutopilotDaemon:
             show_grid=show_grid,
             image_width=params.get("image_width"),
             since_tick=since_tick,
+            crop=crop,
         )
+
+        screen_changed: bool | None = None
+        diff_score: float | None = None
+        if pre_img is not None and region_box is not None:
+            post_img = await asyncio.to_thread(
+                self.vision.grab_native_region, *region_box)
+            if post_img is not None:
+                masks = []
+                for cur in (pre_cursor, cursor_abs):
+                    lx = cur[0] - region_box[0]
+                    ly = cur[1] - region_box[1]
+                    if 0 <= lx < region_box[2] and 0 <= ly < region_box[3]:
+                        masks.append((lx, ly))
+                diff_score = self.vision.region_diff_score(pre_img, post_img, masks)
+                screen_changed = diff_score > config.CLICK_CHANGED_DIFF_THRESHOLD
 
         # Report where the cursor actually ended up, not where the caller asked it to
         # go. The two differ whenever a move was clipped, interrupted, or the
@@ -1629,7 +1723,23 @@ class AutopilotDaemon:
             "data": self._frame_block(
                 encoded_webp, w, h, sx, sy, mon, cursor_abs,
                 requested=[x, y],
-                message=f"Mouse {sub_action} at ({x}, {y}); cursor now at {actual_desc}.",
+                **({"crop": meta} if meta else {}),
+                **(
+                    {"screen_changed": screen_changed,
+                     "region_diff": round(diff_score, 2)}
+                    if diff_score is not None else {}
+                ),
+                message=(
+                    f"Mouse {sub_action} at ({x}, {y}); cursor now at {actual_desc}."
+                    + (
+                        " Область вокруг цели НЕ изменилась после клика "
+                        f"(region_diff={diff_score:.2f}): клик мог не сработать -- "
+                        "снимите новый кадр или повторите действие."
+                        if screen_changed is False else
+                        " Область вокруг цели изменилась после клика."
+                        if screen_changed is True else ""
+                    )
+                ),
             ),
         }
 
@@ -1639,6 +1749,20 @@ class AutopilotDaemon:
         hotkey = params.get("hotkey")
         mon_idx = params.get("monitor_index")
         show_grid = params.get("show_grid", False)
+        text_mode = params.get("text_mode", "unicode")
+        if text is not None and text_mode not in TEXT_MODES:
+            return {
+                "status": "error",
+                "message": (
+                    f"Неизвестный режим ввода текста {text_mode!r}; ничего не "
+                    f"отправлено. Допустимые значения: "
+                    f"{', '.join(sorted(TEXT_MODES))}."
+                ),
+            }
+        crop, err, meta = self._resolve_crop(
+            mon_idx, params.get("crop"), params.get("image_width"))
+        if err is not None:
+            return err
 
         # A request with neither payload used to return status "ok" plus a
         # screenshot, having typed nothing. Same defect as the mouse chain above:
@@ -1663,6 +1787,15 @@ class AutopilotDaemon:
         guard = self._host_refusal(fg_pid, False,
                                    f"активное окно (pid {fg_pid})", "keyboard_action")
         if guard is not None:
+            # The refusal is correct but not actionable on its own: the usual cause is
+            # that the chat window itself still holds focus, and the way out is to focus
+            # the target window first. Measured live: win+r was refused while the host
+            # chat was foreground, and worked right after a click on the desktop.
+            guard["message"] = (
+                str(guard.get("message", ""))
+                + " Активируйте целевое окно перед вводом: клик по нему или "
+                "window_action(activate), затем повторите действие."
+            )
             return guard
         if hotkey:
             level = self._risk_of("hotkey", verb=str(hotkey), app=app)
@@ -1695,9 +1828,11 @@ class AutopilotDaemon:
         self.input_ctrl.set_state(AutopilotState.AI_ACTIVE)
 
         if text:
-            await asyncio.to_thread(self.input_ctrl.type_text, text)
+            await asyncio.to_thread(self.input_ctrl.type_text, text, text_mode)
         if hotkey:
             await asyncio.to_thread(self.input_ctrl.press_hotkey, hotkey)
+
+        await self._flash_foreground(level.level, "hotkey" if hotkey else "type")
 
         # Capture stabilized screen
         cursor_abs = self.input_ctrl.get_cursor_pos()
@@ -1709,6 +1844,7 @@ class AutopilotDaemon:
             show_grid=show_grid,
             image_width=params.get("image_width"),
             since_tick=since_tick,
+            crop=crop,
         )
 
         return {
@@ -1719,7 +1855,16 @@ class AutopilotDaemon:
                 encoded_webp, w, h, sx, sy, mon, cursor_abs,
                 risk_level=level.level,
                 risk_reason=level.reason,
-                message=f"Keyboard action completed (text={bool(text)}, hotkey={hotkey}).",
+                **({"crop": meta} if meta else {}),
+                message=(
+                    f"Keyboard action completed (text={bool(text)}, hotkey={hotkey})."
+                    + (
+                        f" Режим ввода {text_mode}; ввод текста не верифицируется: "
+                        "цель может игнорировать события клавиатуры, и ответ этого "
+                        "не заметит."
+                        if text else ""
+                    )
+                ),
             ),
         }
 
@@ -1783,6 +1928,7 @@ class AutopilotDaemon:
             await asyncio.to_thread(self.input_ctrl.smooth_move, abs_x, abs_y)
 
         await asyncio.to_thread(self.input_ctrl.scroll, direction, amount)
+        await self._flash_monitor(mon_idx, "reversible", f"scroll {direction}")
 
         cursor_abs = self.input_ctrl.get_cursor_pos()
         encoded_webp, w, h, sx, sy, mon = await asyncio.to_thread(
@@ -2156,6 +2302,49 @@ class AutopilotDaemon:
         }
         return {"status": "ok", "data": data}
 
+    async def _action_browser_landmarks(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Finds browser chrome addresses in the existing UIA tree, without CDP/BiDi.
+
+        This is observation only. The returned paths can be passed to act_on_element;
+        selected tabs are read through SelectionItem rather than inferred from focus.
+        """
+        handle, how = await self._resolve_target(params)
+        if handle is None:
+            return {"status": "error", "message": how}
+
+        budget_ms = float(params.get("time_budget_ms") or 1500)
+
+        def inspect():
+            snap = self.uia.snapshot(
+                handle,
+                max_depth=int(params.get("max_depth") or DEFAULT_MAX_DEPTH),
+                max_nodes=int(params.get("max_nodes") or 500),
+                time_budget_s=budget_ms / 1000.0,
+            )
+            landmarks = browser_targets.find_browser_landmarks(
+                snap, selected_reader=lambda path: self.uia.is_selected(handle, path)
+            )
+            address_path = (landmarks.get("address_bar") or {}).get("path")
+            if address_path:
+                landmarks["address_value"] = self.uia.read_text_value(
+                    handle, address_path
+                )
+            return snap, landmarks
+
+        snap, landmarks = await asyncio.to_thread(inspect)
+        landmarks.update({
+            "handle": handle,
+            "resolution": how,
+            "snapshot": {
+                "nodes": len(snap.nodes),
+                "elapsed_ms": round(snap.elapsed_ms, 1),
+                "truncated": snap.truncated,
+                "truncated_reason": snap.truncated_reason,
+            },
+        })
+        landmarks["warnings"] = [*landmarks["warnings"], *snap.warnings]
+        return {"status": "ok", "data": landmarks}
+
     async def _action_resolve_clickable(self, params: dict[str, Any]) -> dict[str, Any]:
         """Resolves one node's precise clickable point, in frame coordinates.
 
@@ -2283,12 +2472,95 @@ class AutopilotDaemon:
             }
 
         res = await asyncio.to_thread(handler, self.uia, handle, str(path), params)
+        await self._flash_element(handle, str(path), level.level, str(kind))
         env = self._action_envelope(handle, how, res)
         env["_risk"] = level
         env["data"]["risk_level"] = level.level
         env["data"]["risk_reason"] = level.reason
         env["data"]["resolved_name"] = control_name
         return env
+
+    # ------------------------------------------------- action highlighting
+    def _flash_rect(self, rect: tuple | None, level: str, action: str) -> None:
+        """Asks the overlay to flash a rect, if highlighting is enabled.
+
+        Presentation only: any failure here is logged and swallowed. A flash that
+        cannot render must never change whether an action ran, how it verified, or
+        what it reported. The signal is thread-safe; the slot runs on the GUI thread.
+        """
+        if not config.ACTION_HIGHLIGHTS or rect is None:
+            return
+        try:
+            x, y, width, height = rect
+            self.overlay.sig_flash_action.emit(int(x), int(y), int(width), int(height),
+                                               str(level), str(action))
+        except Exception as exc:  # pragma: no cover - presentation must not break actions
+            logger.debug("action highlight failed: %s", exc)
+
+    async def _flash_element(self, handle: int, path: str, level: str,
+                             action: str) -> None:
+        """Flashes the bounding rect of the element an action just touched.
+
+        Read after the action, not before: for scroll_into_view the rect is only
+        meaningful once the element has actually scrolled into view, and for
+        set_value/invoke the target's layout may have shifted as a result.
+        element_bounds returns None for offscreen or degenerate elements, which is
+        exactly when there is nothing truthful to mark.
+        """
+        if not config.ACTION_HIGHLIGHTS:
+            return
+        try:
+            rect = await asyncio.to_thread(self.uia.element_bounds, handle, path)
+        except Exception as exc:  # presentation must never fail the action itself
+            logger.debug("element highlight read failed: %s", exc)
+            return
+        self._flash_rect(rect, level, action)
+
+    async def _flash_window(self, handle: int, level: str, action: str) -> None:
+        """Flashes a window's rect for window-level and terminal actions."""
+        if not config.ACTION_HIGHLIGHTS:
+            return
+        try:
+            bounds = await asyncio.to_thread(self.uia.window_bounds, handle)
+        except Exception as exc:  # presentation must never fail the action itself
+            logger.debug("window highlight read failed: %s", exc)
+            return
+        if not bounds:
+            return
+        left, top, right, bottom = bounds
+        # Minimized windows sit at the Win32 sentinel position; there is nothing on
+        # screen to mark, and flashing the sentinel would be a lie about location.
+        if left <= -30000 and top <= -30000:
+            return
+        self._flash_rect((left, top, right - left, bottom - top), level, action)
+
+    async def _flash_foreground(self, level: str, action: str) -> None:
+        """Flashes the focused window for keyboard actions, which name no element."""
+        if not config.ACTION_HIGHLIGHTS:
+            return
+        import ctypes
+        try:
+            hwnd = await asyncio.to_thread(ctypes.windll.user32.GetForegroundWindow)
+        except Exception as exc:  # presentation must never fail the action itself
+            logger.debug("foreground highlight read failed: %s", exc)
+            return
+        if hwnd:
+            await self._flash_window(int(hwnd), level, action)
+
+    async def _flash_monitor(self, monitor_index: int | None, level: str,
+                             action: str) -> None:
+        """Flashes the monitor bounds for scrolling, whose target is whatever is under it."""
+        if not config.ACTION_HIGHLIGHTS:
+            return
+        try:
+            bbox, _ = await asyncio.to_thread(self.vision.get_monitor_bounds, monitor_index)
+        except Exception as exc:  # presentation must never fail the action itself
+            logger.debug("monitor highlight read failed: %s", exc)
+            return
+        if bbox:
+            self._flash_rect(
+                (bbox["left"], bbox["top"], bbox["width"], bbox["height"]), level, action
+            )
 
     @staticmethod
     def _action_envelope(handle: int, how: str, res: Any) -> dict[str, Any]:
@@ -2381,6 +2653,7 @@ class AutopilotDaemon:
             }
 
         res = await asyncio.to_thread(handler, self.uia, handle, params)
+        await self._flash_window(handle, level.level, str(kind))
         env = self._action_envelope(handle, how, res)
         env["_risk"] = level
         env["data"]["risk_level"] = level.level
@@ -2500,6 +2773,9 @@ class AutopilotDaemon:
                 timeout_s=float(params.get("timeout_s") or 3.0),
             )
         )
+        # Typing into a terminal can execute a command on Enter; medium is the honest
+        # level, and the window rect is the only target a posted WM_CHAR has.
+        await self._flash_window(handle, "medium", "terminal")
         return {
             "status": "ok",
             "data": {
@@ -2761,7 +3037,8 @@ def main() -> int:
                      "input hooks", config.INSTANCE_MUTEX_NAME)
         return config.EXIT_ALREADY_RUNNING
 
-    config.ensure_interactive_desktop()
+    config.ensure_thread_dpi_context()
+    config.ensure_thread_interactive_desktop()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
@@ -2798,4 +3075,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

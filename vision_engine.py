@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw, ImageStat
 
 import config
 import cursor_composite
@@ -218,6 +218,37 @@ def resolve_image_width(requested: int | None) -> int:
     return width
 
 
+def validate_crop(crop: Any, frame_w: int, frame_h: int) -> tuple[int, int, int, int]:
+    """Checks a [x0, y0, x1, y1] crop against the frame it will be cut from.
+
+    Raises rather than clamping, for the same reason out-of-frame click coordinates
+    do: a clamped crop silently returns a region the caller did not ask for, and the
+    caller then reads coordinates against the wrong rectangle. A degenerate crop
+    (x1 <= x0) is rejected too -- it would encode to an empty image, which looks like
+    a blank screen rather than a bad request.
+    """
+    if not (isinstance(crop, (list, tuple)) and len(crop) == 4):
+        raise ValueError(
+            f"crop должен быть списком из четырёх целых [x0, y0, x1, y1], "
+            f"получено {crop!r}."
+        )
+    vals: list[int] = []
+    for v in crop:
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(
+                f"crop должен содержать целые числа в координатах кадра, "
+                f"получено {v!r}."
+            )
+        vals.append(v)
+    x0, y0, x1, y1 = vals
+    if not (0 <= x0 < x1 <= frame_w and 0 <= y0 < y1 <= frame_h):
+        raise ValueError(
+            f"crop {vals} вне кадра {frame_w}x{frame_h} или вырожден "
+            f"(нужно x0 < x1 и y0 < y1); область не снята."
+        )
+    return x0, y0, x1, y1
+
+
 class VisionEngine:
     """Handles multi-monitor frame acquisition, stabilization, and accessibility inspection."""
 
@@ -250,7 +281,8 @@ class VisionEngine:
 
     def list_monitors(self) -> list[MonitorInfo]:
         """Enumerates connected monitors through mss and platform metrics."""
-        config.ensure_interactive_desktop()
+        config.ensure_thread_dpi_context()
+        config.ensure_thread_interactive_desktop()
         monitors: list[MonitorInfo] = []
         import mss
 
@@ -328,6 +360,7 @@ class VisionEngine:
         wait_stabilization: bool = False,
         show_grid: bool = False,
         since_tick: int | None = None,
+        crop: tuple[int, int, int, int] | None = None,
     ) -> tuple[str, int, int, float, float, MonitorInfo]:
         """
         Captures target display, waits for animations to finish, overlays cursor, and compresses to WebP.
@@ -337,6 +370,15 @@ class VisionEngine:
         the action from one that was already in flight, so stabilisation falls back to
         frame differencing.
 
+        ``crop`` is [x0, y0, x1, y1] in the same downscaled frame coordinates the tools
+        use. The region is cut out of the native capture and returned at native
+        resolution (scale factors come back as 1.0), which is what makes small UI --
+        menu rows, number fields, operator panels -- readable: at the default 1280-wide
+        frame a menu row is ten pixels tall and a misread of one row adds the wrong
+        object, measured live on Blender's Add menu. To convert a pixel of the returned
+        crop back into frame coordinates, divide by the full-frame scale the daemon
+        reports alongside the crop and add the crop origin.
+
         Returns:
             base64_webp (str): Base64 encoded WebP image
             scaled_width (int): Target image width (default 1280)
@@ -345,7 +387,8 @@ class VisionEngine:
             scale_y (float): Conversion factor from scaled to desktop Y
             target_monitor (MonitorInfo): Active monitor metadata
         """
-        config.ensure_interactive_desktop()
+        config.ensure_thread_dpi_context()
+        config.ensure_thread_interactive_desktop()
         bbox, target_monitor = self.get_monitor_bounds(monitor_index)
         import mss
 
@@ -365,28 +408,52 @@ class VisionEngine:
             raise ScreenCaptureError(msg) from exc
 
         orig_w, orig_h = pil_image.size
-        scaled_w = resolve_image_width(image_width)
-        scaled_h = int(round(orig_h * (scaled_w / float(orig_w))))
+        full_w = resolve_image_width(image_width)
+        full_h = int(round(orig_h * (full_w / float(orig_w))))
+        full_sx = orig_w / float(full_w)
+        full_sy = orig_h / float(full_h)
 
+        crop_native: tuple[int, int, int, int] | None = None
+        if crop is not None:
+            x0, y0, x1, y1 = validate_crop(crop, full_w, full_h)
+            crop_native = (
+                int(round(x0 * full_sx)),
+                int(round(y0 * full_sy)),
+                int(round(x1 * full_sx)),
+                int(round(y1 * full_sy)),
+            )
+            pil_image = pil_image.crop(crop_native)
+            orig_w, orig_h = pil_image.size
+
+        # A crop is returned at native resolution: downscaling it again would undo the
+        # only reason to ask for one.
+        scaled_w, scaled_h = (orig_w, orig_h) if crop_native else (full_w, full_h)
         scale_x = orig_w / float(scaled_w)
         scale_y = orig_h / float(scaled_h)
 
         # High quality downsampling
-        scaled_image = pil_image.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
+        scaled_image = (
+            pil_image
+            if crop_native
+            else pil_image.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
+        )
 
         # Overlay coordinate grid if requested
-        if show_grid:
+        # Grid labels are frame coordinates; over a crop they would name pixels that
+        # are not frame coordinates, so the grid is refused there rather than lying.
+        if show_grid and crop_native is None:
             scaled_image = self._draw_coordinate_grid(scaled_image)
 
         # Draw mouse pointer if cursor is inside this monitor's bounds
         if cursor_pos is not None:
             cur_x, cur_y = cursor_pos
-            if (
-                bbox["left"] <= cur_x < bbox["left"] + bbox["width"]
-                and bbox["top"] <= cur_y < bbox["top"] + bbox["height"]
-            ):
-                img_cur_x = int(round((cur_x - bbox["left"]) / scale_x))
-                img_cur_y = int(round((cur_y - bbox["top"]) / scale_y))
+            origin_x = bbox["left"] + (crop_native[0] if crop_native else 0)
+            origin_y = bbox["top"] + (crop_native[1] if crop_native else 0)
+            span_w = crop_native[2] - crop_native[0] if crop_native else bbox["width"]
+            span_h = crop_native[3] - crop_native[1] if crop_native else bbox["height"]
+            if origin_x <= cur_x < origin_x + span_w and origin_y <= cur_y < origin_y + span_h:
+                img_cur_x = int(round((cur_x - origin_x) / scale_x))
+                img_cur_y = int(round((cur_y - origin_y) / scale_y))
                 self._paint_cursor(scaled_image, img_cur_x, img_cur_y,
                                    (scale_x, scale_y))
 
@@ -396,6 +463,59 @@ class VisionEngine:
         encoded_webp = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
         return encoded_webp, scaled_w, scaled_h, scale_x, scale_y, target_monitor
+
+    def grab_native_region(
+        self, left: int, top: int, width: int, height: int
+    ) -> Image.Image | None:
+        """Grabs a small desktop region at native resolution, or None on failure.
+
+        Used for the click post-check: whether the pixels around a target changed is
+        the cheapest evidence that a click did something, and a 320x240 grab costs a
+        few milliseconds where a full stabilized frame costs hundreds. None, not an
+        exception: a failed observation must not fail the action it was observing.
+        """
+        if width <= 0 or height <= 0:
+            return None
+        config.ensure_thread_dpi_context()
+        config.ensure_thread_interactive_desktop()
+        import mss
+
+        try:
+            with mss.MSS() as sct:
+                raw = sct.grab({"left": left, "top": top,
+                                "width": width, "height": height})
+                return Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+        except Exception as exc:
+            logger.warning("region grab failed: %s", exc)
+            return None
+
+    @staticmethod
+    def region_diff_score(
+        a: Image.Image,
+        b: Image.Image,
+        mask_points: list[tuple[int, int]] | None = None,
+        mask_radius: int = 24,
+    ) -> float:
+        """Mean absolute pixel difference between two same-size regions, 0..255.
+
+        ``mask_points`` are region-local centres blacked out in both images before the
+        difference: the cursor is drawn wherever it ends up, and a click always moves
+        it, so an unmasked comparison would report "changed" for the pointer alone and
+        prove nothing about the click.
+        """
+        if a.size != b.size:
+            return -1.0
+        first = a.copy()
+        second = b.copy()
+        if mask_points:
+            draws = [ImageDraw.Draw(first), ImageDraw.Draw(second)]
+            for px, py in mask_points:
+                box = [px - mask_radius, py - mask_radius,
+                       px + mask_radius, py + mask_radius]
+                for draw in draws:
+                    draw.rectangle(box, fill=(0, 0, 0))
+        diff = ImageChops.difference(first, second).convert("L")
+        return float(ImageStat.Stat(diff).mean[0])
 
     def _draw_coordinate_grid(self, image: Image.Image) -> Image.Image:
         """Overlays grid lines and coordinate markers without occluding the frame.
@@ -651,7 +771,8 @@ class VisionEngine:
             (image, bbox, monitor) where bbox is left/top/width/height in native
             desktop pixels.
         """
-        config.ensure_interactive_desktop()
+        config.ensure_thread_dpi_context()
+        config.ensure_thread_interactive_desktop()
         bbox, target_monitor = self.get_monitor_bounds(monitor_index)
         import mss
 
@@ -666,10 +787,11 @@ class VisionEngine:
         if sys.platform != "win32":
             return windows
 
-        # Called on a pool thread via asyncio.to_thread, and DPI awareness is
-        # per-thread: without this, GetWindowRect returns virtualised coordinates
-        # on mixed-DPI setups and every window rect is subtly wrong.
-        config.ensure_interactive_desktop()
+        # Called on a pool thread via asyncio.to_thread. Process-level DPI V2 is the
+        # normal case; the thread context is kept explicit for coordinates, while the
+        # interactive-desktop switch is a separate obligation.
+        config.ensure_thread_dpi_context()
+        config.ensure_thread_interactive_desktop()
 
         user32 = ctypes.windll.user32
         active_hwnd = user32.GetForegroundWindow()
@@ -781,8 +903,9 @@ class VisionEngine:
         if sys.platform != "win32":
             return InspectionResult([], 0, None, "UI automation requires Windows")
 
-        # Pool thread; DPI awareness is per-thread. See list_windows.
-        config.ensure_interactive_desktop()
+        # Pool thread; see list_windows for why both obligations are explicit.
+        config.ensure_thread_dpi_context()
+        config.ensure_thread_interactive_desktop()
 
         bbox, _ = self.get_monitor_bounds(monitor_index)
         scale_x = bbox["width"] / float(config.TARGET_IMAGE_WIDTH)
@@ -942,5 +1065,3 @@ class VisionEngine:
 
         best = max(matches, key=area)
         return _target_from(best, f"largest-of-{len(matches)}"), len(matches), f"largest-of-{len(matches)}"
-
-

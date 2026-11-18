@@ -49,6 +49,7 @@
     "desktop-autopilot_get_ui_elements": "allow",
     "desktop-autopilot_probe_target": "allow",
     "desktop-autopilot_get_snapshot": "allow",
+    "desktop-autopilot_get_browser_landmarks": "allow",
     "desktop-autopilot_resolve_clickable": "allow",
     "desktop-autopilot_read_screen_text": "allow",
     "desktop-autopilot_find_text_on_screen": "allow",

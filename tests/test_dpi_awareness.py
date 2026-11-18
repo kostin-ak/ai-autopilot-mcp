@@ -1,4 +1,4 @@
-"""Tests for process DPI awareness.
+"""Tests for process DPI awareness and independent thread environment setup.
 
 Awareness can be set once per process and the first call wins, so the order of attempts
 is the whole behaviour. These tests drive fakes rather than the real API: calling it for
@@ -141,3 +141,71 @@ class TestReporting:
         assert config.DPI_MODE == "unset"
         assert "unset" not in {"per-monitor-v2", "per-monitor-v1", "system",
                                "unavailable"}
+
+
+class TestThreadEnvironment:
+    """DPI context and desktop attachment are independent thread obligations."""
+
+    class User32:
+        def __init__(self, desktop="default"):
+            self.desktop = desktop
+            self.calls = []
+
+        def SetThreadDpiAwarenessContext(self, handle):
+            self.calls.append(("dpi", int(handle.value)))
+
+        def GetThreadDesktop(self, _thread_id):
+            self.calls.append(("get_desktop",))
+            return 41
+
+        def GetUserObjectInformationW(self, handle, _index, buf, _size, _out):
+            assert handle == 41
+            buf.value = self.desktop
+            self.calls.append(("read_desktop",))
+            return True
+
+        def OpenDesktopW(self, name, _flags, _inherit, _access):
+            self.calls.append(("open_desktop", name))
+            return 42
+
+        def SetThreadDesktop(self, handle):
+            self.calls.append(("set_desktop", handle))
+            return True
+
+    class Kernel32:
+        @staticmethod
+        def GetCurrentThreadId():
+            return 7
+
+    def install_thread_fakes(self, monkeypatch, user32):
+        monkeypatch.setattr(ctypes.windll, "user32", user32, raising=False)
+        monkeypatch.setattr(ctypes.windll, "kernel32", self.Kernel32(), raising=False)
+
+    def test_dpi_context_does_not_touch_the_desktop(self, monkeypatch):
+        user32 = self.User32()
+        self.install_thread_fakes(monkeypatch, user32)
+        config.ensure_thread_dpi_context()
+        assert user32.calls[0][0] == "dpi"
+        assert user32.calls[0][1] & 0xFFFFFFFF == 0xFFFFFFFC
+
+    def test_interactive_desktop_does_not_touch_dpi(self, monkeypatch):
+        user32 = self.User32(desktop="default")
+        self.install_thread_fakes(monkeypatch, user32)
+        config.ensure_thread_interactive_desktop()
+        assert user32.calls == [("get_desktop",), ("read_desktop",)]
+
+    def test_a_non_interactive_thread_is_attached_to_default(self, monkeypatch):
+        user32 = self.User32(desktop="autopilot-hidden")
+        self.install_thread_fakes(monkeypatch, user32)
+        config.ensure_thread_interactive_desktop()
+        assert user32.calls == [
+            ("get_desktop",), ("read_desktop",),
+            ("open_desktop", "default"), ("set_desktop", 42),
+        ]
+
+    def test_a_failed_desktop_open_does_not_install_an_invalid_handle(self, monkeypatch):
+        user32 = self.User32(desktop="autopilot-hidden")
+        user32.OpenDesktopW = lambda *_args: 0
+        self.install_thread_fakes(monkeypatch, user32)
+        config.ensure_thread_interactive_desktop()
+        assert not any(call[0] == "set_desktop" for call in user32.calls)

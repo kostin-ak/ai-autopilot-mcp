@@ -98,6 +98,7 @@ _PATTERN_FLAGS = {
     "ScrollItem": "UIA_IsScrollItemPatternAvailablePropertyId",
     "RangeValue": "UIA_IsRangeValuePatternAvailablePropertyId",
     "Text": "UIA_IsTextPatternAvailablePropertyId",
+    "TextPattern2": "UIA_IsTextPattern2AvailablePropertyId",
     "GridItem": "UIA_IsGridItemPatternAvailablePropertyId",
     "TableItem": "UIA_IsTableItemPatternAvailablePropertyId",
     "Window": "UIA_IsWindowPatternAvailablePropertyId",
@@ -423,6 +424,12 @@ class UIAClient:
                     for n in dir(mod)
                     if n.startswith("UIA_") and n.endswith("PatternId")
                 }
+                # TextPattern2's constant is UIA_TextPattern2Id, not
+                # UIA_TextPattern2PatternId, so the suffix rule above cannot see it.
+                # Firefox's address bar supports it; omitting it made a present
+                # interface look absent to every caller.
+                with contextlib.suppress(AttributeError, TypeError, ValueError):
+                    self._pattern_map["TextPattern2"] = int(mod.UIA_TextPattern2Id)
         return self._pattern_map
 
     def pattern_flags(self) -> dict[str, int]:
@@ -1090,6 +1097,68 @@ class UIAClient:
         return {"name": name, "role": self.control_type_names().get(ct, str(ct)),
                 "pid": pid or None}
 
+    def element_bounds(self, hwnd: int, path: str) -> tuple[int, int, int, int] | None:
+        """Absolute (x, y, width, height) of an element, or None if it cannot be shown.
+
+        Used by the action highlight overlay. Class B actions never move the cursor,
+        so this rect is the only spatial evidence of where an action actually landed.
+
+        Offscreen and degenerate elements return None rather than a rect: an offscreen
+        element has no meaningful place on any monitor, and highlighting a stale rect
+        would mislead the operator about what was touched. The (-32000, -32000)
+        sentinel is the Win32 minimized-window position, not a real location.
+        """
+        el = self._element_at_path(hwnd, path)
+        if el is None:
+            return None
+        try:
+            if bool(el.CurrentIsOffscreen):
+                return None
+        except COMError:
+            pass
+        try:
+            r = self._retry(lambda: el.CurrentBoundingRectangle)
+        except (COMError, AttributeError, TypeError):
+            return None
+        if r is None:
+            return None
+        left, top, right, bottom = int(r.left), int(r.top), int(r.right), int(r.bottom)
+        if left <= -30000 and top <= -30000:
+            return None
+        width, height = right - left, bottom - top
+        if width <= 0 or height <= 0:
+            return None
+        return (left, top, width, height)
+
+    def read_text_value(self, hwnd: int, path: str) -> str | None:
+        """Current text of one element, preferring ValuePattern then TextPattern2.
+
+        Observation only. Firefox's address bar reports an empty ValuePattern while
+        its TextPattern2 range carries the URL (measured live 2026-11-14), so a single
+        surface is not enough. An empty string is treated as "not provided" rather
+        than as a value: the placeholder ComboBox text would otherwise hide the URL.
+        """
+        el = self._element_at_path(hwnd, path)
+        if el is None:
+            return None
+        value = self._pattern_on(el, "Value", "IUIAutomationValuePattern")
+        if value is not None:
+            try:
+                text = str(value.CurrentValue or "")
+                if text:
+                    return text
+            except COMError:
+                pass
+        text2 = self._pattern_on(el, "TextPattern2", "IUIAutomationTextPattern2")
+        if text2 is not None:
+            try:
+                text = str(text2.DocumentRange.GetText(-1) or "")
+                if text:
+                    return text
+            except (COMError, AttributeError, TypeError):
+                pass
+        return None
+
     def clickable_point(self, hwnd: int, path: str) -> tuple[int, int] | None:
         """Resolves UIA's own clickable point for one element, by snapshot path.
 
@@ -1354,6 +1423,43 @@ class UIAClient:
         except COMError as exc:
             return ActionResult(False, "set_value", path, False, before=before,
                                 message=f"SetValue отказал: {self._hresult(exc)}")
+        # TextPattern2 is a reader, not a writer: it has no SetValue. It is still
+        # the faster confirmation path on Firefox, where the address bar's
+        # ValuePattern takes about 1000 ms to reflect a write while the text range
+        # reflects it in under a millisecond (measured live 2026-11-14). Poll both
+        # and accept whichever matches first. A TextPattern2 match counts only when
+        # it equals the requested text, so this adds speed without weakening the
+        # read-back guarantee.
+        text2 = self._pattern_on(el, "TextPattern2", "IUIAutomationTextPattern2")
+        if text2 is not None:
+            deadline = time.monotonic() + 1.5
+            while True:
+                try:
+                    value_now = pat.CurrentValue
+                except COMError:
+                    value_now = None
+                try:
+                    text_now = str(text2.DocumentRange.GetText(-1))
+                except (COMError, AttributeError, TypeError):
+                    text_now = None
+                if text_now == text:
+                    return ActionResult(
+                        True, "set_value", path, True, before=before, after=text,
+                        message="Значение подтверждено перечитыванием через TextPattern2."
+                    )
+                if value_now == text:
+                    return ActionResult(
+                        True, "set_value", path, True, before=before, after=value_now,
+                        message="Значение подтверждено перечитыванием ValuePattern."
+                    )
+                if time.monotonic() >= deadline:
+                    return ActionResult(
+                        False, "set_value", path, False, before=before, after=value_now,
+                        message=(f"Значение НЕ подтверждено: ожидалось {text!r}, "
+                                 f"ValuePattern прочитал {value_now!r}, "
+                                 f"TextPattern2 прочитал {text_now!r}.")
+                    )
+                time.sleep(0.03)
         after, verified = self._read_back(lambda: pat.CurrentValue,
                                           lambda v: v == text)
         return ActionResult(
@@ -1391,6 +1497,24 @@ class UIAClient:
             verified, "toggle", path, verified, before=before, after=after,
             message=(f"Состояние изменилось: {before} -> {after}." if verified else
                      f"Состояние НЕ изменилось (осталось {after!r})."))
+
+    def is_selected(self, hwnd: int, path: str) -> bool | None:
+        """Reads SelectionItem.IsSelected for an observation, without mutating it.
+
+        Browser chrome reports the current tab through SelectionItem. It is separate
+        from focus: a focused address bar does not make its tab unselected.
+        """
+        el = self._element_at_path(hwnd, path)
+        if el is None:
+            return None
+        pat = self._pattern_on(el, "SelectionItem",
+                               "IUIAutomationSelectionItemPattern")
+        if pat is None:
+            return None
+        try:
+            return bool(pat.CurrentIsSelected)
+        except COMError:
+            return None
 
     def select_item(self, hwnd: int, path: str) -> ActionResult:
         """Selects a list or tree item and confirms IsSelected."""

@@ -108,6 +108,21 @@ class FakeValuePattern:
             self.CurrentValue = text
 
 
+class _FakeLiveTextRange:
+    def __init__(self, source):
+        self._source = source
+
+    def GetText(self, _limit):
+        return self._source()
+
+
+class FakeTextPattern2:
+    """Read-only text view used to confirm a write without ValuePattern's lag."""
+
+    def __init__(self, source):
+        self.DocumentRange = _FakeLiveTextRange(source)
+
+
 class FakeTogglePattern:
     def __init__(self, state=0, ignore_calls=False):
         self.CurrentToggleState = state
@@ -233,7 +248,7 @@ PATTERN_IDS = {
     "Invoke": 10000, "Value": 10002, "Toggle": 10015,
     "SelectionItem": 10010, "ExpandCollapse": 10005,
     "ScrollItem": 10017, "RangeValue": 10003,
-    "Window": 10009, "Transform": 10016,
+    "Window": 10009, "Transform": 10016, "TextPattern2": 10024,
 }
 
 
@@ -261,6 +276,7 @@ class _FakeTypelib:
     IUIAutomationScrollItemPattern = "IID_SCROLLITEM"
     IUIAutomationRangeValuePattern = "IID_RANGEVALUE"
     IUIAutomationTransformPattern = "IID_TRANSFORM"
+    IUIAutomationTextPattern2 = "IID_TEXTPATTERN2"
 
 
 class FakeClient(uc.UIAClient):
@@ -914,6 +930,63 @@ class TestPatternActions:
         assert r.ok and r.verified is True
         assert (r.before, r.after) == ("before", "after")
         assert pat.CurrentValue == "after"
+
+    def test_set_value_confirms_through_textpattern2(self):
+        """The fast path: Firefox's ValuePattern lags by a second, its text range
+        does not. Both surfaces must agree on the requested text."""
+        pat = FakeValuePattern("before")
+        text2 = FakeTextPattern2(lambda: pat.CurrentValue)
+        child = FakeElement("target", pattern_objs={
+            PATTERN_IDS["Value"]: pat,
+            PATTERN_IDS["TextPattern2"]: text2,
+        })
+        root = FakeElement("root", children=[child], bounds=(0, 0, 100, 100))
+        r = FakeClient(root).set_value(1, "0", "after")
+        assert r.ok and r.verified is True
+        assert (r.before, r.after) == ("before", "after")
+        assert "TextPattern2" in r.message
+
+    def test_a_different_text_pattern_value_cannot_confirm_the_write(self):
+        """If the text range shows something else, the old ValuePattern read-back
+        remains the authority; the fast path must not confirm a different surface."""
+        pat = FakeValuePattern("before")
+        text2 = FakeTextPattern2(lambda: "unrelated document text")
+        child = FakeElement("target", pattern_objs={
+            PATTERN_IDS["Value"]: pat,
+            PATTERN_IDS["TextPattern2"]: text2,
+        })
+        root = FakeElement("root", children=[child], bounds=(0, 0, 100, 100))
+        r = FakeClient(root).set_value(1, "0", "after")
+        assert r.ok and r.verified is True
+        assert r.after == "after"
+        assert "ValuePattern" in r.message
+
+    def test_read_text_value_falls_back_to_textpattern2(self):
+        """Firefox's address bar has an empty ValuePattern and the URL in its text
+        range. A single surface would report no address at all."""
+        pat = FakeValuePattern("")
+        text2 = FakeTextPattern2(lambda: "vk.ru/kostin_ak")
+        child = FakeElement("target", pattern_objs={
+            PATTERN_IDS["Value"]: pat,
+            PATTERN_IDS["TextPattern2"]: text2,
+        })
+        root = FakeElement("root", children=[child], bounds=(0, 0, 100, 100))
+        assert FakeClient(root).read_text_value(1, "0") == "vk.ru/kostin_ak"
+
+    def test_read_text_value_prefers_a_nonempty_value_pattern(self):
+        pat = FakeValuePattern("visible")
+        text2 = FakeTextPattern2(lambda: "document text")
+        child = FakeElement("target", pattern_objs={
+            PATTERN_IDS["Value"]: pat,
+            PATTERN_IDS["TextPattern2"]: text2,
+        })
+        root = FakeElement("root", children=[child], bounds=(0, 0, 100, 100))
+        assert FakeClient(root).read_text_value(1, "0") == "visible"
+
+    def test_read_text_value_without_text_patterns_is_none(self):
+        child = FakeElement("target")
+        root = FakeElement("root", children=[child], bounds=(0, 0, 100, 100))
+        assert FakeClient(root).read_text_value(1, "0") is None
 
     def test_set_value_detects_silent_success(self):
         """The terminal trap: SetValue returns success, IsReadOnly reports 0, and

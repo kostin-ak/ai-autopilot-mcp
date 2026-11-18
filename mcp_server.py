@@ -16,6 +16,7 @@ import websockets
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ImageContent, TextContent
 
+import browser_targets
 import config
 
 # Must run before logging.basicConfig: StreamHandler captures sys.stderr at
@@ -255,6 +256,7 @@ async def get_screen_state(
     monitor_index: int | None = None,
     show_grid: bool = False,
     image_width: int | None = None,
+    crop: list[int] | None = None,
 ) -> list[ContentBlock]:
     """
     Requests a fresh screen capture plus system state (IDLE, AI_ACTIVE, USER_OVERRIDE),
@@ -263,6 +265,14 @@ async def get_screen_state(
     The response may carry a session warning. When the workstation is locked, capture
     still succeeds and returns the lock screen; the warning is the only thing that
     distinguishes that from a frame of the target application.
+
+    `crop` returns a region of the frame at native resolution instead of the whole
+    downscaled frame: [x0, y0, x1, y1] in the same frame coordinates, cut out of the
+    native capture. Use it to read small UI -- menu rows, number fields, status lines --
+    that the 1280-wide frame renders illegible. The answer carries a `crop` block with
+    the origin and the full-frame scale for converting crop pixels back into frame
+    coordinates. The coordinate grid is not drawn over a crop, because its labels would
+    name crop-local pixels as if they were frame coordinates.
 
     Args:
         monitor_index: 1 = primary, 0 = every display as one virtual desktop,
@@ -276,7 +286,7 @@ async def get_screen_state(
     """
     resp = await _send_daemon_request(
         "get_screen_state", {"monitor_index": monitor_index, "show_grid": show_grid,
-                             "image_width": image_width}
+                             "image_width": image_width, "crop": crop}
     )
     return _format_image_and_text(resp, "Снимок экрана успешно получен.")
 
@@ -294,6 +304,8 @@ async def mouse_action(
     monitor_index: int | None = None,
     show_grid: bool = False,
     image_width: int | None = None,
+    instant: bool = False,
+    crop: list[int] | None = None,
 ) -> list[ContentBlock]:
     """
     Performs a mouse action with a predictive visual marker and human-interruption check.
@@ -311,6 +323,21 @@ async def mouse_action(
     The response reports where the cursor actually ended up, which differs from the
     requested point whenever a move was clipped or interrupted -- that difference is
     the signal a click failed.
+
+    `instant=True` skips the predictive marker and the smooth cursor sweep, jumping
+    straight to the target. Use it for transient UI -- cascading menus, hover popups --
+    where the sweep itself opens and closes submenus mid-gesture: measured live on
+    Blender's Add menu, a smooth move into a not-yet-open submenu closed it and the
+    click landed on empty viewport.
+
+    Clicks carry a post-check: a small native region around the target is compared
+    before and after, cursor positions masked out. `screen_changed: false` in the
+    answer means the click repainted nothing -- a menu that only re-highlighted an
+    item, a popup that swallowed the press -- and is a hint to re-observe or retry,
+    not proof of failure.
+
+    `crop` returns the resulting frame as a native-resolution region, see
+    get_screen_state.
 
     Args:
         action: 'click', 'double_click', 'right_click', 'middle_click', 'triple_click',
@@ -331,6 +358,8 @@ async def mouse_action(
             rather than clamping. The same value is used by the coordinate bounds
             check, so a coordinate valid for the frame you asked for is valid for
             the frame you get.
+        instant: Jump to the target without the marker and the smooth sweep.
+        crop: [x0, y0, x1, y1] in frame coordinates for the resulting frame.
     """
     params = {
         "action": action,
@@ -343,6 +372,8 @@ async def mouse_action(
         "monitor_index": monitor_index,
         "show_grid": show_grid,
         "image_width": image_width,
+        "instant": instant,
+        "crop": crop,
     }
     resp = await _send_daemon_request("mouse_action", params)
     return _format_image_and_text(resp)
@@ -355,6 +386,8 @@ async def keyboard_action(
     monitor_index: int | None = None,
     show_grid: bool = False,
     image_width: int | None = None,
+    text_mode: Literal["unicode", "vkeys"] = "unicode",
+    crop: list[int] | None = None,
 ) -> list[ContentBlock]:
     """
     Types text or presses a key combination.
@@ -367,6 +400,21 @@ async def keyboard_action(
 
     This is a Class A action: it consumes the session keyboard, so a physical keypress
     switches the daemon to USER_OVERRIDE and aborts typing mid-flight.
+
+    `text_mode="vkeys"` sends plain virtual-key presses -- the same event shape as
+    hotkeys -- instead of KEYEVENTF_UNICODE. Some applications build characters from
+    WM_KEYDOWN and never see the unicode path: Blender's GHOST event system is the
+    measured case, its search and filter fields stayed empty while the tool reported
+    typing as completed. GHOST also rejects key presses carrying KEYEVENTF_SCANCODE, so
+    vkeys deliberately sends wScan = 0 with no scancode flag. vkeys is layout-dependent
+    by nature -- the layout is read from the foreground thread -- and characters the
+    layout cannot produce fall back to unicode one by one.
+
+    Text delivery is not verified and cannot be: the response says the events were sent,
+    not that the target received them. When the answer matters, re-read the field.
+
+    `crop` returns the resulting frame as a native-resolution region, see
+    get_screen_state.
 
     Args:
         text: Literal text to type. Newline and tab are sent as their virtual keys.
@@ -381,6 +429,8 @@ async def keyboard_action(
             rather than clamping. The same value is used by the coordinate bounds
             check, so a coordinate valid for the frame you asked for is valid for
             the frame you get.
+        text_mode: "unicode" (default) or "vkeys" for targets that ignore WM_CHAR.
+        crop: [x0, y0, x1, y1] in frame coordinates for the resulting frame.
     """
     params = {
         "text": text,
@@ -388,6 +438,8 @@ async def keyboard_action(
         "monitor_index": monitor_index,
         "show_grid": show_grid,
         "image_width": image_width,
+        "text_mode": text_mode,
+        "crop": crop,
     }
     resp = await _send_daemon_request("keyboard_action", params)
     return _format_image_and_text(resp)
@@ -756,6 +808,55 @@ async def get_snapshot(
             "повторите с monitor_index их монитора."
         )
     return "\n".join([*header, "", tree, *footer])
+
+
+# Unstructured on purpose: tab and bookmark lists can be long. See ContentBlock.
+@mcp.tool(structured_output=False)
+async def get_browser_landmarks(
+    hwnd: int | None = None,
+    window_title: str | None = None,
+    class_name: str | None = None,
+    max_nodes: int | None = None,
+    max_depth: int | None = None,
+    time_budget_ms: int | None = None,
+) -> str:
+    """Finds browser chrome landmarks through UIA/MSAA, without CDP or WebDriver BiDi.
+
+    This is the browser mode for an already-running Firefox or Chromium window. It
+    does not start a browser, request a debug port, close tabs, change the address bar,
+    or mutate page state. The returned address-bar and tab paths can be passed to
+    act_on_element. The current tab is read through SelectionItem, not inferred from
+    keyboard focus. Bookmark absence is reported as an observation, not as an error:
+    the toolbar may simply be hidden.
+
+    Paths are snapshot-relative: re-read the landmarks after a substantial tree change
+    before acting. Stable AutomationIds are included where the browser exposes them.
+
+    Args:
+        hwnd: Exact handle from list_windows_and_monitors. Takes priority.
+        window_title: Substring of the window title.
+        class_name: Win32 window class, narrows a title search.
+        max_nodes: Snapshot node cap (default 500).
+        max_depth: Snapshot depth cap (default 40). Browser context menus can be deep;
+            a low cap can truncate the walk before the address bar and tab strip.
+        time_budget_ms: Wall-clock walk budget (default 1500).
+    """
+    resp = await _send_daemon_request("browser_landmarks", {
+        "hwnd": hwnd, "window_title": window_title, "class_name": class_name,
+        "max_nodes": max_nodes, "max_depth": max_depth, "time_budget_ms": time_budget_ms,
+    })
+    if resp.get("status") != "ok":
+        return f"Ошибка поиска браузерных адресов: {resp.get('message', 'Неизвестная ошибка')}"
+    data = resp.get("data", {})
+    header = []
+    if data.get("session_warning"):
+        header.append(f"ВНИМАНИЕ: {data['session_warning']}")
+    snapshot = data.get("snapshot") or {}
+    header.append(
+        f"Снимок: {snapshot.get('nodes')} узлов за {snapshot.get('elapsed_ms')} мс; "
+        f"усечён={snapshot.get('truncated')} причина={snapshot.get('truncated_reason')}"
+    )
+    return "\n".join([*header, browser_targets.format_browser_landmarks(data)])
 
 
 @mcp.tool()
@@ -1494,6 +1595,8 @@ async def get_hud_state() -> str:
         f"Цель (локальные коорд.):   {d.get('target_local')}",
         f"Рамка рисуется в точке:    {d.get('painted_at_global')}",
         f"Размещение корректно:      {d.get('placement_correct')}",
+        f"Подсветки действий:        активных={d.get('active_flashes')} "
+        f"всего={d.get('flashes_total')}",
     ])
 
 
@@ -1797,6 +1900,7 @@ async def wait(
     monitor_index: int | None = None,
     show_grid: bool = False,
     image_width: int | None = None,
+    crop: list[int] | None = None,
 ) -> list[ImageContent | TextContent]:
     """
     Wait a fixed time, then return a fresh frame of the screen.
@@ -1812,12 +1916,15 @@ async def wait(
     and the actual wait so a cap is visible rather than silent.
 
     Takes no input lock: it holds nothing and moves nothing.
+
+    `crop` returns the fresh frame as a native-resolution region, see get_screen_state.
     """
     resp = await _send_daemon_request("wait", {
         "duration_ms": duration_ms,
         "monitor_index": monitor_index,
         "show_grid": show_grid,
         "image_width": image_width,
+        "crop": crop,
     })
     return _format_image_and_text(resp)
 

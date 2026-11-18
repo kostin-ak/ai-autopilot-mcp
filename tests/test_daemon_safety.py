@@ -45,6 +45,9 @@ class FakeUIA:
     def node_identity(self, hwnd, path):
         return {"name": self._name, "role": "Button", "pid": self._pid}
 
+    def element_bounds(self, hwnd, path):
+        return (10, 10, 40, 20)
+
     def invoke(self, hwnd, path):
         self.calls.append(("invoke", hwnd, path))
         return ActionResult(True, "invoke", path, None,

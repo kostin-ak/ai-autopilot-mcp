@@ -787,7 +787,7 @@ class TestToolDescriptions:
         "keyboard_action", "scroll_screen", "list_windows_and_monitors",
         "get_ui_elements", "reset_user_override", "get_hud_state",
         "probe_target", "get_snapshot", "resolve_clickable", "act_on_element",
-        "window_action",
+        "window_action", "get_browser_landmarks",
         "read_terminal", "write_terminal", "wait_terminal",
         "find_text_on_screen", "read_screen_text", "wait_for_text",
         "wait_for_event", "execute_batch", "get_cursor_state",
@@ -880,6 +880,7 @@ class TestToolDescriptions:
         """Both mutating verb sets stay blocked while a human holds the machine."""
         import autopilot_daemon as daemon
 
+        assert "browser_landmarks" in daemon.NON_INPUT_ACTIONS
         for action in ("element_action", "window_action", "write_terminal"):
             assert action not in daemon.NON_INPUT_ACTIONS, (
                 f"{action} changes application state and must not run during "
