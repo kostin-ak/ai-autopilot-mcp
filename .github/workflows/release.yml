@@ -1,0 +1,101 @@
+name: Release
+
+# Tag-driven: a tag is pushed only when the operator asks for a release. The tag must
+# equal "v" + pyproject version, so the version has exactly one source of truth.
+# When the project later moves to PyPI, the publishing step belongs at the end of the
+# build job, after the same verify-tag and test gates -- not in a second workflow.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  verify-tag:
+    name: Tag matches pyproject version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          python - <<'PY'
+          import os, sys, tomllib
+          with open("pyproject.toml", "rb") as fh:
+              version = tomllib.load(fh)["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          expected = f"v{version}"
+          if tag != expected:
+              sys.exit(f"Tag {tag} does not match pyproject version {expected}")
+          print(f"Tag {tag} matches pyproject version")
+          PY
+
+  test:
+    name: Gate: pytest + ruff (py${{ matrix.python }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: pip install -e ".[win32,dev]"
+      - run: python -m pytest tests -q --no-header
+      - run: python -m ruff check .
+
+  build:
+    name: Build wheel and sdist
+    needs: [verify-tag, test]
+    # Pure-Python distribution, so the build runs on the fast runner; the Windows
+    # matrix above is what actually proves the code works on the target OS.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  release:
+    name: GitHub Release with notes and artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Notes are generated from commits since the previous tag; that history is
+          # not present in a shallow checkout.
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Compose release notes
+        run: |
+          prev="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          if [ -n "$prev" ]; then
+            echo "Changes since $prev" > notes.md
+            echo "" >> notes.md
+            git log --no-merges --pretty='- %s (%h)' "$prev..${GITHUB_REF_NAME}" >> notes.md
+          else
+            echo "Initial tagged release" > notes.md
+            echo "" >> notes.md
+            git log --no-merges --pretty='- %s (%h)' >> notes.md
+          fi
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md dist/*

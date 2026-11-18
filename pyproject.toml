@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-autopilot-mcp"
-version = "0.2.0"
+# First public tag is v0.1.0-beta, per the operator: the project is honest about not
+# being past a beta yet. verify-tag in release.yml checks the tag against this value.
+version = "0.1.0-beta"
 description = "Desktop autopilot MCP server: UIA-first semantic control with pixel fallback, HUD overlay, and human-override detection"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -89,6 +91,27 @@ python_version = "3.11"
 warn_unused_ignores = true
 warn_redundant_casts = true
 ignore_missing_imports = true
+
+# Flat layout: modules live in the repo root, so mypy needs the root on its path and
+# explicit bases to map file paths to module names. The excludes stop it from
+# recursing into the virtualenv (PyQt6's own stubs fail parsing under this mypy) and
+# into build artifacts.
+mypy_path = "."
+explicit_package_bases = true
+# PyQt6 ships .pyi stubs this mypy cannot parse (positional-only marker placement),
+# and following imports into site-packages aborts the whole run before any project
+# file is checked. Skipping installed stubs turns those imports into Any via
+# ignore_missing_imports instead of a hard stop; the project's own code is still
+# fully checked.
+no_site_packages = true
+exclude = [
+    '^\.venv/',
+    '^build/',
+    '^dist/',
+    '^\.mypy_cache/',
+    '^\.pytest_cache/',
+    '^\.ruff_cache/',
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

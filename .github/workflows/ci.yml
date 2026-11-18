@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest + ruff (py${{ matrix.python }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    env:
+      # The suite renders Qt offscreen: CI runners have no interactive desktop,
+      # and the same variable is how the headless run is reproduced locally.
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install project and dev deps
+        run: pip install -e ".[win32,dev]"
+      # `python -m pytest`, not bare `pytest`: the flat layout puts modules in the
+      # repo root, and only `python -m` places the current directory on sys.path.
+      - name: pytest
+        run: python -m pytest tests -q --no-header
+      - name: ruff
+        run: python -m ruff check .
+
+  mypy:
+    # Non-blocking on purpose: the project never claimed a clean mypy run, and a
+    # blocking job would freeze every PR until the whole debt is paid. The check is
+    # visible in the run summary so the debt stays measurable instead of invisible.
+    name: mypy (non-blocking)
+    runs-on: windows-latest
+    continue-on-error: true
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[win32,dev]"
+      - run: python -m mypy .

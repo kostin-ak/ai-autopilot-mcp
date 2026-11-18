@@ -493,3 +493,22 @@ Blender оставлен открытым со сценой из сферы.
 - **host_guard**: отказ по фокусу в хосте теперь подсказывает активировать целевое окно.
 - Тесты: 869 passed, ruff чист. Управление освобождено; Blender 5.3 оставлен открытым
   (дефолтная сцена), демон работает фоновым процессом сессии.
+### CI/CD 2026-11-19 (решения оператора)
+
+- **CI**: .github/workflows/ci.yml — windows-latest, py3.11/3.12/3.13, pip install -e
+  ".[win32,dev]", QT_QPA_PLATFORM=offscreen, python -m pytest tests -q --no-header
+  (именно python -m: flat layout требует CWD в sys.path), uff check .. Headless-прогон
+  локально совпал с интерактивным: 869 passed, 4 skipped.
+- **mypy — non-blocking**, как решено. Настройка, без которой прогон умирал до проверки
+  кода: mypy_path=".", explicit_package_bases=true (flat layout), 
+o_site_packages=true
+  (стабы PyQt6 этот mypy не парсит, следование импортов в site-packages обрывало всё).
+  Итог замера: 27 ошибок в 7 файлах — реальный долг, CI показывает, не блокирует.
+- **CD**: .github/workflows/release.yml на тег *: verify-tag (тег == +pyproject
+  version), те же гейты, build (ubuntu, wheel+sdist), Release с notes из коммитов с прошлого
+  тега. PyPI отложен по решению оператора: публикация потом добавляется в job build.
+- **Версия первого тега — 0.1.0-beta**, решение оператора; pyproject version установлен
+  в  .1.0-beta. Тег ставится вручную по его слову, автоматических релизов нет.
+- **Известный flaky**: один раз под offscreen упал 	est_uia_client.py::test_large_window_
+  with_nothing_usable_is_opaque; в одиночку и в двух повторных полных прогонах зелёный.
+  Rerun-политику не вводили: если повторится на CI — разбирать как дефект, а не глушить.
