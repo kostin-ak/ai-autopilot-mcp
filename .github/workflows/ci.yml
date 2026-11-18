@@ -40,12 +40,13 @@ jobs:
         run: python -m ruff check .
 
   mypy:
-    # Non-blocking on purpose: the project never claimed a clean mypy run, and a
-    # blocking job would freeze every PR until the whole debt is paid. The check is
-    # visible in the run summary so the debt stays measurable instead of invisible.
-    name: mypy (non-blocking)
+    # The project never claimed a clean mypy run, and a blocking job would freeze
+    # every PR until the whole debt is paid. So the job always passes and publishes
+    # the debt into the step summary instead: measurable on every run, invisible to
+    # nobody, blocking to nobody. A red cross on an expected failure only trains
+    # people to ignore red crosses.
+    name: mypy (debt meter)
     runs-on: windows-latest
-    continue-on-error: true
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
@@ -55,4 +56,14 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -e ".[win32,dev]"
-      - run: python -m mypy .
+      - name: mypy debt meter
+        run: |
+          python -m mypy . > mypy-report.txt 2>&1
+          $code = $LASTEXITCODE
+          $tail = Get-Content mypy-report.txt | Select-Object -Last 40
+          Add-Content $env:GITHUB_STEP_SUMMARY "## mypy debt meter (exit $code)"
+          Add-Content $env:GITHUB_STEP_SUMMARY ''
+          Add-Content $env:GITHUB_STEP_SUMMARY '```'
+          $tail | Add-Content $env:GITHUB_STEP_SUMMARY
+          Add-Content $env:GITHUB_STEP_SUMMARY '```'
+          exit 0
