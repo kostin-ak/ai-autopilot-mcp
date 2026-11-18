@@ -21,6 +21,9 @@ jobs:
       # The suite renders Qt offscreen: CI runners have no interactive desktop,
       # and the same variable is how the headless run is reproduced locally.
       QT_QPA_PLATFORM: offscreen
+      # A service session installs the WinEvent hook but delivers no UI events at
+      # all, so the live-desktop confirmation has nothing to confirm here.
+      AUTOPILOT_NO_LIVE_DESKTOP: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

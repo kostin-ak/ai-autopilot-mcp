@@ -8,6 +8,7 @@ established and the implementation depends on.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -366,6 +367,11 @@ class TestWatcherThread:
     def test_events_from_the_live_desktop_are_delivered(self):
         """Confirms the shipped class against the real API, end to end.
 
+        Skipped when AUTOPILOT_NO_LIVE_DESKTOP is set: a service session such as a CI
+        runner installs the hook fine but delivers no UI events at all, measured on the
+        first CI run (delivered=0, timeouts=1). There is nothing to confirm there, and
+        pretending otherwise fails the suite for an environmental reason.
+
         Deliberately does not create or destroy a window. An earlier version did, and
         reliably produced an access violation in the test process *after* the test
         passed: creating and destroying a window on the main thread while a system-wide
@@ -378,6 +384,9 @@ class TestWatcherThread:
         produces no desktop UI events, and that is a condition of the machine rather
         than a defect here.
         """
+        if os.environ.get("AUTOPILOT_NO_LIVE_DESKTOP"):
+            pytest.skip("no interactive desktop: a service session delivers no UI events")
+
         import session_state
 
         if session_state.session_state()["locked"]:

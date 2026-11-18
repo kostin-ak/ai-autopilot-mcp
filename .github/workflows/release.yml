@@ -41,6 +41,7 @@ jobs:
         python: ["3.11", "3.12", "3.13"]
     env:
       QT_QPA_PLATFORM: offscreen
+      AUTOPILOT_NO_LIVE_DESKTOP: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

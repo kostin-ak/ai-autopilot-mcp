@@ -154,8 +154,23 @@ class TestCoordinateMath:
         assert fn(stub, v_left, v_top) == (0, 0)
         assert fn(stub, v_left + v_w - 1, v_top + v_h - 1) == (65535, 65535)
 
-    def test_secondary_monitor_maps_below_zero_boundary(self):
-        """Negative desktop coordinates must not clamp or wrap."""
+    def test_secondary_monitor_maps_below_zero_boundary(self, monkeypatch):
+        """Negative desktop coordinates must not clamp or wrap.
+
+        The virtual desktop is faked rather than read: the assertion used to depend on
+        the machine actually having a monitor to the left of the primary, so a
+        single-display CI runner failed a test about coordinate math. Measured on the
+        first CI run: nx came back -64061 on a 1024-wide virtual desktop.
+        """
+        bounds = {
+            ic.SM_XVIRTUALSCREEN: -1920,
+            ic.SM_YVIRTUALSCREEN: 0,
+            ic.SM_CXVIRTUALSCREEN: 4480,
+            ic.SM_CYVIRTUALSCREEN: 1440,
+        }
+        monkeypatch.setattr(
+            ic.ctypes.windll.user32, "GetSystemMetrics",
+            lambda metric: bounds[metric])
         stub = StubController()
         nx, ny = ic.InputController._pixel_to_normalized_coords(stub, -1000, 600)
         assert 0 <= nx <= 65535
