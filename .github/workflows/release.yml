@@ -33,7 +33,7 @@ jobs:
           PY
 
   test:
-    name: Gate: pytest + ruff (py${{ matrix.python }})
+    name: pytest + ruff gate (py${{ matrix.python }})
     runs-on: windows-latest
     strategy:
       fail-fast: false
