@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+# setuptools >= 77 understands the SPDX license expression below (PEP 639) and
+# copies LICENSE into the wheel's dist-info; older versions reject the string form.
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,7 +12,10 @@ version = "0.1.0-beta"
 description = "Desktop autopilot MCP server: UIA-first semantic control with pixel fallback, HUD overlay, and human-override detection"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
-license = { text = "MIT" }
+# SPDX expression (PEP 639) rather than the deprecated { text = "MIT" } table: the
+# table form is not machine-readable and newer packaging tools warn on it.
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["mcp", "automation", "desktop", "ui-automation", "computer-use"]
 
 # Верхние границы заданы явно: проект использует нативные API Windows и

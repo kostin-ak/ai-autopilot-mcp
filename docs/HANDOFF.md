@@ -512,3 +512,13 @@ o_site_packages=true
 - **Известный flaky**: один раз под offscreen упал 	est_uia_client.py::test_large_window_
   with_nothing_usable_is_opaque; в одиночку и в двух повторных полных прогонах зелёный.
   Rerun-политику не вводили: если повторится на CI — разбирать как дефект, а не глушить.
+### Лицензия 2026-11-20
+
+- В pyproject стояло license = { text = "MIT" }, но файла LICENSE в репозитории не было:
+  GitHub показывал репу без лицензии, а wheel ехал без текста прав. Исправлено: добавлен
+  LICENSE (MIT, Alexander Kostin, 2026), метаданные переведены на SPDX-выражение
+  (PEP 639, license = "MIT" + license-files), build-system поднят до setuptools>=77
+  (старые версии строковую форму отвергают). Проверено сборкой: в wheel появились
+  dist-info/licenses/LICENSE, License-Expression: MIT, License-File: LICENSE.
+- Опубликованный артефакт v0.1.0-beta собран до этой правки и файла лицензии внутри не
+  содержит (метаданные при этом уже говорили MIT). Перерезка тега — по слову оператора.
